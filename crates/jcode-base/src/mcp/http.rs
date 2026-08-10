@@ -171,6 +171,20 @@ impl HttpTransport {
                 authorized_retry = true;
                 continue;
             }
+            if status == reqwest::StatusCode::FORBIDDEN && !authorized_retry {
+                let detail = resp.text().await.unwrap_or_default();
+                if is_auth_error_text(&detail) {
+                    self.ensure_auth(None).await?;
+                    authorized_retry = true;
+                    continue;
+                }
+                anyhow::bail!(
+                    "MCP server '{}' returned HTTP {}: {}",
+                    self.name,
+                    status.as_u16(),
+                    detail.chars().take(200).collect::<String>()
+                );
+            }
             if !status.is_success() {
                 let detail = resp.text().await.unwrap_or_default();
                 anyhow::bail!(
@@ -215,6 +229,15 @@ impl HttpTransport {
         *self.tokens.write().await = Some(tokens);
         Ok(())
     }
+}
+
+pub(crate) fn is_auth_error_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("missing required authentication")
+        || text.contains("expected oauth 2 access token")
+        || text.contains("authentication credential")
+        || text.contains("unregistered caller")
+        || text.contains("without established identity")
 }
 
 /// Incremental SSE decoder.
