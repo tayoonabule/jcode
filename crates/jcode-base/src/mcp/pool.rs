@@ -510,6 +510,7 @@ mod tests {
                 transport: None,
                 url: None,
                 headers: std::collections::HashMap::new(),
+                oauth: None,
                 enabled: None,
                 disabled: None,
             },

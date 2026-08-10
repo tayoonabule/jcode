@@ -159,7 +159,15 @@ fn environment_expansion_matches_claude_syntax_across_config_fields() {
                 },
                 "type": "http",
                 "url": "${BASE_URL:-https://example.test}/mcp",
-                "headers": {"Authorization": "Bearer ${TOKEN}"}
+                "headers": {"Authorization": "Bearer ${TOKEN}"},
+                "oauth": {
+                    "clientId": "${CLIENT_ID}",
+                    "clientSecret": "${CLIENT_SECRET}",
+                    "authorizationEndpoint": "${AUTH_ENDPOINT}",
+                    "tokenEndpoint": "${TOKEN_ENDPOINT}",
+                    "scopes": ["scope:${TOKEN}"],
+                    "redirectUri": "${REDIRECT_URI}"
+                }
             }
         }
     }"#;
@@ -168,6 +176,11 @@ fn environment_expansion_matches_claude_syntax_across_config_fields() {
     let warnings = config.expand_environment_variables_with(|variable| match variable {
         "BIN_DIR" => Some("/opt/tools".to_string()),
         "TOKEN" => Some("secret-token".to_string()),
+        "CLIENT_ID" => Some("client-id".to_string()),
+        "CLIENT_SECRET" => Some("client-secret".to_string()),
+        "AUTH_ENDPOINT" => Some("https://accounts.example.test/authorize".to_string()),
+        "TOKEN_ENDPOINT" => Some("https://accounts.example.test/token".to_string()),
+        "REDIRECT_URI" => Some("http://127.0.0.1:1455/callback".to_string()),
         _ => None,
     });
 
@@ -181,6 +194,16 @@ fn environment_expansion_matches_claude_syntax_across_config_fields() {
     assert_eq!(server.env["STILL_MISSING"], "prefix-${MISSING}");
     assert_eq!(server.url.as_deref(), Some("https://example.test/mcp"));
     assert_eq!(server.headers["Authorization"], "Bearer secret-token");
+    let oauth = server.oauth.as_ref().expect("static OAuth config");
+    assert_eq!(oauth.client_id.as_deref(), Some("client-id"));
+    assert_eq!(oauth.client_secret.as_deref(), Some("client-secret"));
+    assert_eq!(
+        oauth.authorization_endpoint.as_deref(),
+        Some("https://accounts.example.test/authorize")
+    );
+    assert_eq!(oauth.token_endpoint.as_deref(), Some("https://accounts.example.test/token"));
+    assert_eq!(oauth.scopes, ["scope:secret-token"]);
+    assert_eq!(oauth.redirect_uri.as_deref(), Some("http://127.0.0.1:1455/callback"));
     assert_eq!(
         warnings,
         vec![UnresolvedEnvironmentVariable {
