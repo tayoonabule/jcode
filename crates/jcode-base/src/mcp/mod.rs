@@ -5,7 +5,9 @@
 //! MCP server processes instead of spawning duplicates.
 
 mod client;
+pub mod http;
 mod manager;
+pub mod oauth;
 pub mod pool;
 mod protocol;
 pub mod schema_cache;

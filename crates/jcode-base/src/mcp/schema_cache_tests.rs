@@ -14,6 +14,7 @@ fn cfg(command: &str, args: &[&str]) -> McpServerConfig {
         transport: None,
         url: None,
         headers: HashMap::new(),
+        oauth: None,
         enabled: None,
         disabled: None,
     }

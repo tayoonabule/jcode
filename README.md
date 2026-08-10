@@ -561,7 +561,7 @@ That imported file is then jcode-owned; later Codex changes are not synced
 automatically. Imported environment values are copied too and may contain
 secrets.
 
-Both the canonical `mcpServers` key and jcode's historical `servers` key are accepted. jcode currently supports stdio (command-based) servers only; HTTP/SSE entries (`"type": "http"`/`"sse"`) are recognized and skipped with a log line.
+Both the canonical `mcpServers` key and jcode's historical `servers` key are accepted. jcode supports stdio (command-based) servers and remote Streamable HTTP entries (`"type": "http"`). HTTP entries use the shared low-memory client and browser OAuth when the endpoint requires it.
 
 Example MCP config:
 
