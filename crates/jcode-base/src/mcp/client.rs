@@ -159,10 +159,7 @@ impl McpHandle {
 }
 
 fn is_auth_error(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    text.contains("missing required authentication")
-        || text.contains("expected oauth 2 access token")
-        || text.contains("authentication credential")
+    super::http::is_auth_error_text(text)
 }
 
 /// MCP Client - owns the child process and provides shared handles.
@@ -545,6 +542,9 @@ mod tests {
             "Request is missing required authentication credential. Expected OAuth 2 access token"
         ));
         assert!(is_auth_error("Expected OAuth 2 access token or login cookie"));
+        assert!(is_auth_error(
+            "Method doesn't allow unregistered callers without established identity"
+        ));
         assert!(!is_auth_error("The requested message was not found"));
     }
 
