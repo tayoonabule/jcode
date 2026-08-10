@@ -219,6 +219,11 @@ struct McpToolInput {
     args: Option<Vec<String>>,
     #[serde(default)]
     env: Option<HashMap<String, String>>,
+    /// URL of a remote (Streamable HTTP) MCP server.
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
 }
 
 pub struct McpManagementTool {
@@ -267,6 +272,15 @@ impl Tool for McpManagementTool {
                 "command": {
                     "type": "string",
                     "description": "Server command."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "URL of a remote MCP server (Streamable HTTP). Use instead of 'command'. Browser OAuth runs automatically if the server requires it."
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Extra HTTP headers for a remote server."
                 },
                 "args": {
                     "type": "array",
@@ -425,7 +439,20 @@ impl McpManagementTool {
         // back to the configured server of that name, which also lets disabled
         // configured servers be connected on demand, session-scoped, without
         // rewriting config (issue #436).
-        let config = if let Some(command) = params.command {
+        let config = if let Some(url) = params.url {
+            McpServerConfig {
+                command: String::new(),
+                args: Vec::new(),
+                env: Default::default(),
+                shared: true,
+                transport: Some("http".to_string()),
+                url: Some(url),
+                headers: params.headers.unwrap_or_default(),
+                oauth: None,
+                enabled: None,
+                disabled: None,
+            }
+        } else if let Some(command) = params.command {
             McpServerConfig {
                 command,
                 args: params.args.unwrap_or_default(),
@@ -434,6 +461,7 @@ impl McpManagementTool {
                 transport: None,
                 url: None,
                 headers: std::collections::HashMap::new(),
+                oauth: None,
                 enabled: None,
                 disabled: None,
             }
@@ -443,7 +471,7 @@ impl McpManagementTool {
             drop(manager);
             configured.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "'command' is required for connect action ('{}' is not in the MCP config)",
+                    "'command' or 'url' is required for connect action ('{}' is not in the MCP config)",
                     server_name
                 )
             })?

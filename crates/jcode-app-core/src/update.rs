@@ -3,7 +3,8 @@ use crate::storage;
 use anyhow::{Context, Result};
 use jcode_update_core::{
     BACKGROUND_UPDATE_THRESHOLD, estimate_release_update_duration, estimate_source_update_duration,
-    format_duration_estimate, get_asset_name, summarize_git_pull_failure, update_estimate,
+    format_duration_estimate, get_asset_name, git_pull_failure_is_divergence,
+    summarize_git_pull_failure, update_estimate,
     verify_asset_checksum_text, version_is_newer,
 };
 pub use jcode_update_core::{
@@ -138,10 +139,129 @@ pub fn run_git_pull_ff_only(repo_dir: &Path, quiet: bool) -> Result<()> {
         .context("Failed to run git pull")?;
 
     if output.status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("{}", summarize_git_pull_failure(&output.stderr));
+        return Ok(());
     }
+
+    // A source install carrying local commits (a personal patch, an in-progress
+    // feature) diverges from upstream and can never fast-forward, which would
+    // strand it on an old version forever. Replay those commits on top of
+    // upstream instead. Rebase is safe here: it aborts cleanly on conflict and
+    // never discards work.
+    if git_pull_failure_is_divergence(&String::from_utf8_lossy(&output.stderr))
+        && let Some(summary) = try_rebase_onto_upstream(repo_dir, quiet)
+    {
+        return summary;
+    }
+
+    anyhow::bail!("{}", summarize_git_pull_failure(&output.stderr));
+}
+
+/// Attempt `git pull --rebase` for a diverged source checkout.
+///
+/// Returns `None` when the working tree is dirty (rebasing would be unsafe),
+/// so the caller reports the original divergence error instead.
+fn try_rebase_onto_upstream(repo_dir: &Path, quiet: bool) -> Option<Result<()>> {
+    if !git_worktree_is_clean(repo_dir) {
+        return None;
+    }
+
+    // Record where we started so the rebase can be proven non-destructive.
+    let before = git_head(repo_dir)?;
+    let local_commits = git_count_commits_ahead(repo_dir)?;
+
+    let fetch = std::process::Command::new("git")
+        .args(["fetch", "-q"])
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    if !fetch.status.success() {
+        return None;
+    }
+
+    // `--no-fork-point` disables git's reflog-based heuristic for guessing
+    // which local commits are "already upstream". That guess is unnecessary
+    // here (the upstream ref is known exactly) and, being reflog-dependent, it
+    // behaves differently on a fresh clone than on a long-lived checkout.
+    // Pinning the base makes the rebase deterministic. `git pull --rebase`
+    // does not accept this flag, so fetch and rebase run separately.
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("rebase").arg("--no-fork-point").arg("@{upstream}");
+    if quiet {
+        cmd.arg("-q");
+    }
+    let output = cmd.current_dir(repo_dir).output().ok()?;
+
+    if output.status.success() {
+        // Belt and braces: never accept an "update" that reduced the number
+        // of local commits. No known git version does this here, but the cost
+        // of the check is one `rev-list`, and the cost of being wrong is
+        // silently deleting the user's work.
+        let after = git_count_commits_ahead(repo_dir).unwrap_or(0);
+        if after < local_commits {
+            let _ = std::process::Command::new("git")
+                .args(["reset", "--hard", &before])
+                .current_dir(repo_dir)
+                .output();
+            return Some(Err(anyhow::anyhow!(
+                "Update aborted: the rebase would have dropped {} local commit(s), \
+                 so the repository was restored. Run `git pull --rebase` manually.",
+                local_commits - after
+            )));
+        }
+        crate::logging::info("Update: replayed local commits on top of upstream");
+        return Some(Ok(()));
+    }
+
+    // Leave the checkout exactly as it was; a half-finished rebase would be
+    // far worse than a skipped update.
+    let _ = std::process::Command::new("git")
+        .args(["rebase", "--abort"])
+        .current_dir(repo_dir)
+        .output();
+    // `rebase --abort` restores HEAD, but be explicit in case the rebase never
+    // started and left HEAD moved.
+    let _ = std::process::Command::new("git")
+        .args(["reset", "--hard", &before])
+        .current_dir(repo_dir)
+        .output();
+    Some(Err(anyhow::anyhow!(
+        "Local commits conflict with upstream, so the update was skipped. \
+         Resolve with `git pull --rebase` in the jcode repo."
+    )))
+}
+
+/// Current HEAD commit hash.
+fn git_head(repo_dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// How many commits the checkout has that its upstream does not.
+fn git_count_commits_ahead(repo_dir: &Path) -> Option<usize> {
+    let out = std::process::Command::new("git")
+        .args(["rev-list", "--count", "@{upstream}..HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
+        .flatten()
+}
+
+/// Whether the checkout has no uncommitted changes.
+fn git_worktree_is_clean(repo_dir: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_dir)
+        .output()
+        .is_ok_and(|out| out.status.success() && out.stdout.is_empty())
 }
 
 fn is_inside_git_repo(path: &std::path::Path) -> bool {
