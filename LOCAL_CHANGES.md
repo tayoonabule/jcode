@@ -72,9 +72,15 @@ or open browser prompts during daemon startup.
 
 - The stored Google OAuth token was accepted by the Gmail REST API (`HTTP 200`)
   and returned the account's label list.
+- The same token was accepted by the Google Drive REST API (`HTTP 200`) and the
+  acceptance probe returned zero files.
 - The real `google-workspace` MCP search path reached Google's gateway but was
   rejected with `The caller does not have permission`, so that remaining issue
   is provider-side rather than a local OAuth or transport failure.
+- The Gmail MCP path returned the same provider permission error. The Drive MCP
+  path is not yet authorized in the local token store, and headless validation
+  correctly stops with an interactive-sign-in error rather than opening a
+  browser unexpectedly.
 - The real Twenty MCP read-only path completed with `HTTP 200` while keeping
   the bearer credential behind the `TWENTY_API_KEY` environment reference.
 
