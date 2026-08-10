@@ -79,11 +79,13 @@ or open browser prompts during daemon startup.
   is provider-side rather than a local OAuth or transport failure.
 - The Gmail MCP path returned the same provider permission error. Drive OAuth was
   then completed for `tayo@drewl.com`; the token is stored locally with mode 0600.
-  A read-only Drive MCP probe now reaches the provider but returns HTTP 403 saying
-  the Drive MCP API has not been used in the project or is disabled. This is a
-  Google project/service enablement boundary, not a local OAuth failure.
-- The real Twenty MCP read-only path completed with `HTTP 200` while keeping
-  the bearer credential behind the `TWENTY_API_KEY` environment reference.
+  The `drivemcp.googleapis.com` service is now enabled in the project, but a
+  read-only Drive MCP probe still returns `The caller does not have permission`.
+  This remains a provider-side authorization boundary, not a local OAuth failure.
+- The real Twenty MCP read-only path completed with `HTTP 200` and zero matches
+  using the local `twentykey.txt` only through `TWENTY_API_KEY`; the first
+  uppercase comparator was rejected by the API validator and the lowercase retry
+  succeeded. The key file was not copied into the repo or printed.
 
 ## Keeping updates working
 
