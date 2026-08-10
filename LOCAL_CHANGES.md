@@ -81,7 +81,12 @@ or open browser prompts during daemon startup.
   then completed for `tayo@drewl.com`; the token is stored locally with mode 0600.
   The `drivemcp.googleapis.com` service is now enabled in the project, but a
   read-only Drive MCP probe still returns `The caller does not have permission`.
-  This remains a provider-side authorization boundary, not a local OAuth failure.
+  The underlying Drive/Gmail APIs and MCP services are enabled, and Google
+  Workspace Admin shows the OAuth client as Trusted. Google's documentation
+  lists these MCP servers as Developer Preview features, so the remaining
+  provider-side boundary may require enrolling `tayo@drewl.com` and project
+  `drewl-366215` in the Workspace Developer Preview Program. This is not a
+  local OAuth or transport failure.
 - The real Twenty MCP read-only path completed with `HTTP 200` and zero matches
   using the local `twentykey.txt` only through `TWENTY_API_KEY`; the first
   uppercase comparator was rejected by the API validator and the lowercase retry
