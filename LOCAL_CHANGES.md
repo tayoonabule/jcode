@@ -51,6 +51,11 @@ so hosted endpoints work without an `mcp-remote` stdio shim.
 OAuth tokens live in `~/.jcode/mcp-auth/<server>.json`, mode 0600, with refresh
 tokens. Deleting one forces a fresh browser sign-in for that server.
 
+The HTTP transport retries once when a server returns either a normal OAuth
+`401` challenge or an auth-like `403` body such as an unregistered-caller
+message. A genuine permission `403` is surfaced unchanged instead of causing
+an endless re-authentication loop.
+
 Atlassian uses OAuth 2.1 dynamic registration. Google Gmail, Drive, and
 Workspace Universal Search require a Google Cloud OAuth web client. The config
 already contains Google's authorization endpoint, token endpoint, scopes, and
@@ -62,6 +67,16 @@ variable so its bearer token is never written here.
 The newly added servers are intentionally `shared: false` until their
 credentials are configured. They connect on demand and do not add idle memory
 or open browser prompts during daemon startup.
+
+### Acceptance notes
+
+- The stored Google OAuth token was accepted by the Gmail REST API (`HTTP 200`)
+  and returned the account's label list.
+- The real `google-workspace` MCP search path reached Google's gateway but was
+  rejected with `The caller does not have permission`, so that remaining issue
+  is provider-side rather than a local OAuth or transport failure.
+- The real Twenty MCP read-only path completed with `HTTP 200` while keeping
+  the bearer credential behind the `TWENTY_API_KEY` environment reference.
 
 ## Keeping updates working
 

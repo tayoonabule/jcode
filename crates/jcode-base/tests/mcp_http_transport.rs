@@ -5,9 +5,16 @@
 //! This exercises the real acceptance path (connect over HTTP, discover tools,
 //! call one) rather than a mocked transport.
 
-use jcode_base::mcp::{ContentBlock, McpClient, McpServerConfig};
+use jcode_base::mcp::{
+    http::HttpTransport,
+    oauth::{McpOAuthTokens, save_tokens},
+    ContentBlock, McpClient, McpServerConfig,
+};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn http_config(url: String) -> McpServerConfig {
     McpServerConfig {
@@ -184,4 +191,83 @@ async fn http_config_without_url_is_rejected() {
         format!("{error:#}").contains("url"),
         "error should mention the missing url: {error:#}"
     );
+}
+
+#[tokio::test]
+async fn auth_like_forbidden_response_retries_with_stored_oauth_token() {
+    let _env_lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().expect("home tempdir");
+    let previous_home = std::env::var_os("JCODE_HOME");
+    jcode_base::env::set_var("JCODE_HOME", home.path());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        for attempt in 0..2 {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut authorization = String::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if trimmed.to_ascii_lowercase().starts_with("authorization:") {
+                    authorization = trimmed["authorization:".len()..].trim().to_string();
+                }
+            }
+            if attempt == 0 {
+                let body = "Method doesn't allow unregistered callers without established identity";
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = writer.write_all(response.as_bytes()).await;
+            } else {
+                assert_eq!(authorization, "Bearer stored-token");
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = writer.write_all(response.as_bytes()).await;
+            }
+        }
+    });
+
+    save_tokens(
+        "forbidden-retry",
+        &McpOAuthTokens {
+            access_token: "stored-token".to_string(),
+            refresh_token: None,
+            expires_at: 0,
+            client_id: None,
+            token_endpoint: None,
+        },
+    )
+    .expect("persist test token");
+
+    let config = http_config(url);
+    let transport = HttpTransport::new("forbidden-retry".to_string(), &config)
+        .expect("construct HTTP transport");
+    let response = transport
+        .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#, true)
+        .await
+        .expect("retry after auth-like 403");
+    assert!(response.is_some(), "the retried request should return JSON");
+
+    match previous_home {
+        Some(value) => jcode_base::env::set_var("JCODE_HOME", value),
+        None => jcode_base::env::remove_var("JCODE_HOME"),
+    }
 }
