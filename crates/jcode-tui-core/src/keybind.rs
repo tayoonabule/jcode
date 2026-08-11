@@ -54,6 +54,18 @@ impl KeyBinding {
             return true;
         }
 
+        // A terminal running on macOS may consume Command shortcuts, while
+        // another terminal can report the same physical intent as Super. Let
+        // a configured Cmd binding have a Ctrl fallback (and vice versa), so
+        // keybindings remain usable in both terminal environments.
+        if is_macos
+            && code == bind_code
+            && ((bind_mods == KeyModifiers::SUPER && modifiers == KeyModifiers::CONTROL)
+                || (bind_mods == KeyModifiers::CONTROL && modifiers == KeyModifiers::SUPER))
+        {
+            return true;
+        }
+
         is_macos
             && modifiers.is_empty()
             && bind_mods == KeyModifiers::ALT
@@ -596,6 +608,21 @@ mod tests {
             binding.matches_for_platform(code, mods, true),
             "Cmd+B kitty sequence must trigger the open_resume binding"
         );
+    }
+
+    #[test]
+    fn cmd_binding_accepts_ctrl_fallback_on_macos_terminals() {
+        let binding = parse_keybinding("cmd+b").expect("cmd+b parses");
+        assert!(binding.matches_for_platform(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+            true
+        ));
+        assert!(!binding.matches_for_platform(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+            false
+        ));
     }
 
     #[test]
