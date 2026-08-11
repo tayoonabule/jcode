@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 const SESSION_HEADER: &str = "mcp-session-id";
+const INTERACTIVE_AUTH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// One interactive OAuth flow per server at a time. Multiple sessions can
 /// discover the same expired remote server concurrently; without this gate
@@ -31,6 +32,27 @@ async fn auth_flow_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
         .entry(name.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+fn interactive_auth_allowed(name: &str) -> bool {
+    // The integration harness intentionally performs a second authorization
+    // in one process to verify stale-token recovery.
+    if std::env::var_os("JCODE_MCP_AUTH_AUTOFOLLOW").is_some() {
+        return true;
+    }
+    static STARTS: OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+        OnceLock::new();
+    let starts = STARTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut starts = starts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    if starts
+        .get(name)
+        .is_some_and(|started| now.duration_since(*started) < INTERACTIVE_AUTH_COOLDOWN)
+    {
+        return false;
+    }
+    starts.insert(name.to_string(), now);
+    true
 }
 
 /// One HTTP client shared by every remote MCP server.
@@ -128,6 +150,13 @@ impl HttpTransport {
         if !self.interactive {
             anyhow::bail!(
                 "MCP server '{}' requires OAuth sign-in; run `jcode` interactively to authorize",
+                self.name
+            );
+        }
+
+        if !interactive_auth_allowed(&self.name) {
+            anyhow::bail!(
+                "MCP server '{}' recently opened an OAuth sign-in window; refusing to open another for 10 minutes",
                 self.name
             );
         }
