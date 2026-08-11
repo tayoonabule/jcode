@@ -51,7 +51,43 @@ fn interactive_auth_allowed(name: &str) -> bool {
     {
         return false;
     }
+
+    // Jcode starts a fresh server process for each session, so an in-memory
+    // cooldown alone still allows every new session to reopen the same stale
+    // Google consent flow. Persist only the small timestamp, not credentials,
+    // so the cooldown survives process restarts without changing token storage.
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let cooldown_path = if let Some(home) = std::env::var_os("JCODE_HOME") {
+        std::path::PathBuf::from(home)
+            .join("mcp-auth")
+            .join(format!("{safe}.prompt"))
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".jcode")
+            .join("mcp-auth")
+            .join(format!("{safe}.prompt"))
+    };
+    if let Ok(value) = std::fs::read_to_string(&cooldown_path)
+        && let Ok(started) = value.trim().parse::<u64>()
+        && std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|now| now.as_secs().saturating_sub(started) < INTERACTIVE_AUTH_COOLDOWN.as_secs())
+            .unwrap_or(false)
+    {
+        return false;
+    }
+
     starts.insert(name.to_string(), now);
+    if let Some(parent) = cooldown_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let _ = std::fs::write(cooldown_path, epoch.as_secs().to_string());
+    }
     true
 }
 
