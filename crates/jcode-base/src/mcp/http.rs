@@ -14,9 +14,24 @@ use super::protocol::{JsonRpcResponse, McpOAuthConfig, McpServerConfig};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, OnceLock, RwLock};
 
 const SESSION_HEADER: &str = "mcp-session-id";
+
+/// One interactive OAuth flow per server at a time. Multiple sessions can
+/// discover the same expired remote server concurrently; without this gate
+/// each request would open its own browser consent page before any of them had
+/// a chance to persist the newly issued token.
+async fn auth_flow_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let locks = LOCKS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let mut guard = locks.lock().await;
+    guard
+        .entry(name.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 /// One HTTP client shared by every remote MCP server.
 ///
@@ -93,6 +108,8 @@ impl HttpTransport {
 
     /// Ensure a usable access token, refreshing or re-authorizing as needed.
     async fn ensure_auth(&self, challenge: Option<&str>) -> Result<()> {
+        let flow_lock = auth_flow_lock(&self.name).await;
+        let _flow_guard = flow_lock.lock().await;
         {
             let current = self.tokens.read().await.clone();
             if let Some(tokens) = current {
