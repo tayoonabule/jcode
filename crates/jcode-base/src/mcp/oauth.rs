@@ -354,6 +354,24 @@ where
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", &state)
         .append_pair("resource", server_url);
+    // Google access tokens are short-lived. Request offline access so the
+    // first interactive login also gives us a refresh token instead of
+    // reopening a browser every hour. Providers that ignore these standard
+    // parameters simply continue to receive the normal authorization request.
+    auth_url
+        .query_pairs_mut()
+        .append_pair("access_type", "offline");
+    if load_tokens(server_name)
+        .as_ref()
+        .is_some_and(|tokens| tokens.refresh_token.is_none())
+    {
+        // An existing grant may otherwise omit a refresh token. This is only
+        // reached when re-authorizing an already-expired, non-refreshable
+        // credential, so consent is not part of the normal request path.
+        auth_url
+            .query_pairs_mut()
+            .append_pair("prompt", "consent");
+    }
     if let Some(scope) = &scope {
         auth_url.query_pairs_mut().append_pair("scope", scope);
     }

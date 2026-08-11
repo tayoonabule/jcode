@@ -127,6 +127,11 @@ async fn serve(listener: tokio::net::TcpListener, base: String, counters: Arc<Co
                         params.contains_key("code_challenge"),
                         "PKCE challenge must be present"
                     );
+                    assert_eq!(
+                        params.get("access_type").map(String::as_str),
+                        Some("offline"),
+                        "authorization must request offline access for refreshable credentials"
+                    );
                     let redirect = params.get("redirect_uri").cloned().unwrap_or_default();
                     let state = params.get("state").cloned().unwrap_or_default();
                     let callback = format!("{redirect}?code=test-code&state={state}");
