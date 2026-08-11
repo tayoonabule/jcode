@@ -53,6 +53,14 @@ pub struct DialectTransforms {
     pub const_as_enum: bool,
     /// Rewrite `oneOf` as `anyOf` for dialects that model only `anyOf`.
     pub one_of_as_any_of: bool,
+    /// Drop a `pattern` whose regex needs backtracking (lookaround,
+    /// backreferences) because the provider compiles it with RE2.
+    ///
+    /// Not expressible as a keyword rule: the provider accepts `pattern`
+    /// itself, and rejects only certain *values* of it. Dropping one costs
+    /// nothing at call time, since the tool still validates the real argument,
+    /// whereas keeping one 400s the entire catalog.
+    pub re2_patterns_only: bool,
     /// Merge each `allOf` branch's `properties` into the enclosing object and
     /// drop the `allOf`.
     ///
@@ -206,6 +214,16 @@ fn walk(schema: &Value, spec: &DialectSpec, quirks: &LearnedQuirks) -> Value {
                         continue;
                     }
                     out.insert(key.clone(), value.clone());
+                    continue;
+                }
+
+                if key == "pattern"
+                    && spec.transforms.re2_patterns_only
+                    && value
+                        .as_str()
+                        .and_then(crate::regex_dialect::unsupported_construct)
+                        .is_some()
+                {
                     continue;
                 }
 
