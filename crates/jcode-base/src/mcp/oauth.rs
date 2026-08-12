@@ -155,7 +155,19 @@ pub fn resource_metadata_from_challenge(header: &str) -> Option<String> {
 
 fn well_known(base: &url::Url, suffix: &str) -> String {
     let mut u = base.clone();
-    u.set_path(suffix);
+    // OAuth issuers are allowed to include a tenant or authorization-server
+    // path. Atlassian uses exactly that shape, for example
+    // `/VCeDsk8ZHncYF1g234fKtc4lNipbBhu3`. Replacing the path with the
+    // well-known suffix silently queries the provider root and makes a valid
+    // server look like it has no dynamic registration support.
+    let base_path = u.path().trim_end_matches('/');
+    let suffix = suffix.trim_start_matches('/');
+    let path = if base_path.is_empty() {
+        format!("/{suffix}")
+    } else {
+        format!("{base_path}/{suffix}")
+    };
+    u.set_path(&path);
     u.set_query(None);
     u.to_string()
 }
@@ -236,7 +248,12 @@ pub async fn authorize(
                 return;
             }
             if !no_browser {
-                let _ = open::that(url);
+                // Do not wait on the browser process. On macOS, `open::that`
+                // can inherit the MCP transport's lifetime and leave the
+                // authorization flow looking stalled even though no visible
+                // prompt was opened. The detached variant returns immediately
+                // and lets the system browser own the OAuth tab.
+                let _ = open::that_detached(url);
             }
         },
     )
@@ -490,6 +507,18 @@ mod tests {
     #[test]
     fn challenge_without_metadata_yields_none() {
         assert!(resource_metadata_from_challenge("Bearer realm=\"mcp\"").is_none());
+    }
+
+    #[test]
+    fn well_known_preserves_issuer_path() {
+        let issuer = url::Url::parse(
+            "https://auth.atlassian.com/VCeDsk8ZHncYF1g234fKtc4lNipbBhu3",
+        )
+        .unwrap();
+        assert_eq!(
+            well_known(&issuer, "/.well-known/oauth-authorization-server"),
+            "https://auth.atlassian.com/VCeDsk8ZHncYF1g234fKtc4lNipbBhu3/.well-known/oauth-authorization-server"
+        );
     }
 
     #[test]
