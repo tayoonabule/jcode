@@ -137,6 +137,7 @@ impl AmbientRunnerHandle {
             AmbientStatus::Scheduled { .. } | AmbientStatus::Idle
         ) {
             state.status = AmbientStatus::Idle;
+            let _ = state.save();
         }
         drop(state);
         self.inner.wake_notify.notify_one();

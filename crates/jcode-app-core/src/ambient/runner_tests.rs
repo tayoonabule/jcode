@@ -189,6 +189,27 @@ async fn runner_recovers_stale_running_state_after_restart() {
 }
 
 #[tokio::test]
+async fn manual_trigger_persists_idle_state_for_scheduler() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+
+    let state = AmbientState {
+        status: AmbientStatus::Scheduled {
+            next_wake: chrono::Utc::now() + chrono::Duration::hours(1),
+        },
+        ..Default::default()
+    };
+    state.save().expect("save scheduled ambient state");
+
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+    runner.trigger().await;
+
+    let triggered = AmbientState::load().expect("load triggered ambient state");
+    assert_eq!(triggered.status, AmbientStatus::Idle);
+}
+
+#[tokio::test]
 async fn spawn_target_creates_one_child_session_and_runs_task() {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
