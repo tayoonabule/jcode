@@ -548,6 +548,18 @@ impl AmbientRunnerHandle {
         }
         logging::info("Ambient runner: starting background loop");
 
+        // A process can die while a cycle is in progress, leaving the
+        // persisted state as Running. Treat that state as stale when a new
+        // runner starts, otherwise AmbientManager::should_run() will refuse
+        // every future cycle forever.
+        if let Ok(mut state) = AmbientState::load()
+            && matches!(state.status, AmbientStatus::Running { .. })
+        {
+            logging::warn("Ambient runner: recovering stale running state");
+            state.status = AmbientStatus::Idle;
+            let _ = state.save();
+        }
+
         let ambient_enabled = config().ambient.enabled;
 
         // Spawn reply pollers only when ambient mode is enabled; scheduled
