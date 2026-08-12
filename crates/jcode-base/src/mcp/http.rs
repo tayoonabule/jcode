@@ -367,7 +367,14 @@ impl SseDecoder {
             return None;
         }
         let data = std::mem::take(&mut self.data);
-        serde_json::from_str::<JsonRpcResponse>(&data).ok()
+        // Streamable HTTP servers may emit JSON-RPC notifications such as
+        // `notifications/progress` before the response to the request. They
+        // deserialize into this type with no id/result, but are not the tool
+        // response. Keep scanning the SSE stream until an actual response
+        // arrives instead of reporting "No result from tool call".
+        serde_json::from_str::<JsonRpcResponse>(&data)
+            .ok()
+            .filter(|response| response.id.is_some())
     }
 }
 
@@ -431,5 +438,15 @@ mod tests {
         let parsed = sse("data: not json\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\n\n")
             .expect("second event");
         assert_eq!(parsed.id, Some(3));
+    }
+
+    #[test]
+    fn skips_json_rpc_notifications_before_response() {
+        let parsed = sse(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n\
+             data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n\n",
+        )
+        .expect("response after notification");
+        assert_eq!(parsed.id, Some(9));
     }
 }
