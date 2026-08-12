@@ -84,6 +84,14 @@ pub fn clear_tokens(server: &str) {
 struct ProtectedResourceMetadata {
     #[serde(default)]
     authorization_servers: Vec<String>,
+    /// The resource server may advertise the scopes its authorization request
+    /// must include. Atlassian's authv2 endpoint publishes the Jira work
+    /// scopes here, while its authorization-server metadata omits
+    /// `scopes_supported`. Ignoring this field causes Atlassian to mint the
+    /// narrower agent-interface grant, which then fails Jira data tools with
+    /// "Unauthorized; scope does not match".
+    #[serde(default)]
+    scopes_supported: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -196,10 +204,15 @@ async fn discover(
         .and_then(resource_metadata_from_challenge)
         .unwrap_or_else(|| well_known(&base, "/.well-known/oauth-protected-resource"));
 
-    let issuer = fetch_json::<ProtectedResourceMetadata>(client, &resource_metadata_url)
+    let resource_meta = fetch_json::<ProtectedResourceMetadata>(client, &resource_metadata_url)
         .await
-        .and_then(|meta| meta.authorization_servers.into_iter().next())
+        .unwrap_or_default();
+    let issuer = resource_meta
+        .authorization_servers
+        .into_iter()
+        .next()
         .unwrap_or_else(|| base.origin().ascii_serialization());
+    let resource_scopes = resource_meta.scopes_supported.clone();
 
     let issuer_url = url::Url::parse(&issuer).unwrap_or(base.clone());
 
@@ -211,7 +224,14 @@ async fn discover(
             && meta.authorization_endpoint.is_some()
             && meta.token_endpoint.is_some()
         {
-            return Ok(meta);
+            return Ok(AuthServerMetadata {
+                scopes_supported: if meta.scopes_supported.is_empty() {
+                    resource_scopes.clone()
+                } else {
+                    meta.scopes_supported
+                },
+                ..meta
+            });
         }
     }
 
@@ -220,7 +240,7 @@ async fn discover(
         authorization_endpoint: Some(well_known(&issuer_url, "/authorize")),
         token_endpoint: Some(well_known(&issuer_url, "/token")),
         registration_endpoint: Some(well_known(&issuer_url, "/register")),
-        scopes_supported: Vec::new(),
+        scopes_supported: resource_scopes,
     })
 }
 
@@ -532,6 +552,19 @@ mod tests {
     fn advertised_scopes_are_requested_verbatim() {
         let scopes = ["mcp.access".to_string()];
         assert_eq!(requested_scope(&scopes).as_deref(), Some("mcp.access"));
+    }
+
+    #[test]
+    fn protected_resource_scopes_can_supply_missing_authorization_scopes() {
+        let metadata: ProtectedResourceMetadata = serde_json::from_value(serde_json::json!({
+            "authorization_servers": ["https://auth.example/issuer"],
+            "scopes_supported": ["read:jira-work", "search:jira-work"]
+        }))
+        .unwrap();
+        assert_eq!(
+            requested_scope(&metadata.scopes_supported).as_deref(),
+            Some("read:jira-work search:jira-work")
+        );
     }
 
     #[test]
