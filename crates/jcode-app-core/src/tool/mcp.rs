@@ -811,6 +811,7 @@ mod tests {
                 transport: None,
                 url: None,
                 headers: HashMap::new(),
+                oauth: None,
                 enabled: Some(false),
                 disabled: None,
             },

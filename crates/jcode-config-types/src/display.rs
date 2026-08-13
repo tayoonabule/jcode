@@ -18,7 +18,7 @@ pub struct DisplayConfig {
     pub(crate) show_diffs: Option<bool>,
     /// Queue mode by default - wait until done before sending (default: false)
     pub queue_mode: bool,
-    /// Automatically reload the remote server when a newer server binary is detected (default: true)
+    /// Automatically reload the remote server when a newer server binary is detected (default: false)
     pub auto_server_reload: bool,
     /// Capture mouse events (default: true). Enables scroll wheel but disables terminal selection.
     pub mouse_capture: bool,
@@ -135,7 +135,7 @@ impl Default for DisplayConfig {
             pin_images: true,
             pin_todos: true,
             queue_mode: false,
-            auto_server_reload: true,
+            auto_server_reload: false,
             mouse_capture: true,
             debug_socket: false,
             emoji: true,

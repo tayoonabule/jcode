@@ -813,8 +813,8 @@ fn test_ambient_visible_defaults_to_true() {
 }
 
 #[test]
-fn test_display_auto_server_reload_defaults_to_true() {
-    assert!(DisplayConfig::default().auto_server_reload);
+fn test_display_auto_server_reload_defaults_to_false() {
+    assert!(!DisplayConfig::default().auto_server_reload);
 }
 
 #[test]
