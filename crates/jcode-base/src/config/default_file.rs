@@ -144,8 +144,8 @@ diff_line_wrap = true
 # Queue mode: wait until assistant is done before sending next message
 queue_mode = false
 
-# Automatically reload the remote server when a newer server binary is detected (default: true)
-auto_server_reload = true
+# Automatically reload the remote server when a newer server binary is detected (default: false)
+auto_server_reload = false
 
 # Capture mouse events (enables scroll wheel; disables terminal text selection)
 mouse_capture = true
@@ -364,8 +364,8 @@ openai_reasoning_effort = "low"
 # xhigh needs Opus 4.7/4.8 or Fable 5; max needs an output_config effort model (Opus/Sonnet 4.6+).
 # Defaults to xhigh for Claude Opus 4.7/4.8 (high on older Opus) when unset; other models keep their own default.
 # anthropic_reasoning_effort = "medium"
-# OpenAI transport mode (auto|websocket|https)
-# openai_transport = "auto"
+# OpenAI transport mode (auto|websocket|https). HTTPS avoids WebSocket failures on large tool surfaces.
+openai_transport = "https"
 # OpenAI service tier override (priority|flex|off)
 # Defaults to `priority` to match Codex /fast behavior for OpenAI OAuth
 # (higher speed, higher usage). Set to "off" (or "standard") to disable.
