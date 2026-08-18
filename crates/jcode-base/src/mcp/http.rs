@@ -19,6 +19,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 const SESSION_HEADER: &str = "mcp-session-id";
 const INTERACTIVE_AUTH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+static AUTH_STARTS: OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+    OnceLock::new();
+
 /// One interactive OAuth flow per server at a time. Multiple sessions can
 /// discover the same expired remote server concurrently; without this gate
 /// each request would open its own browser consent page before any of them had
@@ -40,9 +43,7 @@ fn interactive_auth_allowed(name: &str) -> bool {
     if std::env::var_os("JCODE_MCP_AUTH_AUTOFOLLOW").is_some() {
         return true;
     }
-    static STARTS: OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
-        OnceLock::new();
-    let starts = STARTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let starts = AUTH_STARTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut starts = starts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = std::time::Instant::now();
     if starts
@@ -56,21 +57,7 @@ fn interactive_auth_allowed(name: &str) -> bool {
     // cooldown alone still allows every new session to reopen the same stale
     // Google consent flow. Persist only the small timestamp, not credentials,
     // so the cooldown survives process restarts without changing token storage.
-    let safe: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let cooldown_path = if let Some(home) = std::env::var_os("JCODE_HOME") {
-        std::path::PathBuf::from(home)
-            .join("mcp-auth")
-            .join(format!("{safe}.prompt"))
-    } else {
-        dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".jcode")
-            .join("mcp-auth")
-            .join(format!("{safe}.prompt"))
-    };
+    let cooldown_path = interactive_auth_cooldown_path(name);
     if let Ok(value) = std::fs::read_to_string(&cooldown_path)
         && let Ok(started) = value.trim().parse::<u64>()
         && std::time::SystemTime::now()
@@ -89,6 +76,36 @@ fn interactive_auth_allowed(name: &str) -> bool {
         let _ = std::fs::write(cooldown_path, epoch.as_secs().to_string());
     }
     true
+}
+
+fn interactive_auth_cooldown_path(name: &str) -> std::path::PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if let Some(home) = std::env::var_os("JCODE_HOME") {
+        std::path::PathBuf::from(home)
+            .join("mcp-auth")
+            .join(format!("{safe}.prompt"))
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".jcode")
+            .join("mcp-auth")
+            .join(format!("{safe}.prompt"))
+    }
+}
+
+/// The marker prevents concurrent sessions from opening duplicate browser
+/// windows, but it must not survive the authorization attempt itself. If the
+/// provider or browser flow fails, leaving it behind strands the next tool call
+/// behind the ten-minute cooldown even though there are no usable credentials.
+fn clear_interactive_auth_attempt(name: &str) {
+    if let Some(starts) = AUTH_STARTS.get() {
+        let mut starts = starts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        starts.remove(name);
+    }
+    let _ = std::fs::remove_file(interactive_auth_cooldown_path(name));
 }
 
 /// One HTTP client shared by every remote MCP server.
@@ -197,14 +214,16 @@ impl HttpTransport {
             );
         }
 
-        let tokens = oauth::authorize(
+        let auth_result = oauth::authorize(
             &self.name,
             &self.url,
             challenge,
             self.oauth_config.as_ref(),
             false,
         )
-        .await?;
+        .await;
+        clear_interactive_auth_attempt(&self.name);
+        let tokens = auth_result?;
         *self.tokens.write().await = Some(tokens);
         Ok(())
     }
@@ -300,14 +319,16 @@ impl HttpTransport {
 
     /// Explicitly start the browser sign-in flow (used by `mcp login`).
     pub async fn login(&self) -> Result<()> {
-        let tokens = oauth::authorize(
+        let auth_result = oauth::authorize(
             &self.name,
             &self.url,
             None,
             self.oauth_config.as_ref(),
             false,
         )
-        .await?;
+        .await;
+        clear_interactive_auth_attempt(&self.name);
+        let tokens = auth_result?;
         *self.tokens.write().await = Some(tokens);
         Ok(())
     }
