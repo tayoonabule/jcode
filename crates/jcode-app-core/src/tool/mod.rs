@@ -1092,7 +1092,11 @@ impl Registry {
             let registry = self.clone();
             tokio::spawn(async move {
                 let (successes, failures) = {
-                    let manager = mcp_manager.write().await;
+                    // `connect_all` only needs shared access. Holding a write
+                    // lock here blocks every MCP tool call while an HTTP
+                    // server waits for browser OAuth, including unrelated
+                    // local or already-connected servers.
+                    let manager = mcp_manager.read().await;
                     manager.connect_all().await.unwrap_or((0, Vec::new()))
                 };
 
