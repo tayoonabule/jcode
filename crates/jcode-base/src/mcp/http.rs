@@ -144,8 +144,16 @@ impl HttpTransport {
             .url
             .clone()
             .context("HTTP MCP server config has no `url`")?;
+        let tokens = oauth::load_tokens(&name);
+        // Older builds left the prompt marker behind after a successful flow.
+        // If credentials are already persisted, that marker cannot represent
+        // the only active authorization attempt and should not block recovery
+        // after an expired-token refresh fails.
+        if tokens.is_some() {
+            clear_interactive_auth_attempt(&name);
+        }
         Ok(Self {
-            tokens: tokio::sync::RwLock::new(oauth::load_tokens(&name)),
+            tokens: tokio::sync::RwLock::new(tokens),
             name,
             url,
             client: shared_client(),
