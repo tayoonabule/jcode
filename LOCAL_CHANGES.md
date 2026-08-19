@@ -95,7 +95,9 @@ or open browser prompts during daemon startup.
 ## Keeping updates working
 
 Updates are expected to keep working: `jcode` rebases these commits onto
-upstream automatically. Two things to know.
+upstream automatically, including the background auto-update path. A clean
+checkout is required; conflicts or uncommitted work cause the update to abort
+without changing the checkout. Two things to know.
 
 1. **Check before trusting it.** After an upstream release lands:
 
