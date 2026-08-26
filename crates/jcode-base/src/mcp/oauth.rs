@@ -370,9 +370,17 @@ where
             .await
             .context("Dynamic client registration failed")?;
         if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::FORBIDDEN {
+                anyhow::bail!(
+                    "Dynamic client registration rejected (403): the OAuth provider does not allow this MCP client; Figma remote MCP currently requires an approved client integration"
+                );
+            }
             anyhow::bail!(
-                "Dynamic client registration rejected ({})",
-                resp.status().as_u16()
+                "Dynamic client registration rejected ({}): {}",
+                status.as_u16(),
+                detail.chars().take(200).collect::<String>()
             );
         }
         resp.json::<RegistrationResponse>().await?.client_id
