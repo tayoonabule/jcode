@@ -228,7 +228,8 @@ pub struct McpServerConfig {
     #[serde(default = "default_shared")]
     pub shared: bool,
     /// Transport type from Claude Code configs ("stdio", "http", "sse").
-    /// Remote HTTP and SSE entries use Streamable HTTP; defaults to stdio.
+    /// `http` selects Streamable HTTP and `sse` selects the legacy GET/event
+    /// stream transport; URL entries without a type default to Streamable HTTP.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
     /// URL for HTTP/SSE servers.
@@ -253,8 +254,7 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
-    /// Whether this entry is a local stdio (command-based) server. HTTP and
-    /// SSE entries are remote and use the Streamable HTTP transport instead.
+    /// Whether this entry is a local stdio (command-based) server.
     pub fn is_stdio(&self) -> bool {
         if let Some(t) = &self.transport {
             let t = t.to_ascii_lowercase();

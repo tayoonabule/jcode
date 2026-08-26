@@ -11,6 +11,7 @@ pub mod oauth;
 pub mod pool;
 mod protocol;
 pub mod schema_cache;
+pub mod sse;
 mod tool;
 
 pub use client::{McpClient, McpHandle};
