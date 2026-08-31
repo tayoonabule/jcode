@@ -36,6 +36,9 @@ fn session(id: &str) -> SessionInfo {
         title: None,
         status: "idle".to_string(),
         transcript_bytes: None,
+        saved: false,
+        updated_at_ms: None,
+        last_active_at_ms: None,
         archived: false,
         archived_at_ms: None,
     }
@@ -148,6 +151,7 @@ fn ga_runtime_and_file_methods_map_requests_and_typed_replies() {
                 session_id: "s1".to_string(),
                 provider: Some("anthropic".to_string()),
                 model: Some("claude".to_string()),
+                reasoning_effort: Some("high".to_string()),
                 routes: reply_routes.clone(),
             },
             ApiRequest::SetApiKey { provider, .. } => ApiEvent::CredentialUpdated {

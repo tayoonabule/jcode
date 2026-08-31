@@ -7,6 +7,13 @@ impl Config {
         reason = "Environment override parsing is intentionally explicit and grouped by config area"
     )]
     pub(crate) fn apply_env_overrides(&mut self) {
+        // Server/operator behavior
+        if let Ok(v) = std::env::var("JCODE_WAKE_MODE")
+            && let Some(parsed) = WakeMode::parse(&v)
+        {
+            self.server.wake_mode = parsed;
+        }
+
         // Keybindings
         if let Ok(v) = std::env::var("JCODE_SCROLL_UP_KEY") {
             self.keybindings.scroll_up = v;
@@ -119,6 +126,16 @@ impl Config {
             && let Some(parsed) = parse_env_bool(&v)
         {
             self.tools.disable_base_tools = parsed;
+        }
+        if let Ok(v) = std::env::var("JCODE_MCP_TOOLS")
+            && let Some(mode) = crate::config::McpToolsMode::parse(&v)
+        {
+            self.tools.mcp_tools = mode;
+        }
+        if let Ok(v) = std::env::var("JCODE_MCP_TOOLS_TOKEN_THRESHOLD")
+            && let Ok(parsed) = v.trim().parse::<usize>()
+        {
+            self.tools.mcp_tools_token_threshold = parsed;
         }
 
         // ACP adapter
@@ -282,6 +299,11 @@ impl Config {
                 self.display.show_agentgrep_output = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_SHOW_BASH_OUTPUT") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.show_bash_output = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_TOOL_CALL_DETAILS") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.tool_call_details = parsed;
@@ -317,6 +339,11 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_ENABLE_MERMAID") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.features.mermaid = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_CHECK_UPDATES") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.check_updates = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_AUTO_POKE") {
@@ -761,6 +788,18 @@ impl Config {
                     self.provider.stream_idle_timeout_secs = parsed;
                 }
             }
+        }
+        if let Ok(v) = std::env::var("JCODE_MAX_RETRIES")
+            && let Ok(parsed) = v.trim().parse::<u32>()
+            && parsed > 0
+        {
+            self.provider.max_retries = parsed;
+        }
+        if let Ok(v) = std::env::var("JCODE_RETRY_BACKOFF_CAP_SECS")
+            && let Ok(parsed) = v.trim().parse::<u64>()
+            && parsed > 0
+        {
+            self.provider.retry_backoff_cap_secs = parsed;
         }
 
         // Copilot premium mode: env var overrides config

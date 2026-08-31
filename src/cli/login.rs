@@ -295,6 +295,9 @@ pub async fn run_login_provider(
             LoginProviderTarget::OpenAiApiKey => {
                 login_openai_api_key_flow().map(|_| LoginFlowOutcome::Completed)
             }
+            LoginProviderTarget::GrokBuild => login_grok_build_flow()
+                .await
+                .map(|_| LoginFlowOutcome::Completed),
             LoginProviderTarget::OpenRouter => {
                 login_openrouter_flow().map(|_| LoginFlowOutcome::Completed)
             }
@@ -400,6 +403,28 @@ pub async fn run_login_provider(
     );
     maybe_persist_default_provider_after_login(provider, &options);
     notify_running_server_auth_changed_best_effort(Some(provider.id)).await;
+    Ok(())
+}
+
+async fn login_grok_build_flow() -> Result<()> {
+    eprintln!("Preparing the Jcode-managed Grok Build backend...");
+    let cli = crate::auth::grok_build::ensure_cli().await?;
+    let status = tokio::process::Command::new(&cli)
+        .arg("login")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to launch Jcode's managed Grok Build backend at '{}'",
+                cli.display()
+            )
+        })?;
+    if !status.success() {
+        anyhow::bail!("`{} login` exited with status {status}", cli.display());
+    }
     Ok(())
 }
 

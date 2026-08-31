@@ -1,7 +1,7 @@
 use super::{
     AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands, LatexRenderingMode,
-    ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig, config_env_fingerprint,
-    populate_context_limits_from_config_ref,
+    McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig,
+    config_env_fingerprint, populate_context_limits_from_config_ref,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -79,6 +79,24 @@ fn auto_poke_feature_defaults_on_and_parses_false() {
     let cfg: Config =
         toml::from_str("[features]\nauto_poke = false\n").expect("features.auto_poke should parse");
     assert!(!cfg.features.auto_poke);
+}
+
+#[test]
+fn auto_poke_toggle_key_defaults_parses_and_reports_disabled() {
+    assert_eq!(Config::default().keybindings.auto_poke_toggle, "ctrl+p");
+
+    let remapped: Config = toml::from_str("[keybindings]\nauto_poke_toggle = \"alt+p\"\n")
+        .expect("keybindings.auto_poke_toggle should parse");
+    assert_eq!(remapped.keybindings.auto_poke_toggle, "alt+p");
+
+    let disabled: Config = toml::from_str("[keybindings]\nauto_poke_toggle = \"\"\n")
+        .expect("an empty auto-poke toggle should parse");
+    assert!(disabled.keybindings.auto_poke_toggle.is_empty());
+    assert!(
+        disabled
+            .display_string()
+            .contains("- Auto-poke toggle: `disabled`")
+    );
 }
 
 #[test]
@@ -206,6 +224,24 @@ fn test_env_override_swarm_model() {
     assert_eq!(cfg.agents.swarm_model, None);
 
     restore_env_var("JCODE_SWARM_MODEL", prev);
+}
+
+#[test]
+fn wake_mode_defaults_parses_and_env_overrides() {
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_WAKE_MODE");
+    assert_eq!(
+        Config::default().server.wake_mode,
+        crate::config::WakeMode::Internal
+    );
+    let parsed: Config = toml::from_str("[server]\nwake_mode = \"external\"\n").unwrap();
+    assert_eq!(parsed.server.wake_mode, crate::config::WakeMode::External);
+
+    crate::env::set_var("JCODE_WAKE_MODE", "external");
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.server.wake_mode, crate::config::WakeMode::External);
+    restore_env_var("JCODE_WAKE_MODE", prev);
 }
 
 #[test]
@@ -394,9 +430,42 @@ fn test_env_override_memory_sidecar() {
 
 #[test]
 fn tool_config_defaults_to_full_toolset() {
-    let selection = ToolConfig::default().selection();
+    let config = ToolConfig::default();
+    let selection = config.selection();
     assert!(selection.allowed_tools.is_none());
     assert!(selection.disabled_tools.is_empty());
+    assert_eq!(config.mcp_tools, McpToolsMode::Auto);
+    assert_eq!(config.mcp_tools_token_threshold, 8_000);
+}
+
+#[test]
+fn tool_config_deserializes_all_mcp_exposure_modes() {
+    for (raw, expected) in [
+        ("auto", McpToolsMode::Auto),
+        ("eager", McpToolsMode::Eager),
+        ("deferred", McpToolsMode::Deferred),
+    ] {
+        let config: Config = toml::from_str(&format!("[tools]\nmcp_tools = \"{raw}\"\n"))
+            .expect("valid MCP exposure mode");
+        assert_eq!(config.tools.mcp_tools, expected);
+    }
+}
+
+#[test]
+fn tool_config_mcp_exposure_env_overrides() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_mode = std::env::var_os("JCODE_MCP_TOOLS");
+    let previous_threshold = std::env::var_os("JCODE_MCP_TOOLS_TOKEN_THRESHOLD");
+    crate::env::set_var("JCODE_MCP_TOOLS", "deferred");
+    crate::env::set_var("JCODE_MCP_TOOLS_TOKEN_THRESHOLD", "4321");
+
+    let mut config = Config::default();
+    config.apply_env_overrides();
+
+    assert_eq!(config.tools.mcp_tools, McpToolsMode::Deferred);
+    assert_eq!(config.tools.mcp_tools_token_threshold, 4_321);
+    restore_env_var("JCODE_MCP_TOOLS", previous_mode);
+    restore_env_var("JCODE_MCP_TOOLS_TOKEN_THRESHOLD", previous_threshold);
 }
 
 #[test]
@@ -537,7 +606,7 @@ fn tool_config_disabled_only_keeps_full_profile_with_deny_list() {
 }
 
 #[test]
-fn test_generated_default_config_uses_low_openai_reasoning_effort() {
+fn test_generated_default_config_has_expected_user_defaults() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -592,6 +661,15 @@ fn test_generated_default_config_uses_low_openai_reasoning_effort() {
     let parsed: Config =
         toml::from_str(&content).expect("generated default config should parse as Config");
     assert_eq!(parsed.agents.swarm_spawn_mode, SwarmSpawnMode::Inline);
+    assert!(
+        parsed.display.show_thinking,
+        "freshly created user config should request model reasoning"
+    );
+    assert_eq!(
+        parsed.display.reasoning_display(),
+        jcode_config_types::ReasoningDisplayMode::Full,
+        "freshly created user config should show the full reasoning trace"
+    );
 
     if let Some(prev) = prev_home {
         crate::env::set_var("JCODE_HOME", prev);
@@ -1020,6 +1098,8 @@ fn populate_context_limits_from_config_ref_seeds_global_cache() {
             base_url: "https://gateway.example.test/v1".to_string(),
             models: vec![NamedProviderModelConfig {
                 id: model_id.to_string(),
+                reasoning: None,
+                reasoning_effort: None,
                 context_window: Some(1_000_000),
                 input: Vec::new(),
             }],
@@ -1054,11 +1134,15 @@ fn populate_context_limits_from_config_seeds_qualified_runtime_model_shapes() {
             models: vec![
                 NamedProviderModelConfig {
                     id: "issue421-qwen-128k".to_string(),
+                    reasoning: None,
+                    reasoning_effort: None,
                     context_window: Some(131_072),
                     input: Vec::new(),
                 },
                 NamedProviderModelConfig {
                     id: "/opt/models/issue421-ornith-35b-q4.gguf".to_string(),
+                    reasoning: None,
+                    reasoning_effort: None,
                     context_window: Some(131_072),
                     input: Vec::new(),
                 },

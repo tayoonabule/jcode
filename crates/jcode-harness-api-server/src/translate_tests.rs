@@ -52,6 +52,16 @@ impl Drop for ScopedJcodeHome {
 }
 
 fn write_session_record(home: &Path, session_id: &str, working_dir: &Path) -> PathBuf {
+    write_session_record_with_titles(home, session_id, working_dir, None, None)
+}
+
+fn write_session_record_with_titles(
+    home: &Path,
+    session_id: &str,
+    working_dir: &Path,
+    title: Option<&str>,
+    custom_title: Option<&str>,
+) -> PathBuf {
     let sessions = home.join("sessions");
     std::fs::create_dir_all(&sessions).expect("create sessions directory");
     let path = sessions.join(format!("{session_id}.json"));
@@ -59,12 +69,43 @@ fn write_session_record(home: &Path, session_id: &str, working_dir: &Path) -> Pa
         &path,
         json!({
             "working_dir": working_dir,
+            "title": title,
+            "custom_title": custom_title,
             "messages": [{"role": "user", "content": "hello"}],
         })
         .to_string(),
     )
     .expect("write session record");
     path
+}
+
+#[test]
+fn persisted_metadata_reads_large_transcripts_from_bounded_windows() {
+    let home = ScopedJcodeHome::new("bounded-metadata");
+    let sessions = home.path.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create sessions directory");
+    let path = sessions.join("session_large.json");
+    let mut file = std::fs::File::create(&path).expect("create large session");
+    write!(
+        file,
+        "{{\"id\":\"session_large\",\"title\":\"Generated title\",\"messages\":[\""
+    )
+    .unwrap();
+    for _ in 0..(2 * 1024) {
+        file.write_all(&[b'x'; 1024]).unwrap();
+    }
+    write!(
+        file,
+        "\"],\"working_dir\":\"/workspace/large\",\"custom_title\":\"Pinned title\"}}"
+    )
+    .unwrap();
+    drop(file);
+
+    let metadata = BridgeState::resolve_session_metadata("session_large").expect("metadata");
+    assert_eq!(metadata.working_dir.as_deref(), Some("/workspace/large"));
+    assert_eq!(metadata.title.as_deref(), Some("Generated title"));
+    assert_eq!(metadata.custom_title.as_deref(), Some("Pinned title"));
+    assert_eq!(metadata.display_title().as_deref(), Some("Pinned title"));
 }
 
 fn only_reply_event(outbound: Vec<Outbound>) -> ApiEvent {
@@ -83,6 +124,45 @@ fn state_with_session() -> BridgeState {
 }
 
 #[test]
+fn connection_phase_is_forwarded_to_api_clients() {
+    let mut state = state_with_session();
+    let frames = state.legacy_event_to_api(&json!({
+        "type": "connection_phase",
+        "phase": "sending request",
+    }));
+
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].reply_to, None);
+    assert_eq!(
+        frames[0].event,
+        ApiEvent::ConnectionPhase {
+            session_id: "s1".into(),
+            phase: "sending request".into(),
+        }
+    );
+}
+
+#[test]
+fn wake_request_is_forwarded_with_explicit_session_and_payload() {
+    let mut state = state_with_session();
+    let frames = state.legacy_event_to_api(&json!({
+        "type": "wake_requested",
+        "session_id": "target",
+        "reason": "background_task_completed",
+        "notification": "finished",
+    }));
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        frames[0].event,
+        ApiEvent::WakeRequested {
+            session_id: "target".into(),
+            reason: "background_task_completed".into(),
+            notification: "finished".into(),
+        }
+    );
+}
+
+#[test]
 fn create_session_maps_to_subscribe() {
     let mut state = BridgeState::default();
     let out = state.api_request_to_legacy(&json!({"req": "create_session", "id": 1}));
@@ -94,7 +174,41 @@ fn create_session_maps_to_subscribe() {
 }
 
 #[test]
+fn desktop_owned_session_requests_crash_on_disconnect() {
+    let mut state = BridgeState::with_crash_on_disconnect(true);
+    let out = state.api_request_to_legacy(&json!({"req": "create_session", "id": 1}));
+    let Outbound::Legacy(value) = &out[0] else {
+        panic!("expected legacy outbound");
+    };
+    assert_eq!(value["crash_on_disconnect"], true);
+}
+
+#[test]
+fn detach_disarms_crash_on_disconnect() {
+    let mut state = BridgeState::with_crash_on_disconnect(true);
+    let out = state.api_request_to_legacy(&json!({
+        "req": "detach_session",
+        "id": 2,
+        "session_id": "abc",
+    }));
+    let Outbound::Legacy(value) = &out[0] else {
+        panic!("expected legacy outbound");
+    };
+    assert_eq!(value["type"], "prepare_disconnect");
+}
+
+#[test]
 fn state_event_answers_pending_attach() {
+    let home = ScopedJcodeHome::new("attach-title");
+    let project = home.path.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    write_session_record_with_titles(
+        &home.path,
+        "abc",
+        &project,
+        Some("Generated attach title"),
+        Some("Persisted attach rename"),
+    );
     let mut state = BridgeState::default();
     let out = state.api_request_to_legacy(&json!({"req": "create_session", "id": 5}));
     assert_eq!(
@@ -119,7 +233,11 @@ fn state_event_answers_pending_attach() {
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].reply_to, Some(5));
     match &frames[0].event {
-        ApiEvent::Attached { session } => assert_eq!(session.session_id, "abc"),
+        ApiEvent::Attached { session } => {
+            assert_eq!(session.session_id, "abc");
+            assert_eq!(session.title.as_deref(), Some("Persisted attach rename"));
+            assert_eq!(session.working_dir.as_deref(), project.to_str());
+        }
         other => panic!("unexpected: {other:?}"),
     }
     assert_eq!(state.session_id.as_deref(), Some("abc"));
@@ -434,14 +552,14 @@ fn an_available_models_push_updates_the_model() {
 
 #[test]
 fn create_session_in_a_jcode_checkout_requests_selfdev() {
-    // Regression: desktop2 opens its own crate, and without the `selfdev`
+    // Regression: external client opens its own crate, and without the `selfdev`
     // flag the daemon hands back an agent with no self-dev tools or prompt.
     let mut state = BridgeState::default();
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .expect("workspace root")
-        .join("crates/jcode-desktop2");
+        .join("crates/jcode-tui");
     let out = state.api_request_to_legacy(&json!({
         "req": "create_session",
         "id": 1,
@@ -651,6 +769,7 @@ fn attached_requests_still_reach_the_daemon() {
 /// `list_sessions`, so the attach guard must leave them alone.
 #[test]
 fn browsing_requests_work_without_attaching() {
+    let _home = ScopedJcodeHome::new("browsing-without-attach");
     let mut state = BridgeState::default();
     for req in ["list_sessions", "peek_session", "ping"] {
         let out = state.api_request_to_legacy(&json!({
@@ -836,6 +955,54 @@ fn reasoning_effort_reports_provider_refusal() {
     assert!(matches!(frames[0].event, ApiEvent::Error { .. }));
 }
 
+/// An effort change is identity, like a model change: every attached client
+/// needs to hear it, not only the requester. A change made by another client
+/// (no pending request here) must still arrive as a `model_info` broadcast,
+/// and the requester's own change gets the broadcast after its `Ok`.
+#[test]
+fn reasoning_effort_changes_are_broadcast_as_model_info() {
+    let mut state = state_with_session();
+
+    // Unsolicited change (another client's request id): broadcast only.
+    let frames = state.legacy_event_to_api(&json!({
+        "type": "reasoning_effort_changed", "id": 999, "effort": "high",
+    }));
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].reply_to, None);
+    match &frames[0].event {
+        ApiEvent::ModelInfo {
+            reasoning_effort, ..
+        } => assert_eq!(reasoning_effort.as_deref(), Some("high")),
+        other => panic!("expected model_info, got {other:?}"),
+    }
+
+    // The same effort again is not news: no broadcast.
+    let frames = state.legacy_event_to_api(&json!({
+        "type": "reasoning_effort_changed", "id": 999, "effort": "high",
+    }));
+    assert!(frames.is_empty(), "unchanged effort must not re-broadcast");
+
+    // This client's own change: Ok reply first, then the broadcast.
+    let out = state.api_request_to_legacy(&json!({
+        "id": 7, "req": "set_reasoning_effort", "effort": "low",
+    }));
+    let legacy_id = match &out[0] {
+        Outbound::Legacy(value) => value["id"].as_u64().unwrap(),
+        _ => unreachable!(),
+    };
+    let frames = state.legacy_event_to_api(&json!({
+        "type": "reasoning_effort_changed", "id": legacy_id, "effort": "low",
+    }));
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].reply_to, Some(7));
+    assert!(matches!(frames[0].event, ApiEvent::Ok));
+    assert!(matches!(
+        &frames[1].event,
+        ApiEvent::ModelInfo { reasoning_effort, .. }
+            if reasoning_effort.as_deref() == Some("low")
+    ));
+}
+
 /// Compaction can be refused (nothing to compact, a turn in flight) and the
 /// daemon says so with `success: false`, not an error frame. Telling the
 /// client "done" would claim work that never happened.
@@ -952,6 +1119,126 @@ fn capability_requests_need_an_attached_session() {
     }
 }
 
+#[test]
+fn another_sessions_broadcast_does_not_replace_the_attachment() {
+    let mut state = BridgeState::default();
+    let attach = state.api_request_to_legacy(&json!({
+        "id": 7,
+        "req": "attach_session",
+        "session_id": "session_retriever_1_a",
+    }));
+    let state_id = match &attach[1] {
+        Outbound::Legacy(value) => value["id"].as_u64().expect("state request id"),
+        other => panic!("unexpected attach output: {other:?}"),
+    };
+    state.legacy_event_to_api(&json!({
+        "type": "state",
+        "id": state_id,
+        "session_id": "session_retriever_1_a",
+    }));
+
+    state.legacy_event_to_api(&json!({
+        "type": "session",
+        "session_id": "session_pawprint_2_b",
+    }));
+
+    assert!(matches!(
+        state
+            .api_request_to_legacy(&json!({
+                "id": 8,
+                "req": "send_message",
+                "session_id": "session_retriever_1_a",
+                "content": "still routed to the attached session",
+            }))
+            .as_slice(),
+        [Outbound::Legacy(_)]
+    ));
+}
+
+#[test]
+fn another_sessions_state_does_not_replace_the_attachment() {
+    let mut state = BridgeState::default();
+    let attach = state.api_request_to_legacy(&json!({
+        "id": 7,
+        "req": "attach_session",
+        "session_id": "session_retriever_1_a",
+    }));
+    let state_id = match &attach[1] {
+        Outbound::Legacy(value) => value["id"].as_u64().expect("state request id"),
+        other => panic!("unexpected attach output: {other:?}"),
+    };
+    state.legacy_event_to_api(&json!({
+        "type": "state",
+        "id": state_id,
+        "session_id": "session_retriever_1_a",
+    }));
+
+    state.legacy_event_to_api(&json!({
+        "type": "state",
+        "id": state_id + 100,
+        "session_id": "session_pawprint_2_b",
+    }));
+
+    assert!(matches!(
+        state
+            .api_request_to_legacy(&json!({
+                "id": 8,
+                "req": "send_message",
+                "session_id": "session_retriever_1_a",
+                "content": "still routed to the attached session",
+            }))
+            .as_slice(),
+        [Outbound::Legacy(_)]
+    ));
+}
+
+#[test]
+fn legacy_request_ids_are_unique_across_bridge_connections() {
+    let mut first = BridgeState::default();
+    let mut second = BridgeState::default();
+    let first_attach = first.api_request_to_legacy(&json!({
+        "id": 1,
+        "req": "attach_session",
+        "session_id": "session_first",
+    }));
+    let second_attach = second.api_request_to_legacy(&json!({
+        "id": 1,
+        "req": "attach_session",
+        "session_id": "session_second",
+    }));
+    let request_id = |outbound: &[Outbound]| match &outbound[1] {
+        Outbound::Legacy(value) => value["id"].as_u64().expect("state request id"),
+        other => panic!("unexpected attach output: {other:?}"),
+    };
+
+    assert_ne!(request_id(&first_attach), request_id(&second_attach));
+}
+
+#[test]
+fn colliding_state_id_for_another_target_does_not_complete_attach() {
+    let mut state = BridgeState::default();
+    let attach = state.api_request_to_legacy(&json!({
+        "id": 7,
+        "req": "attach_session",
+        "session_id": "session_wanted",
+    }));
+    let state_id = match &attach[1] {
+        Outbound::Legacy(value) => value["id"].as_u64().expect("state request id"),
+        other => panic!("unexpected attach output: {other:?}"),
+    };
+
+    assert!(
+        state
+            .legacy_event_to_api(&json!({
+                "type": "state",
+                "id": state_id,
+                "session_id": "session_other",
+            }))
+            .is_empty()
+    );
+    assert!(state.session_id.is_none());
+}
+
 /// A session id becomes a filesystem path, so it must be treated as untrusted.
 ///
 /// The id arrives straight off the wire and is interpolated into
@@ -1013,8 +1300,20 @@ fn unattached_list_sessions_discovers_all_persisted_records() {
     let second_root = home.path.join("second-project");
     std::fs::create_dir_all(&first_root).unwrap();
     std::fs::create_dir_all(&second_root).unwrap();
-    write_session_record(&home.path, "persisted_one", &first_root);
-    write_session_record(&home.path, "persisted_two", &second_root);
+    write_session_record_with_titles(
+        &home.path,
+        "persisted_one",
+        &first_root,
+        Some("  Generated first title  "),
+        None,
+    );
+    write_session_record_with_titles(
+        &home.path,
+        "persisted_two",
+        &second_root,
+        Some("Generated second title"),
+        Some("  Custom second title  "),
+    );
     std::fs::write(home.path.join("sessions/not-a-session.txt"), "ignored").unwrap();
 
     let event = only_reply_event(
@@ -1032,6 +1331,54 @@ fn unattached_list_sessions_discovers_all_persisted_records() {
     );
     assert_eq!(sessions[0].working_dir.as_deref(), first_root.to_str());
     assert_eq!(sessions[1].working_dir.as_deref(), second_root.to_str());
+    assert_eq!(sessions[0].title.as_deref(), Some("Generated first title"));
+    assert_eq!(sessions[1].title.as_deref(), Some("Custom second title"));
+}
+
+#[test]
+fn limited_session_list_reads_compact_index_without_transcript_records() {
+    let home = ScopedJcodeHome::new("metadata-index");
+    assert!(BridgeState::recent_session_index_entries().is_empty());
+    let mut connection = Connection::open(home.path.join("session-metadata-v1.sqlite3")).unwrap();
+    let transaction = connection.transaction().unwrap();
+    for index in 0..100 {
+        transaction
+            .execute(
+                "INSERT INTO recent_sessions (
+                     session_id, working_dir, todo_title, saved, updated_at_ms, last_active_at_ms
+                 ) VALUES (?1, '/indexed/project', ?2, ?4, ?3, ?3)",
+                params![
+                    format!("indexed_{index:03}"),
+                    format!("Indexed goal {index}"),
+                    index,
+                    index == 99,
+                ],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+
+    let event = only_reply_event(
+        BridgeState::default()
+            .api_request_to_legacy(&json!({"req": "list_sessions", "id": 1, "limit": 100})),
+    );
+    let ApiEvent::Sessions { sessions } = event else {
+        panic!("expected sessions reply, got {event:?}");
+    };
+    assert_eq!(sessions.len(), 100);
+    let newest = sessions
+        .iter()
+        .find(|session| session.session_id == "indexed_099")
+        .expect("indexed newest session");
+    assert!(newest.saved);
+    assert_eq!(newest.updated_at_ms, Some(99));
+    assert_eq!(newest.last_active_at_ms, Some(99));
+    assert!(sessions.iter().all(|session| {
+        session
+            .title
+            .as_deref()
+            .is_some_and(|title| title.starts_with("Indexed goal "))
+    }));
 }
 
 #[test]
@@ -1041,6 +1388,7 @@ fn runtime_info_reports_the_active_provider_and_complete_route_catalog() {
         "type": "available_models_updated",
         "provider_name": "anthropic",
         "provider_model": "claude-sonnet",
+        "reasoning_effort": "high",
         "available_models": ["claude-sonnet", "gemini-pro"],
         "available_model_routes": [
             {
@@ -1069,6 +1417,7 @@ fn runtime_info_reports_the_active_provider_and_complete_route_catalog() {
         session_id,
         provider,
         model,
+        reasoning_effort,
         routes,
     } = event
     else {
@@ -1077,6 +1426,7 @@ fn runtime_info_reports_the_active_provider_and_complete_route_catalog() {
     assert_eq!(session_id, "s1");
     assert_eq!(provider.as_deref(), Some("anthropic"));
     assert_eq!(model.as_deref(), Some("claude-sonnet"));
+    assert_eq!(reasoning_effort.as_deref(), Some("high"));
     assert_eq!(routes.len(), 2);
     assert_eq!(routes[1].provider, "gemini");
     assert!(!routes[1].available);

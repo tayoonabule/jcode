@@ -24,15 +24,18 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const TELEMETRY_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/event";
+const TRANSCRIPT_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/transcript";
 const ASYNC_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKGROUND_QUEUE_CAPACITY: usize = 2048;
 const BLOCKING_INSTALL_TIMEOUT: Duration = Duration::from_millis(1200);
 const BLOCKING_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(800);
+const BLOCKING_FIRST_PROMPT_TIMEOUT: Duration = Duration::from_millis(500);
 const TELEMETRY_SCHEMA_VERSION: u32 = 6;
 const DEFAULT_DISCOVERY_ENDPOINT: &str = "https://api.jcode.sh/v1/discovery";
 static TELEMETRY_PERMANENTLY_REJECTED: AtomicBool = AtomicBool::new(false);
 static TELEMETRY_QUEUE_OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
 static TELEMETRY_BACKGROUND_SENDER: OnceLock<SyncSender<Value>> = OnceLock::new();
+static TRANSCRIPT_BACKGROUND_SENDER: OnceLock<SyncSender<Value>> = OnceLock::new();
 static TELEMETRY_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 #[cfg(test)]
 static TEST_EMITTED_PAYLOADS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
@@ -407,16 +410,62 @@ enum DeliveryMode {
     Blocking(Duration),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryOptOutSource {
+    Environment,
+    MarkerFile,
+}
+
+impl TelemetryOptOutSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::MarkerFile => "marker_file",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryStatus {
+    pub enabled: bool,
+    pub content_sharing_enabled: bool,
+    pub opt_out_source: Option<TelemetryOptOutSource>,
+    pub telemetry_id: Option<String>,
+}
+
+pub fn opt_out_source() -> Option<TelemetryOptOutSource> {
+    if opt_out_forced_by_env() {
+        return Some(TelemetryOptOutSource::Environment);
+    }
+    opt_out_marker_path()
+        .is_some_and(|path| path.exists())
+        .then_some(TelemetryOptOutSource::MarkerFile)
+}
+
+/// Return the current telemetry state without creating a telemetry identity or
+/// changing any persisted state.
+pub fn status() -> TelemetryStatus {
+    let opt_out_source = opt_out_source();
+    TelemetryStatus {
+        enabled: opt_out_source.is_none(),
+        content_sharing_enabled: content_sharing_enabled(),
+        opt_out_source,
+        telemetry_id: read_existing_id(),
+    }
+}
+
 pub fn is_enabled() -> bool {
-    if std::env::var("JCODE_NO_TELEMETRY").is_ok() || std::env::var("DO_NOT_TRACK").is_ok() {
-        logging::debug("telemetry disabled by environment");
-        return false;
+    match opt_out_source() {
+        Some(TelemetryOptOutSource::Environment) => {
+            logging::debug("telemetry disabled by environment");
+            false
+        }
+        Some(TelemetryOptOutSource::MarkerFile) => {
+            logging::debug("telemetry disabled by no_telemetry marker");
+            false
+        }
+        None => true,
     }
-    if opt_out_marker_path().map(|p| p.exists()).unwrap_or(false) {
-        logging::debug("telemetry disabled by no_telemetry marker");
-        return false;
-    }
-    true
 }
 
 /// Marker file recording that the user opted out of anonymous usage telemetry.
@@ -431,7 +480,15 @@ fn opt_out_marker_path() -> Option<std::path::PathBuf> {
 /// persisted marker. Env opt-outs win, so UI should present themselves as
 /// read-only in that case.
 pub fn opt_out_forced_by_env() -> bool {
-    std::env::var("JCODE_NO_TELEMETRY").is_ok() || std::env::var("DO_NOT_TRACK").is_ok()
+    fn is_truthy(name: &str) -> bool {
+        std::env::var(name).is_ok_and(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        })
+    }
+    is_truthy("JCODE_NO_TELEMETRY") || is_truthy("DO_NOT_TRACK")
 }
 
 /// Persist the user's anonymous-usage telemetry choice. `enabled == false`
@@ -451,6 +508,12 @@ pub fn set_usage_telemetry_enabled(enabled: bool) -> bool {
             }
         }
     } else {
+        // Record the explicit in-app choice once, while telemetry is still
+        // enabled. Failure never prevents or delays the opt-out itself, and
+        // environment-forced opt-outs remain completely silent.
+        if !path.exists() && !opt_out_forced_by_env() {
+            emit_telemetry_opt_out();
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -467,6 +530,31 @@ pub fn set_usage_telemetry_enabled(enabled: bool) -> bool {
     }
 }
 
+fn emit_telemetry_opt_out() {
+    let Some(id) = get_or_create_id() else {
+        return;
+    };
+    let (schema_version, build_channel, git_checkout, ci, from_cargo) = telemetry_envelope();
+    let payload = serde_json::json!({
+        "event_id": new_event_id(),
+        "id": id,
+        "event": "telemetry_opt_out",
+        "version": version(),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "step": "telemetry_settings",
+        "schema_version": schema_version,
+        "build_channel": build_channel,
+        "is_git_checkout": git_checkout,
+        "is_ci": ci,
+        "ran_from_cargo": from_cargo,
+    });
+    let _ = send_payload(
+        payload,
+        DeliveryMode::Blocking(BLOCKING_FIRST_PROMPT_TIMEOUT),
+    );
+}
+
 /// Marker file recording that the user opted in to sharing prompt and
 /// transcript content with telemetry. This is a separate, more sensitive
 /// consent than the anonymous usage metrics gated by [`is_enabled`], so it is
@@ -475,7 +563,9 @@ pub fn set_usage_telemetry_enabled(enabled: bool) -> bool {
 fn share_content_marker_path() -> Option<std::path::PathBuf> {
     storage::jcode_dir()
         .ok()
-        .map(|d| d.join("telemetry_share_content"))
+        // Version the marker so introducing actual uploads cannot silently turn
+        // an older, pre-upload UI choice into consent for the new program.
+        .map(|d| d.join("telemetry_share_transcripts_v1"))
 }
 
 /// Whether the user has opted in to sharing prompt/transcript content.
@@ -522,6 +612,50 @@ pub fn set_content_sharing_enabled(enabled: bool) -> bool {
             }
         }
     }
+}
+
+/// Queue one complete conversation transcript for the separately consented
+/// content-sharing program. This path is intentionally distinct from anonymous
+/// usage telemetry: it has its own endpoint, queue, backend storage, and an
+/// explicit opt-in gate that is off by default.
+pub fn record_transcript(
+    provider: &str,
+    model: &str,
+    end_reason: SessionEndReason,
+    messages: Value,
+) -> bool {
+    if !content_sharing_enabled() {
+        return false;
+    }
+    let Some(id) = get_or_create_id() else {
+        return false;
+    };
+    let message_count = messages.as_array().map_or(0, Vec::len);
+    if message_count == 0 {
+        return false;
+    }
+    let (schema_version, build_channel, is_git_checkout, is_ci, ran_from_cargo) =
+        telemetry_envelope();
+    let payload = serde_json::json!({
+        "id": id,
+        "event": "transcript",
+        "upload_id": uuid::Uuid::new_v4().to_string(),
+        "consent_version": 1,
+        "schema_version": schema_version,
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "build_channel": build_channel,
+        "is_git_checkout": is_git_checkout,
+        "is_ci": is_ci,
+        "ran_from_cargo": ran_from_cargo,
+        "provider": sanitize_telemetry_label(provider),
+        "model": sanitize_telemetry_label(model),
+        "end_reason": end_reason.as_str(),
+        "message_count": message_count,
+        "messages": messages,
+    });
+    send_transcript_payload(payload)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1195,6 +1329,51 @@ fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
     }
 }
 
+fn post_payload_with_retry(payload: serde_json::Value, timeout: Duration) -> bool {
+    const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(800)];
+    if post_payload(payload.clone(), timeout) {
+        return true;
+    }
+    for delay in RETRY_DELAYS {
+        if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep(delay);
+        if post_payload(payload.clone(), timeout) {
+            return true;
+        }
+    }
+    false
+}
+
+fn post_transcript_payload(payload: serde_json::Value, timeout: Duration) -> bool {
+    let client = TELEMETRY_HTTP_CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent(jcode_provider_core::JCODE_USER_AGENT)
+            .build()
+            .expect("telemetry HTTP client should build")
+    });
+    match client
+        .post(TRANSCRIPT_ENDPOINT)
+        .timeout(timeout)
+        .json(&payload)
+        .send()
+    {
+        Ok(response) if response.status().is_success() => true,
+        Ok(response) => {
+            logging::warn(&format!(
+                "transcript endpoint rejected upload with HTTP {}",
+                response.status()
+            ));
+            false
+        }
+        Err(err) => {
+            logging::warn(&format!("transcript upload failed: {err}"));
+            false
+        }
+    }
+}
+
 fn telemetry_status_is_permanent(status: u16) -> bool {
     (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
 }
@@ -1217,17 +1396,53 @@ where
 fn background_sender() -> &'static SyncSender<Value> {
     TELEMETRY_BACKGROUND_SENDER.get_or_init(|| {
         spawn_background_worker(BACKGROUND_QUEUE_CAPACITY, |payload| {
-            let _ = post_payload(payload, ASYNC_SEND_TIMEOUT);
+            let _ = post_payload_with_retry(payload, ASYNC_SEND_TIMEOUT);
         })
         .expect("telemetry background worker should start")
     })
 }
 
+fn transcript_background_sender() -> &'static SyncSender<Value> {
+    TRANSCRIPT_BACKGROUND_SENDER.get_or_init(|| {
+        spawn_background_worker(64, |payload| {
+            let _ = post_transcript_payload(payload, ASYNC_SEND_TIMEOUT);
+        })
+        .expect("transcript telemetry background worker should start")
+    })
+}
+
+fn send_transcript_payload(payload: Value) -> bool {
+    #[cfg(test)]
+    {
+        if let Ok(mut emitted) = TEST_EMITTED_PAYLOADS.lock() {
+            emitted.push(payload);
+        }
+        return true;
+    }
+    #[cfg(not(test))]
+    match transcript_background_sender().try_send(payload) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            logging::warn("transcript upload queue is full; dropping transcript");
+            false
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            logging::warn("transcript upload worker stopped; dropping transcript");
+            false
+        }
+    }
+}
+
 fn send_payload(payload: serde_json::Value, mode: DeliveryMode) -> bool {
     #[cfg(test)]
-    if let Ok(mut emitted) = TEST_EMITTED_PAYLOADS.lock() {
-        emitted.push(payload.clone());
+    {
+        let _ = mode;
+        if let Ok(mut emitted) = TEST_EMITTED_PAYLOADS.lock() {
+            emitted.push(payload);
+        }
+        return true;
     }
+    #[cfg(not(test))]
     match mode {
         DeliveryMode::Background => {
             if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
@@ -1484,7 +1699,6 @@ fn maybe_emit_session_start() {
         if state.start_event_sent {
             return;
         }
-        state.start_event_sent = true;
         observe_session_concurrency(state);
         let (schema_version, build_channel, git_checkout, ci, from_cargo) = telemetry_envelope();
         SessionStartEvent {
@@ -1515,8 +1729,13 @@ fn maybe_emit_session_start() {
             ran_from_cargo: from_cargo,
         }
     };
-    if let Ok(payload) = serde_json::to_value(&event) {
-        let _ = send_payload(payload, DeliveryMode::Background);
+    if let Ok(payload) = serde_json::to_value(&event)
+        && send_payload(payload, DeliveryMode::Background)
+        && let Ok(mut guard) = SESSION_STATE.lock()
+        && let Some(state) = guard.as_mut()
+        && state.session_id == event.session_id
+    {
+        state.start_event_sent = true;
     }
 }
 
@@ -1916,6 +2135,8 @@ fn begin_session_with_mode(
 
 pub fn record_turn() {
     let id = get_or_create_id();
+    let mut prompt_event = None;
+    let mut first_prompt = false;
     if let Ok(mut guard) = SESSION_STATE.lock()
         && let Some(ref mut state) = *guard
     {
@@ -1929,6 +2150,7 @@ pub fn record_turn() {
             finalize_current_turn(id, state, now, "next_user_prompt", DeliveryMode::Background);
         }
         state.turns += 1;
+        first_prompt = state.turns == 1;
         logging::debug(&format!("recording telemetry turn index={}", state.turns));
         state.had_user_prompt = true;
         let idle_before_turn_ms = previous_last_activity.and_then(|last| {
@@ -1941,6 +2163,36 @@ pub fn record_turn() {
             now_ms_since(state.started_at),
             idle_before_turn_ms,
         ));
+        if let Some(ref id) = id {
+            let (schema_version, build_channel, git_checkout, ci, from_cargo) =
+                telemetry_envelope();
+            prompt_event = Some(serde_json::json!({
+                "event_id": new_event_id(),
+                "id": id,
+                "session_id": state.session_id,
+                "event": "prompt_submitted",
+                "version": version(),
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "turn_index": state.turns,
+                "schema_version": schema_version,
+                "build_channel": build_channel,
+                "is_git_checkout": git_checkout,
+                "is_ci": ci,
+                "ran_from_cargo": from_cargo,
+            }));
+        }
+    }
+    if let Some(payload) = prompt_event {
+        let mode = if first_prompt {
+            // Short `jcode run` invocations can exit before the background
+            // worker starts. Bound the first prompt's delivery so every active
+            // installation has an immediate durable activity anchor.
+            DeliveryMode::Blocking(BLOCKING_FIRST_PROMPT_TIMEOUT)
+        } else {
+            DeliveryMode::Background
+        };
+        let _ = send_payload(payload, mode);
     }
     emit_onboarding_step_once("first_prompt_sent", None, None);
     maybe_emit_session_start();

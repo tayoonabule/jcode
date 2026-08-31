@@ -31,7 +31,7 @@ pub(crate) enum ProviderAuthArg {
 #[command(version = jcode_build_meta::version())]
 #[command(about = "J-Code: A coding agent using Claude Max or ChatGPT Pro subscriptions")]
 pub(crate) struct Args {
-    /// Initial provider to use (jcode, claude, openai, openai-api, openrouter, azure, opencode, opencode-go, zai, 302ai, baseten, cortecs, comtegra, deepseek, fpt, firmware, huggingface, moonshotai, nebius, scaleway, stackit, groq, mistral, perplexity, togetherai, deepinfra, xai, nvidia-nim, lmstudio, ollama, chutes, cerebras, alibaba-coding-plan, openai-compatible, cursor, copilot, gemini, antigravity, google, or auto-detect). Interactive sessions can switch providers with /model.
+    /// Initial provider to use (jcode, claude, openai, openai-api, openrouter, azure, opencode, opencode-go, zai, 302ai, baseten, conifer, cortecs, comtegra, deepseek, fpt, firmware, huggingface, moonshotai, nebius, scaleway, stackit, groq, mistral, perplexity, togetherai, deepinfra, xai, grok-build, nvidia-nim, lmstudio, ollama, chutes, cerebras, alibaba-coding-plan, openai-compatible, cursor, copilot, gemini, antigravity, google, or auto-detect). Interactive sessions can switch providers with /model.
     #[arg(short, long, default_value = "auto", global = true)]
     pub(crate) provider: ProviderChoice,
 
@@ -81,6 +81,11 @@ pub(crate) struct Args {
     #[arg(long = "onboarding-sim")]
     pub(crate) onboarding_sim: bool,
 
+    /// Launch the normal TUI, skip onboarding, then autoplay a safe simulation
+    /// of receiving, downloading, installing, and restarting after an update.
+    #[arg(long = "update-sim")]
+    pub(crate) update_sim: bool,
+
     /// Custom socket path for server/client communication
     #[arg(long, global = true)]
     pub(crate) socket: Option<String>,
@@ -113,6 +118,14 @@ pub(crate) struct Args {
     /// Hide all built-in tools unless --tools or [tools].enabled opts tools back in.
     #[arg(long, global = true)]
     pub(crate) disable_base_tools: bool,
+
+    /// MCP tool exposure mode: auto, eager, or deferred.
+    #[arg(long, global = true, value_parser = ["auto", "eager", "deferred"])]
+    pub(crate) mcp_tools: Option<String>,
+
+    /// Token estimate at which --mcp-tools=auto switches to deferred exposure.
+    #[arg(long, global = true, value_name = "TOKENS")]
+    pub(crate) mcp_tools_token_threshold: Option<usize>,
 
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
@@ -253,6 +266,10 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Inspect or change anonymous telemetry settings
+    #[command(subcommand)]
+    Telemetry(TelemetryCommand),
 
     /// Self-development mode: run as a canary session on the shared server
     #[command(alias = "selfdev")]
@@ -551,6 +568,20 @@ pub(crate) enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+pub(crate) enum TelemetryCommand {
+    /// Show the current telemetry state without creating an anonymous ID
+    Status {
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable anonymous usage telemetry
+    Enable,
+    /// Disable all telemetry persistently
+    Disable,
+}
+
+#[derive(Subcommand, Debug)]
 pub(crate) enum AccountCommand {
     /// Open browser-based device authorization and wait for plan activation
     Login {
@@ -582,6 +613,19 @@ pub(crate) enum ServerCommand {
     /// Internal: hold a lightweight connection open until stdin closes.
     #[command(hide = true)]
     Keepalive,
+
+    /// Pin the shared server channel to an installed version.
+    ///
+    /// Defaults to the active `current` version. This only selects the daemon's
+    /// binary; run `jcode server reload` separately to apply it.
+    Promote {
+        /// Installed version to promote (defaults to the current channel)
+        version: Option<String>,
+
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Gracefully reload the running background server onto the newest binary.
     ///

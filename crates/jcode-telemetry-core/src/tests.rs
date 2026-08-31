@@ -1,5 +1,8 @@
 use super::*;
-use std::sync::{Mutex, OnceLock};
+use std::{
+    ffi::OsString,
+    sync::{Mutex, MutexGuard, OnceLock},
+};
 
 // All of these tests mutate process-global state: the env-var opt-out tests
 // flip `JCODE_NO_TELEMETRY` / `DO_NOT_TRACK`, while the session tests drive the
@@ -10,12 +13,51 @@ use std::sync::{Mutex, OnceLock};
 // as `None`; the session test's `expect(...)` panicked while holding the
 // `SESSION_STATE` lock and poisoned it, cascading into `PoisonError` failures
 // in every other session test.
-fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
+struct TestEnvironment {
+    _home: tempfile::TempDir,
+    previous_home: Option<OsString>,
+    previous_no_telemetry: Option<OsString>,
+    previous_do_not_track: Option<OsString>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for TestEnvironment {
+    fn drop(&mut self) {
+        restore_env_var("JCODE_HOME", self.previous_home.take());
+        restore_env_var("JCODE_NO_TELEMETRY", self.previous_no_telemetry.take());
+        restore_env_var("DO_NOT_TRACK", self.previous_do_not_track.take());
+    }
+}
+
+fn restore_env_var(key: &str, value: Option<OsString>) {
+    if let Some(value) = value {
+        jcode_core::env::set_var(key, value);
+    } else {
+        jcode_core::env::remove_var(key);
+    }
+}
+
+fn global_test_lock() -> TestEnvironment {
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_LOCK
+    let lock = TEST_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let home = tempfile::tempdir().expect("create isolated telemetry test home");
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let previous_no_telemetry = std::env::var_os("JCODE_NO_TELEMETRY");
+    let previous_do_not_track = std::env::var_os("DO_NOT_TRACK");
+    jcode_core::env::set_var("JCODE_HOME", home.path());
+    jcode_core::env::remove_var("JCODE_NO_TELEMETRY");
+    jcode_core::env::remove_var("DO_NOT_TRACK");
+
+    TestEnvironment {
+        _home: home,
+        previous_home,
+        previous_no_telemetry,
+        previous_do_not_track,
+        _lock: lock,
+    }
 }
 
 #[test]
@@ -57,13 +99,56 @@ fn background_delivery_queue_is_bounded() {
 #[test]
 fn telemetry_endpoint_uses_production_custom_domain() {
     assert_eq!(TELEMETRY_ENDPOINT, "https://telemetry.jcode.sh/v1/event");
+    assert_eq!(
+        TRANSCRIPT_ENDPOINT,
+        "https://telemetry.jcode.sh/v1/transcript"
+    );
 }
 
-fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+#[test]
+fn transcript_upload_requires_separate_content_consent() {
+    let _guard = lock_test_env();
+    TEST_EMITTED_PAYLOADS.lock().unwrap().clear();
+
+    assert!(!record_transcript(
+        "provider",
+        "model",
+        SessionEndReason::NormalExit,
+        serde_json::json!([{"role": "user", "content": "secret prompt"}]),
+    ));
+    assert!(TEST_EMITTED_PAYLOADS.lock().unwrap().is_empty());
+}
+
+#[test]
+fn opted_in_transcript_payload_contains_full_structured_messages() {
+    let _guard = lock_test_env();
+    TEST_EMITTED_PAYLOADS.lock().unwrap().clear();
+    assert!(set_content_sharing_enabled(true));
+    let messages = serde_json::json!([
+        {"role": "user", "content": [{"type": "text", "text": "secret prompt"}]},
+        {"role": "assistant", "content": [{"type": "reasoning", "text": "private reasoning"}]}
+    ]);
+
+    assert!(record_transcript(
+        "provider",
+        "model",
+        SessionEndReason::NormalExit,
+        messages.clone(),
+    ));
+    let payloads = TEST_EMITTED_PAYLOADS.lock().unwrap();
+    let payload = payloads.last().expect("transcript payload");
+    assert_eq!(payload["event"], "transcript");
+    assert_eq!(payload["consent_version"], 1);
+    assert_eq!(payload["message_count"], 2);
+    assert_eq!(payload["messages"], messages);
+    assert!(uuid::Uuid::parse_str(payload["upload_id"].as_str().unwrap()).is_ok());
+}
+
+fn lock_test_env() -> TestEnvironment {
     global_test_lock()
 }
 
-fn lock_telemetry_test_state() -> std::sync::MutexGuard<'static, ()> {
+fn lock_telemetry_test_state() -> TestEnvironment {
     global_test_lock()
 }
 
@@ -84,10 +169,114 @@ fn test_do_not_track() {
 }
 
 #[test]
+fn false_opt_out_values_keep_telemetry_enabled() {
+    let _guard = lock_test_env();
+    for value in ["", "0", "false", "no", "off"] {
+        jcode_core::env::set_var("JCODE_NO_TELEMETRY", value);
+        jcode_core::env::set_var("DO_NOT_TRACK", value);
+        assert!(is_enabled(), "{value:?} should not opt out");
+    }
+}
+
+#[test]
+fn in_app_opt_out_emits_once_then_stops_telemetry() {
+    let _guard = lock_test_env();
+    TEST_EMITTED_PAYLOADS.lock().unwrap().clear();
+
+    assert!(set_usage_telemetry_enabled(false));
+    assert!(!is_enabled());
+    assert!(set_usage_telemetry_enabled(false));
+
+    let payloads = TEST_EMITTED_PAYLOADS.lock().unwrap();
+    let opt_outs = payloads
+        .iter()
+        .filter(|payload| payload["event"] == "telemetry_opt_out")
+        .collect::<Vec<_>>();
+    assert_eq!(opt_outs.len(), 1);
+    assert_eq!(opt_outs[0]["step"], "telemetry_settings");
+}
+
+#[test]
+fn record_turn_emits_prompt_submitted_immediately() {
+    let _guard = lock_telemetry_test_state();
+    TEST_EMITTED_PAYLOADS.lock().unwrap().clear();
+    if let Ok(mut session) = SESSION_STATE.lock() {
+        *session = None;
+    }
+    begin_session_with_mode("openai", "gpt-test", None, false);
+
+    record_turn();
+
+    let payloads = TEST_EMITTED_PAYLOADS.lock().unwrap().clone();
+    let prompt = payloads
+        .iter()
+        .find(|payload| payload["event"] == "prompt_submitted")
+        .expect("prompt_submitted should be emitted before turn completion");
+    assert_eq!(prompt["turn_index"], 1);
+    assert!(prompt["session_id"].is_string());
+    if let Ok(mut session) = SESSION_STATE.lock() {
+        *session = None;
+    }
+}
+
+#[test]
+fn telemetry_status_on_fresh_home_is_read_only() {
+    let _guard = lock_test_env();
+
+    let snapshot = status();
+
+    assert!(snapshot.enabled);
+    assert_eq!(snapshot.opt_out_source, None);
+    assert_eq!(snapshot.telemetry_id, None);
+    assert!(!snapshot.content_sharing_enabled);
+    assert!(!telemetry_id_path().expect("telemetry id path").exists());
+}
+
+#[test]
+fn telemetry_status_reads_an_existing_id_without_replacing_it() {
+    let _guard = lock_test_env();
+    let path = telemetry_id_path().expect("telemetry id path");
+    write_private_file(&path, "existing-id\n");
+
+    assert_eq!(status().telemetry_id.as_deref(), Some("existing-id"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "existing-id\n");
+}
+
+#[test]
+fn telemetry_status_reports_marker_file_opt_out() {
+    let _guard = lock_test_env();
+    assert!(set_usage_telemetry_enabled(false));
+
+    let snapshot = status();
+
+    assert!(!snapshot.enabled);
+    assert_eq!(
+        snapshot.opt_out_source,
+        Some(TelemetryOptOutSource::MarkerFile)
+    );
+}
+
+#[test]
+fn environment_opt_out_takes_precedence_over_marker_file() {
+    let _guard = lock_test_env();
+    assert!(set_usage_telemetry_enabled(false));
+    jcode_core::env::set_var("DO_NOT_TRACK", "1");
+
+    let snapshot = status();
+
+    assert!(!snapshot.enabled);
+    assert_eq!(
+        snapshot.opt_out_source,
+        Some(TelemetryOptOutSource::Environment)
+    );
+}
+
+#[test]
 fn test_is_ci_detects_ci_env() {
     let _guard = lock_test_env();
     // Clear any inherited CI markers so the baseline is deterministic.
     for key in [
+        "JCODE_CI",
         "CI",
         "CONTINUOUS_INTEGRATION",
         "BUILD_NUMBER",
@@ -120,6 +309,28 @@ fn test_is_ci_detects_ci_env() {
     );
     jcode_core::env::remove_var("CI");
     assert!(!is_ci());
+
+    jcode_core::env::set_var("JCODE_CI", "1");
+    assert!(is_ci(), "explicit JCODE_CI=1 should mark any runtime as CI");
+    jcode_core::env::remove_var("JCODE_CI");
+
+    jcode_core::env::set_var("CI", "true");
+    jcode_core::env::set_var("JCODE_CI", "0");
+    assert!(
+        !is_ci(),
+        "explicit JCODE_CI=0 should override inherited provider markers"
+    );
+    jcode_core::env::remove_var("JCODE_CI");
+    jcode_core::env::remove_var("CI");
+
+    jcode_core::env::set_var("CI", "true");
+    jcode_core::env::set_var("JCODE_CI", "invalid");
+    assert!(
+        is_ci(),
+        "invalid explicit values should fall back to provider detection"
+    );
+    jcode_core::env::remove_var("JCODE_CI");
+    jcode_core::env::remove_var("CI");
 
     // Vendor-specific markers count on their own: several providers never set
     // the generic `CI` variable, and those runners used to look like people.

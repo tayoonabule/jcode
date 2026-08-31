@@ -61,6 +61,24 @@ where
     Ok(read)
 }
 
+/// Cancellation-safe variant for the multiplexed client loop. Tokio guarantees
+/// `read_until` retains bytes already appended to `frame` when another select
+/// branch wins, unlike `read_line` with a temporary String.
+async fn read_frame_bytes<R>(reader: &mut R, frame: &mut Vec<u8>) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut limited = tokio::io::AsyncReadExt::take(reader, MAX_FRAME_BYTES);
+    let read = limited.read_until(b'\n', frame).await?;
+    if frame.len() as u64 == MAX_FRAME_BYTES && !frame.ends_with(b"\n") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame exceeds {MAX_FRAME_BYTES} byte limit"),
+        ));
+    }
+    Ok(read)
+}
+
 /// Run the bridge accept loop forever.
 #[cfg(unix)]
 pub(crate) struct InstanceLock {
@@ -193,6 +211,7 @@ async fn handle_api_client(stream: Stream, legacy_socket: PathBuf) -> Result<()>
         }
     };
     let reply_to = hello["id"].as_u64().unwrap_or(0);
+    let client_name = hello["client"].as_str().unwrap_or_default();
     let compatible = hello["req"] == "hello"
         && hello["min_version"].as_u64().unwrap_or(0) <= u64::from(API_VERSION_MAJOR)
         && hello["max_version"].as_u64().unwrap_or(0) >= u64::from(API_VERSION_MAJOR);
@@ -225,6 +244,7 @@ async fn handle_api_client(stream: Stream, legacy_socket: PathBuf) -> Result<()>
                 "session_archive",
                 "session_retention",
                 "session_files",
+                "session_fork",
             ]
             .into_iter()
             .map(str::to_string)
@@ -240,15 +260,20 @@ async fn handle_api_client(stream: Stream, legacy_socket: PathBuf) -> Result<()>
     let (legacy_read, mut legacy_write) = legacy.into_split();
     let mut legacy_reader = BufReader::new(legacy_read);
 
-    let mut state = translate::BridgeState::default();
+    let mut state =
+        translate::BridgeState::with_crash_on_disconnect(client_name.starts_with("jcode-desktop-"));
 
     // 3. Pump both directions in one select loop so translation state stays
     //    single-threaded.
-    let mut api_line = String::new();
+    let mut api_frame = Vec::new();
     let mut legacy_line = String::new();
     loop {
         tokio::select! {
-            n = read_frame(&mut reader, &mut api_line) => {
+            // A busy daemon can keep the legacy socket continuously readable.
+            // Prefer client requests so locally answered operations such as
+            // list_sessions cannot sit behind an unbounded event broadcast.
+            biased;
+            n = read_frame_bytes(&mut reader, &mut api_frame) => {
                 let n = match n {
                     Ok(n) => n,
                     // An oversized frame is unrecoverable: the stream is now
@@ -263,8 +288,13 @@ async fn handle_api_client(stream: Stream, legacy_socket: PathBuf) -> Result<()>
                     }
                 };
                 if n == 0 { return Ok(()); }
-                if api_line.trim().is_empty() { continue; }
-                let request: Value = match serde_json::from_str(api_line.trim()) {
+                if api_frame.iter().all(u8::is_ascii_whitespace) {
+                    api_frame.clear();
+                    continue;
+                }
+                let parsed = serde_json::from_slice(&api_frame);
+                api_frame.clear();
+                let request: Value = match parsed {
                     Ok(value) => value,
                     Err(error) => {
                         // No `reply_to`: the id lived in the frame that failed
@@ -328,6 +358,101 @@ where
     line.push('\n');
     writer.write_all(line.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod public_acceptance_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn public_socket_keeps_its_attachment_after_another_sessions_state() {
+        let root = std::env::temp_dir().join(format!(
+            "jcode-api-attachment-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let api_path = root.join("api.sock");
+        let legacy_path = root.join("legacy.sock");
+        let legacy_listener = UnixListener::bind(&legacy_path).unwrap();
+
+        let fake_daemon = tokio::spawn(async move {
+            let (stream, _) = legacy_listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut attached_state_id = None;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                match request["type"].as_str() {
+                    Some("state") if attached_state_id.is_none() => {
+                        let id = request["id"].as_u64().unwrap();
+                        attached_state_id = Some(id);
+                        write_json_line(
+                            &mut write,
+                            &json!({"type":"state", "id":id, "session_id":"session_alpha"}),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    Some("message") => {
+                        assert_eq!(request["content"], "public boundary prompt");
+                        return;
+                    }
+                    _ => {}
+                }
+                if attached_state_id.is_some() {
+                    write_json_line(
+                        &mut write,
+                        &json!({"type":"state", "id":999_999, "session_id":"session_beta"}),
+                    )
+                    .await
+                    .unwrap();
+                    attached_state_id = None;
+                }
+            }
+            panic!("API connection closed before the message reached the attached session");
+        });
+
+        let bridge = tokio::spawn(run_bridge(api_path.clone(), legacy_path));
+        let stream = loop {
+            match UnixStream::connect(&api_path).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        };
+        let (read, mut write) = stream.into_split();
+        let mut replies = BufReader::new(read).lines();
+        for request in [
+            json!({"id":1, "req":"hello", "min_version":1, "max_version":1, "client":"acceptance-test"}),
+            json!({"id":2, "req":"attach_session", "session_id":"session_alpha"}),
+        ] {
+            write_json_line(&mut write, &request).await.unwrap();
+            replies
+                .next_line()
+                .await
+                .unwrap()
+                .expect("public API reply");
+        }
+        write_json_line(
+            &mut write,
+            &json!({"id":3, "req":"send_message", "session_id":"session_alpha", "content":"public boundary prompt"}),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), fake_daemon)
+            .await
+            .expect("message should cross the API/legacy boundary")
+            .unwrap();
+        bridge.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]

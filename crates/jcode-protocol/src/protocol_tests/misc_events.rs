@@ -281,6 +281,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
         client_instance_id: Some("client-123".to_string()),
         client_has_local_history: true,
         allow_session_takeover: true,
+        crash_on_disconnect: true,
         terminal_env: vec![("ZELLIJ_SESSION_NAME".to_string(), "sessionB".to_string())],
     };
     let json = serde_json::to_string(&req)?;
@@ -294,6 +295,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
         client_instance_id,
         client_has_local_history,
         allow_session_takeover,
+        crash_on_disconnect,
         terminal_env,
     } = decoded
     else {
@@ -306,6 +308,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
     assert_eq!(client_instance_id.as_deref(), Some("client-123"));
     assert!(client_has_local_history);
     assert!(allow_session_takeover);
+    assert!(crash_on_disconnect);
     assert_eq!(
         terminal_env,
         vec![("ZELLIJ_SESSION_NAME".to_string(), "sessionB".to_string())]
@@ -325,6 +328,7 @@ fn test_subscribe_request_defaults_optional_flags() -> Result<()> {
         client_instance_id,
         client_has_local_history,
         allow_session_takeover,
+        crash_on_disconnect,
         terminal_env,
     } = decoded
     else {
@@ -337,6 +341,7 @@ fn test_subscribe_request_defaults_optional_flags() -> Result<()> {
     assert_eq!(client_instance_id, None);
     assert!(!client_has_local_history);
     assert!(!allow_session_takeover);
+    assert!(!crash_on_disconnect);
     assert!(terminal_env.is_empty());
     Ok(())
 }
@@ -416,6 +421,7 @@ fn test_message_request_roundtrip_preserves_images_and_system_reminder() -> Resu
             ("image/jpeg".to_string(), "BBB".to_string()),
         ],
         system_reminder: Some("be concise".to_string()),
+        active_skill: Some("verification".to_string()),
         no_reply: true,
     };
     let json = serde_json::to_string(&req)?;
@@ -425,6 +431,7 @@ fn test_message_request_roundtrip_preserves_images_and_system_reminder() -> Resu
         content,
         images,
         system_reminder,
+        active_skill,
         no_reply,
     } = decoded
     else {
@@ -436,6 +443,7 @@ fn test_message_request_roundtrip_preserves_images_and_system_reminder() -> Resu
     assert_eq!(images[0].0, "image/png");
     assert_eq!(images[1].0, "image/jpeg");
     assert_eq!(system_reminder.as_deref(), Some("be concise"));
+    assert_eq!(active_skill.as_deref(), Some("verification"));
     assert!(no_reply);
     Ok(())
 }
@@ -460,9 +468,7 @@ fn test_provider_guardrail_event_roundtrip() -> Result<()> {
     assert_eq!(message, "Provider guardrail stopped the response");
 
     // stop_reason is optional on the wire.
-    let decoded = parse_event_json(
-        r#"{"type":"provider_guardrail","message":"blocked"}"#,
-    )?;
+    let decoded = parse_event_json(r#"{"type":"provider_guardrail","message":"blocked"}"#)?;
     let ServerEvent::ProviderGuardrail { stop_reason, .. } = decoded else {
         return Err(anyhow!("expected ProviderGuardrail event"));
     };

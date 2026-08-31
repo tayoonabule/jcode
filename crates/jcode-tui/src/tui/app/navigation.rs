@@ -198,7 +198,30 @@ impl App {
         else {
             return false;
         };
-        self.cycle_image_expand(image_id);
+        let level = self.cycle_image_expand(image_id);
+        let size = match level {
+            crate::tui::ui::inline_image_ui::ImageExpandLevel::Fit => "fit",
+            crate::tui::ui::inline_image_ui::ImageExpandLevel::Large => "large",
+            crate::tui::ui::inline_image_ui::ImageExpandLevel::Full => "full",
+        };
+        crate::tui::mermaid::set_mermaid_inline_expand_level(image_id, level as u8);
+        if let Some(source) = crate::tui::mermaid::mermaid_source_for_hash(image_id) {
+            let copied = super::helpers::copy_to_clipboard(&source);
+            self.set_status_notice(if copied {
+                format!("Image size: {size} · Mermaid code copied")
+            } else {
+                format!("Image size: {size} · Could not copy Mermaid code")
+            });
+        } else if let Some((media_type, data)) =
+            super::super::ui::inline_image_ui::payload_for_copy(image_id)
+        {
+            let copied = super::helpers::copy_image_to_clipboard(&media_type, &data);
+            self.set_status_notice(if copied {
+                format!("Image size: {size} · Image copied")
+            } else {
+                format!("Image size: {size} · Could not copy image")
+            });
+        }
         true
     }
 
@@ -1048,7 +1071,9 @@ impl App {
             .get(&image_id)
             .copied()
             .unwrap_or_default();
-        let next = current.next();
+        let next = ImageExpandLevel::from_index(
+            crate::tui::mermaid::next_distinct_mermaid_inline_level(image_id, current as u8),
+        );
         if matches!(next, ImageExpandLevel::Fit) {
             self.expanded_images.remove(&image_id);
         } else {
@@ -1484,6 +1509,15 @@ impl App {
             self.set_diff_pane_focus(false);
         }
 
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && crate::tui::ui::viewport::pinned_todo_more_area().is_some_and(|area| {
+                super::super::layout_utils::point_in_rect(mouse.column, mouse.row, area)
+            })
+        {
+            self.pinned_todos_expanded = true;
+            finish_mouse_event!(false, "pinned_todos_expand");
+        }
+
         // A left press in the composer moves the caret first (native text-field
         // behavior), then falls through so the shared copy-selection machinery
         // can arm a drag anchor: click repositions the cursor, drag selects the
@@ -1646,6 +1680,27 @@ impl App {
             && self.try_toggle_swarm_expand_at(mouse.column, mouse.row)
         {
             finish_mouse_event!(false, "toggle_swarm_expand");
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && crate::tui::ui::visible_expand_edit_badge_at(mouse.column, mouse.row)
+            && super::input::handle_expand_edit_badge_shortcut(self, 'e')
+        {
+            finish_mouse_event!(false, "expand_edit_badge_click");
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && let Some(target) = crate::tui::ui::visible_copy_target_at(mouse.column, mouse.row)
+        {
+            let success = super::helpers::copy_to_clipboard(&target.content);
+            self.record_copy_badge_key_press(target.key);
+            self.record_copy_badge_feedback(target.key, success);
+            if success {
+                self.set_status_notice(target.copied_notice);
+            } else {
+                self.set_status_notice(format!("Failed to copy {}", target.kind_label));
+            }
+            finish_mouse_event!(false, "copy_badge_click");
         }
 
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))

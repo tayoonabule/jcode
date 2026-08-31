@@ -28,10 +28,16 @@ pub enum ApiEvent {
     /// Reply to `CreateSession` / `AttachSession`.
     Attached { session: SessionInfo },
 
+    /// Reply to `ForkSession`.
+    SessionForked { session: SessionInfo },
+
     /// Reply to `GetHistory`.
     History {
         session_id: String,
         messages: Vec<HistoryMessage>,
+        /// Images anchored to user prompts or tool calls in this transcript.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<RenderedImage>,
     },
 
     /// Reply to `Ping`.
@@ -76,6 +82,13 @@ pub enum ApiEvent {
         error: Option<String>,
     },
 
+    /// Images the model just received from a tool result or image generator.
+    /// Clients should render these at their transcript anchor immediately.
+    SidePaneImages {
+        session_id: String,
+        images: Vec<RenderedImage>,
+    },
+
     /// Token usage update for the attached session.
     TokenUsage {
         session_id: String,
@@ -87,6 +100,14 @@ pub enum ApiEvent {
 
     /// The turn finished; the agent is idle.
     TurnDone { session_id: String },
+
+    /// The daemon requests that its external operator decide when to run the
+    /// session. Emitted only when external wake ownership is configured.
+    WakeRequested {
+        session_id: String,
+        reason: String,
+        notification: String,
+    },
 
     /// A background task the agent is waiting on reported progress, or
     /// finished.
@@ -133,6 +154,15 @@ pub enum ApiEvent {
     /// Session-level status change (idle, generating, tool_running, ...).
     SessionStatus { session_id: String, status: String },
 
+    /// Provider request lifecycle. The value uses the daemon's stable display
+    /// vocabulary, for example `connecting`, `sending request`, `waiting for
+    /// response`, `streaming`, or `retrying (2/4)`.
+    ///
+    /// This is separate from `SessionStatus`: a session can be `generating`
+    /// throughout all of these phases, while clients need the finer progress to
+    /// avoid looking stuck before the model emits its first token.
+    ConnectionPhase { session_id: String, phase: String },
+
     /// The provider and model serving the attached session.
     ///
     /// Sent unsolicited after attach, and again whenever the model changes, so
@@ -145,6 +175,9 @@ pub enum ApiEvent {
         /// Model id, e.g. `claude-sonnet-4-20250514`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Reasoning effort, e.g. `high`, for providers that expose it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     },
 
     /// Reply to `ListModels`: the models this session can switch to.
@@ -164,6 +197,9 @@ pub enum ApiEvent {
         provider: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Reasoning effort, e.g. `high`, for providers that expose it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
         routes: Vec<ModelRouteInfo>,
     },
 
@@ -245,6 +281,8 @@ pub struct SessionInfo {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// The effective persisted display title. A custom rename takes precedence
+    /// over the generated or imported title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub status: String,
@@ -257,6 +295,16 @@ pub struct SessionInfo {
     /// could not determine it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_bytes: Option<u64>,
+    /// Whether the user pinned/saved this session. Saved sessions sort before
+    /// ordinary sessions in every first-party session picker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub saved: bool,
+    /// Persisted transcript update time, used for newest-first ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_ms: Option<i64>,
+    /// Most recent active-process timestamp when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_at_ms: Option<i64>,
     /// Archived sessions are hidden from the default list but never deleted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
@@ -286,4 +334,29 @@ pub struct HistoryMessage {
     /// "user" | "assistant" | "tool".
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenderedImageSource {
+    UserInput,
+    ToolResult { tool_name: String },
+    Other { role: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenderedImageAnchor {
+    ToolCall { id: String },
+    UserPrompt { ordinal: usize },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenderedImage {
+    pub media_type: String,
+    pub data: String,
+    pub label: Option<String>,
+    pub source: RenderedImageSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<RenderedImageAnchor>,
 }

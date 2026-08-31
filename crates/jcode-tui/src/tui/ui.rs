@@ -54,7 +54,7 @@ mod file_diff_ui;
 #[path = "ui_frame_metrics.rs"]
 mod frame_metrics;
 #[path = "ui_header.rs"]
-mod header;
+pub(crate) mod header;
 #[path = "ui_inline_image.rs"]
 pub(crate) mod inline_image_ui;
 #[path = "ui_inline_interactive.rs"]
@@ -87,7 +87,7 @@ pub(crate) mod tools_ui;
 #[path = "ui_transitions.rs"]
 mod transitions;
 #[path = "ui_viewport.rs"]
-mod viewport;
+pub(crate) mod viewport;
 use crate::tui::mermaid;
 #[cfg(test)]
 pub(crate) use box_utils::truncate_line_to_width;
@@ -240,6 +240,7 @@ thread_local! {
     static TEST_VISIBLE_COPY_TARGETS: RefCell<Vec<VisibleCopyTarget>> = RefCell::new(Vec::new());
     static TEST_VISIBLE_EXPAND_EDIT_BADGE: Cell<bool> = const { Cell::new(false) };
     static TEST_VISIBLE_EXPAND_EDIT_BADGE_LINE: Cell<Option<usize>> = const { Cell::new(None) };
+    static TEST_VISIBLE_EXPAND_EDIT_BADGE_RECT: Cell<Option<Rect>> = const { Cell::new(None) };
     static TEST_PROMPT_VIEWPORT_STATE: RefCell<PromptViewportState> = RefCell::new(PromptViewportState::default());
     static TEST_COPY_VIEWPORT: RefCell<CopyViewportSnapshots> = RefCell::new(CopyViewportSnapshots::default());
 }
@@ -588,6 +589,8 @@ pub(crate) struct VisibleCopyTarget {
     pub kind_label: String,
     pub copied_notice: String,
     pub content: String,
+    /// Screen cells occupied by the rendered shortcut badge in the latest frame.
+    pub badge_rect: Option<Rect>,
 }
 
 // Copy badges intentionally avoid h/j/k/l so they never shadow vi-style
@@ -604,6 +607,9 @@ static VISIBLE_EXPAND_EDIT_BADGE: OnceLock<Mutex<bool>> = OnceLock::new();
 static VISIBLE_EXPAND_EDIT_BADGE_LINE: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
 
 #[cfg(not(test))]
+static VISIBLE_EXPAND_EDIT_BADGE_RECT: OnceLock<Mutex<Option<Rect>>> = OnceLock::new();
+
+#[cfg(not(test))]
 fn visible_copy_targets_state() -> &'static Mutex<Vec<VisibleCopyTarget>> {
     VISIBLE_COPY_TARGETS.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -616,6 +622,41 @@ fn visible_expand_edit_badge_state() -> &'static Mutex<bool> {
 #[cfg(not(test))]
 fn visible_expand_edit_badge_line_state() -> &'static Mutex<Option<usize>> {
     VISIBLE_EXPAND_EDIT_BADGE_LINE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(not(test))]
+fn visible_expand_edit_badge_rect_state() -> &'static Mutex<Option<Rect>> {
+    VISIBLE_EXPAND_EDIT_BADGE_RECT.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn set_visible_expand_edit_badge_rect(rect: Option<Rect>) {
+    #[cfg(test)]
+    {
+        TEST_VISIBLE_EXPAND_EDIT_BADGE_RECT.with(|state| state.set(rect));
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let mut state = visible_expand_edit_badge_rect_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *state = rect;
+    }
+}
+
+pub(crate) fn visible_expand_edit_badge_at(column: u16, row: u16) -> bool {
+    #[cfg(test)]
+    let rect = TEST_VISIBLE_EXPAND_EDIT_BADGE_RECT.with(Cell::get);
+    #[cfg(not(test))]
+    let rect = *visible_expand_edit_badge_rect_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    rect.is_some_and(|rect| {
+        column >= rect.x
+            && column < rect.x.saturating_add(rect.width)
+            && row >= rect.y
+            && row < rect.y.saturating_add(rect.height)
+    })
 }
 
 pub(crate) fn set_visible_expand_edit_badge(visible: bool, line: Option<usize>) {
@@ -710,6 +751,29 @@ pub(crate) fn visible_copy_target_for_key(key: char) -> Option<VisibleCopyTarget
             .iter()
             .find(|target| target.key.eq_ignore_ascii_case(&key))
             .cloned()
+    }
+}
+
+pub(crate) fn visible_copy_target_at(column: u16, row: u16) -> Option<VisibleCopyTarget> {
+    let contains = |target: &&VisibleCopyTarget| {
+        target.badge_rect.is_some_and(|rect| {
+            column >= rect.x
+                && column < rect.x.saturating_add(rect.width)
+                && row >= rect.y
+                && row < rect.y.saturating_add(rect.height)
+        })
+    };
+    #[cfg(test)]
+    {
+        TEST_VISIBLE_COPY_TARGETS.with(|state| state.borrow().iter().find(contains).cloned())
+    }
+    #[cfg(not(test))]
+    {
+        let state = match visible_copy_targets_state().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.iter().find(contains).cloned()
     }
 }
 

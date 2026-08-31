@@ -52,9 +52,9 @@ mod util;
 pub(super) use self::await_members_state::AwaitMembersRuntime;
 use self::background_tasks::{
     dispatch_background_task_completion, dispatch_background_task_progress,
-    dispatch_swarm_await_completion, dispatch_swarm_batch_progress, dispatch_swarm_output_tail,
-    dispatch_swarm_runtime_status, dispatch_swarm_todo_progress, dispatch_swarm_tool_activity,
-    dispatch_ui_activity,
+    dispatch_background_task_stalled, dispatch_swarm_await_completion,
+    dispatch_swarm_batch_progress, dispatch_swarm_output_tail, dispatch_swarm_runtime_status,
+    dispatch_swarm_todo_progress, dispatch_swarm_tool_activity, dispatch_ui_activity,
 };
 use self::debug::{ClientConnectionInfo, ClientDebugState};
 use self::debug_jobs::DebugJob;
@@ -109,6 +109,20 @@ use tokio::sync::{Mutex, OnceCell, RwLock, broadcast, mpsc};
 pub(super) type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 pub(super) type ChannelSubscriptions =
     Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
+
+fn idle_monitor_should_start(client_count: usize, has_live_headless_worker: bool) -> bool {
+    client_count == 0 && !has_live_headless_worker
+}
+
+async fn has_live_headless_worker(sessions: &SessionAgents, swarm_state: &SwarmState) -> bool {
+    let live_sessions: HashSet<String> = sessions.read().await.keys().cloned().collect();
+    swarm_state
+        .members
+        .read()
+        .await
+        .values()
+        .any(|member| member.is_headless && live_sessions.contains(&member.session_id))
+}
 
 /// Remove a live server session and its process-presence marker as one
 /// lifecycle operation. Server-owned sessions all share the long-running
@@ -640,6 +654,27 @@ const IDLE_TIMEOUT_SECS: u64 = 300;
 /// comfortably below the default idle threshold so reclamation is prompt and
 /// predictable rather than delayed by another full sampling interval.
 const EMBEDDING_IDLE_CHECK_SECS: u64 = 10;
+
+#[cfg(test)]
+mod idle_monitor_tests {
+    use super::idle_monitor_should_start;
+
+    #[test]
+    fn shared_idle_monitor_preserves_live_headless_worker() {
+        assert!(!idle_monitor_should_start(0, true));
+    }
+
+    #[test]
+    fn temporary_idle_monitor_preserves_live_headless_worker() {
+        assert!(!idle_monitor_should_start(0, true));
+    }
+
+    #[test]
+    fn idle_monitor_starts_only_without_clients_or_headless_workers() {
+        assert!(idle_monitor_should_start(0, false));
+        assert!(!idle_monitor_should_start(1, false));
+    }
+}
 
 /// How often the retained-heap watchdog samples allocator retention.
 const HEAP_RETENTION_CHECK_SECS: u64 = 120;
@@ -1768,6 +1803,8 @@ impl Server {
         if let Some(policy) = temporary_server_policy {
             lifecycle::spawn_temporary_lifecycle_monitor(
                 Arc::clone(&self.client_count),
+                Arc::clone(&self.sessions),
+                self.swarm_state.clone(),
                 self.socket_path.clone(),
                 self.debug_socket_path.clone(),
                 self.identity.name.clone(),
@@ -1777,6 +1814,8 @@ impl Server {
             crate::logging::info("Debug control enabled; idle timeout monitor disabled.");
         } else {
             let idle_client_count = Arc::clone(&self.client_count);
+            let idle_sessions = Arc::clone(&self.sessions);
+            let idle_swarm_state = self.swarm_state.clone();
             let idle_server_name = self.identity.name.clone();
             tokio::spawn(async move {
                 let mut idle_since: Option<std::time::Instant> = None;
@@ -1786,8 +1825,10 @@ impl Server {
                     check_interval.tick().await;
 
                     let count = *idle_client_count.read().await;
+                    let has_live_headless_worker =
+                        has_live_headless_worker(&idle_sessions, &idle_swarm_state).await;
 
-                    if count == 0 {
+                    if idle_monitor_should_start(count, has_live_headless_worker) {
                         // No clients connected
                         if idle_since.is_none() {
                             idle_since = Some(std::time::Instant::now());
@@ -2177,6 +2218,19 @@ impl Server {
                 }
                 Ok(BusEvent::BackgroundTaskProgress(task)) => {
                     dispatch_background_task_progress(&task, &swarm_members).await;
+                }
+                Ok(BusEvent::BackgroundTaskStalled(task)) => {
+                    dispatch_background_task_stalled(
+                        &task,
+                        &sessions,
+                        &soft_interrupt_queues,
+                        &swarm_members,
+                        &swarms_by_id,
+                        &event_history,
+                        &event_counter,
+                        &swarm_event_tx,
+                    )
+                    .await;
                 }
                 Ok(BusEvent::SwarmAwaitCompleted(event)) => {
                     dispatch_swarm_await_completion(

@@ -23,6 +23,57 @@ fn server_start_and_internal_keepalive_parse() {
 }
 
 #[test]
+fn server_promote_parses_default_and_explicit_version() {
+    let current = Args::try_parse_from(["jcode", "server", "promote", "--json"])
+        .expect("server promote should default to current");
+    assert!(matches!(
+        current.command,
+        Some(Command::Server {
+            action: ServerCommand::Promote {
+                version: None,
+                json: true,
+            }
+        })
+    ));
+
+    let explicit = Args::try_parse_from(["jcode", "server", "promote", "abc1234-dirty-deadbeef"])
+        .expect("server promote should accept an installed version label");
+    assert!(matches!(
+        explicit.command,
+        Some(Command::Server {
+            action: ServerCommand::Promote {
+                version: Some(ref version),
+                json: false,
+            }
+        }) if version == "abc1234-dirty-deadbeef"
+    ));
+}
+
+#[test]
+fn telemetry_subcommands_parse() {
+    let status = Args::try_parse_from(["jcode", "telemetry", "status", "--json"])
+        .expect("telemetry status should parse");
+    assert!(matches!(
+        status.command,
+        Some(Command::Telemetry(TelemetryCommand::Status { json: true }))
+    ));
+
+    let enable = Args::try_parse_from(["jcode", "telemetry", "enable"])
+        .expect("telemetry enable should parse");
+    assert!(matches!(
+        enable.command,
+        Some(Command::Telemetry(TelemetryCommand::Enable))
+    ));
+
+    let disable = Args::try_parse_from(["jcode", "telemetry", "disable"])
+        .expect("telemetry disable should parse");
+    assert!(matches!(
+        disable.command,
+        Some(Command::Telemetry(TelemetryCommand::Disable))
+    ));
+}
+
+#[test]
 fn test_provider_choice_aliases_parse() {
     let args = Args::try_parse_from(["jcode", "--provider", "z.ai", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Zai);
@@ -46,6 +97,9 @@ fn test_provider_choice_aliases_parse() {
 
     let args = Args::try_parse_from(["jcode", "--provider", "grok", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Xai);
+
+    let args = Args::try_parse_from(["jcode", "--provider", "grok-build"]).unwrap();
+    assert_eq!(args.provider, ProviderChoice::GrokBuild);
 
     let args = Args::try_parse_from(["jcode", "--provider", "cgc", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Comtegra);

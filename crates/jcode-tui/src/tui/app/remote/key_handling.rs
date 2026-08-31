@@ -278,6 +278,9 @@ async fn handle_remote_key_internal(
     if app.handle_onboarding_sim_reset_shortcut(code, modifiers) {
         return Ok(());
     }
+    if app.handle_update_sim_shortcut(code, modifiers) {
+        return Ok(());
+    }
 
     // The onboarding simulator owns all key handling while active (and Cmd+5
     // toggles it). Handle it first so no real onboarding action can leak through.
@@ -294,12 +297,8 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
-    if app.changelog_scroll.is_some() {
-        return app.handle_changelog_key(code);
-    }
-
-    if app.help_scroll.is_some() {
-        return app.handle_help_key(code);
+    if input::handle_scroll_overlay_key(app, code)? {
+        return Ok(());
     }
 
     if app.session_picker_overlay.is_some() {
@@ -321,6 +320,22 @@ async fn handle_remote_key_internal(
     if let Some(ref picker) = app.inline_interactive_state
         && !picker.preview
     {
+        if code == KeyCode::Enter {
+            let subagent_model = picker
+                .filtered
+                .get(picker.selected)
+                .and_then(|index| picker.entries.get(*index))
+                .and_then(|entry| match entry.action {
+                    crate::tui::PickerAction::SubagentModelChoice { inherit: true } => Some(None),
+                    crate::tui::PickerAction::SubagentModelChoice { inherit: false } => Some(Some(
+                        super::super::inline_interactive::subagent_picker_model_spec(entry),
+                    )),
+                    _ => None,
+                });
+            if let Some(model) = subagent_model {
+                remote.set_subagent_model(model).await?;
+            }
+        }
         return app.handle_inline_interactive_key(code, modifiers);
     }
 
@@ -390,8 +405,60 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    if app.toggle_keys.auto_poke.matches(code, modifiers) {
+        if app.auto_poke_incomplete_todos {
+            let cleared = app_mod::commands::disable_auto_poke(app);
+            app.set_status_notice("Poke: OFF");
+            app.push_display_message(DisplayMessage::system(
+                app_mod::commands::poke_disabled_message(cleared),
+            ));
+        } else {
+            match app_mod::commands::activate_auto_poke(app) {
+                app_mod::commands::PokeActivation::EnabledNoIncomplete => {
+                    app.push_display_message(DisplayMessage::system(
+                        app_mod::commands::poke_enabled_without_incomplete_message(),
+                    ));
+                }
+                app_mod::commands::PokeActivation::Queued => {
+                    app.push_display_message(DisplayMessage::system(
+                        app_mod::commands::poke_queued_display_message(),
+                    ));
+                }
+                app_mod::commands::PokeActivation::SendNow {
+                    incomplete_count,
+                    poke_msg,
+                } => {
+                    app.push_display_message(DisplayMessage::system(
+                        app_mod::commands::poke_triggered_display_message(incomplete_count),
+                    ));
+
+                    let _ =
+                        begin_remote_send(app, remote, poke_msg, vec![], true, None, true, 0).await;
+                    app.visible_turn_started = Some(Instant::now());
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if app.toggle_keys.copy_selection.matches(code, modifiers) {
+        app.toggle_copy_selection_mode();
+        return Ok(());
+    }
+
     if app.toggle_keys.side_panel.matches(code, modifiers) {
         app.toggle_side_panel();
+        return Ok(());
+    }
+
+    if app.toggle_keys.info_widget.matches(code, modifiers) {
+        crate::tui::info_widget::toggle_enabled();
+        let status = if crate::tui::info_widget::is_enabled() {
+            "Info widget: ON"
+        } else {
+            "Info widget: OFF"
+        };
+        app.set_status_notice(status);
         return Ok(());
     }
 
@@ -700,50 +767,6 @@ async fn handle_remote_key_internal(
                 app.toggle_input_stash();
                 return Ok(());
             }
-            KeyCode::Char('p') => {
-                if app.auto_poke_incomplete_todos {
-                    let cleared = app_mod::commands::disable_auto_poke(app);
-                    app.set_status_notice("Poke: OFF");
-                    app.push_display_message(DisplayMessage::system(
-                        app_mod::commands::poke_disabled_message(cleared),
-                    ));
-                } else {
-                    match app_mod::commands::activate_auto_poke(app) {
-                        app_mod::commands::PokeActivation::EnabledNoIncomplete => {
-                            app.push_display_message(DisplayMessage::system(
-                                app_mod::commands::poke_enabled_without_incomplete_message(),
-                            ));
-                        }
-                        app_mod::commands::PokeActivation::Queued => {
-                            app.push_display_message(DisplayMessage::system(
-                                app_mod::commands::poke_queued_display_message(),
-                            ));
-                        }
-                        app_mod::commands::PokeActivation::SendNow {
-                            incomplete_count,
-                            poke_msg,
-                        } => {
-                            app.push_display_message(DisplayMessage::system(
-                                app_mod::commands::poke_triggered_display_message(incomplete_count),
-                            ));
-
-                            let _ = begin_remote_send(
-                                app,
-                                remote,
-                                poke_msg,
-                                vec![],
-                                true,
-                                None,
-                                true,
-                                0,
-                            )
-                            .await;
-                            app.visible_turn_started = Some(Instant::now());
-                        }
-                    }
-                }
-                return Ok(());
-            }
             KeyCode::Char('v') => {
                 app.paste_from_clipboard();
                 return Ok(());
@@ -1043,16 +1066,10 @@ async fn handle_remote_key_internal(
                 }
 
                 if trimmed == "/model" || trimmed == "/models" {
-                    let _ = remote.refresh_models().await;
-                    // `refresh_models` re-queries providers and pushes the
-                    // result over the bus, where oversized frames get
-                    // downgraded to names-only. Also request the catalog
-                    // directly so the picker gets real route expansion even
-                    // when the bus push is downgraded and no usable local
-                    // catalog cache exists (otherwise every row is a
-                    // placeholder "remote-catalog" entry).
-                    let _ = remote.request_model_catalog().await;
-                    app.set_status_notice("Refreshing model catalog...");
+                    // Opening the picker is a read-only UI action. The session
+                    // bootstrap and explicit `/model refresh` command own
+                    // catalog I/O; doing it here races startup and briefly
+                    // replaces the session catalog with remote fallback rows.
                     app.open_model_picker();
                     return Ok(());
                 }

@@ -14,6 +14,7 @@ mod debug_socket;
 mod discover;
 mod discover_secrets;
 mod edit;
+mod feedback;
 mod gmail;
 mod goal;
 pub mod inflight;
@@ -47,11 +48,21 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub(crate) fn tool_name_is_allowed(allowed: &HashSet<String>, name: &str) -> bool {
-    allowed.contains(name) || (allowed.contains("mcp") && name.starts_with("mcp__"))
+    allowed.contains(name)
+        || (allowed.contains("mcp") && is_mcp_tool_name(name))
+        || (is_fixed_mcp_tool(name) && allowed.iter().any(|tool| tool.starts_with("mcp__")))
 }
 
 pub(crate) fn tool_name_is_disabled(disabled: &HashSet<String>, name: &str) -> bool {
-    disabled.contains(name) || (disabled.contains("mcp") && name.starts_with("mcp__"))
+    disabled.contains(name) || (disabled.contains("mcp") && is_mcp_tool_name(name))
+}
+
+fn is_fixed_mcp_tool(name: &str) -> bool {
+    matches!(name, "mcp_search" | "mcp_call")
+}
+
+fn is_mcp_tool_name(name: &str) -> bool {
+    name == "mcp" || name.starts_with("mcp__") || is_fixed_mcp_tool(name)
 }
 use std::sync::{LazyLock, RwLock as StdRwLock};
 use tokio::sync::RwLock;
@@ -100,6 +111,23 @@ fn session_tool_policy(session_id: &str) -> Option<SessionToolPolicy> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(session_id)
         .cloned()
+}
+
+/// Apply the current session policy to an MCP server tool invoked through a
+/// fixed deferred surface. Explicitly enabling the fixed surface authorizes its
+/// underlying MCP calls, while per-tool allow/deny entries remain effective.
+pub(crate) fn session_mcp_dispatch_is_allowed(
+    session_id: &str,
+    dispatched_name: &str,
+    fixed_surface: &str,
+) -> bool {
+    let Some(policy) = session_tool_policy(session_id) else {
+        return true;
+    };
+    let allowed = policy.allowed_tools.as_ref().is_none_or(|allowed| {
+        tool_name_is_allowed(allowed, dispatched_name) || allowed.contains(fixed_surface)
+    });
+    allowed && !tool_name_is_disabled(&policy.disabled_tools, dispatched_name)
 }
 
 /// Whether a tool call opted in to receiving an oversized (truncated) result.
@@ -249,17 +277,17 @@ impl Registry {
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
+                "maintainer_feedback",
+                feedback::MaintainerFeedbackTool::new,
+            );
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
                 "jcode_docs",
                 jcode_docs::JcodeDocsTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "todo", todo::TodoTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bg", bg::BgTool::new);
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "swarm",
-                communicate::CommunicateTool::new,
-            );
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
@@ -296,6 +324,12 @@ impl Registry {
             "skill_manage",
             skill::SkillTool::new(skills.clone()),
         );
+        // The swarm tool captures the user-editable swarm prompt in its
+        // description. Construct it once per session rather than sharing the
+        // process-wide instance. Existing sessions keep their stable tool
+        // definition (and provider KV cache), while newly created agents see
+        // prompt edits immediately.
+        Self::insert_tool(&mut tools, "swarm", communicate::CommunicateTool::new());
         tools
     }
 
@@ -935,6 +969,16 @@ impl Registry {
             mcp::McpManagementTool::new(Arc::clone(&mcp_manager)).with_registry(self.clone());
         self.register("mcp".to_string(), Arc::new(mcp_tool) as Arc<dyn Tool>)
             .await;
+        self.register(
+            "mcp_search".to_string(),
+            Arc::new(mcp::McpSearchTool::new(Arc::clone(&mcp_manager))) as Arc<dyn Tool>,
+        )
+        .await;
+        self.register(
+            "mcp_call".to_string(),
+            Arc::new(mcp::McpCallTool::new(Arc::clone(&mcp_manager))) as Arc<dyn Tool>,
+        )
+        .await;
 
         // Check if we have enabled servers to connect to. Disabled servers stay
         // configured (visible to the mcp management tool, connectable by name)

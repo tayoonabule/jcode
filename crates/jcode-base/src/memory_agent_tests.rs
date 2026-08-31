@@ -2,6 +2,24 @@ use super::*;
 use crate::memory::MemoryCategory;
 
 #[test]
+fn extraction_transcript_omits_internal_system_reminders() {
+    let messages = vec![
+        crate::message::Message::user(
+            "<system-reminder>\n# Session Context\nHardware: private\n</system-reminder>",
+        ),
+        crate::message::Message::user("Remember that tests use a temporary database."),
+        crate::message::Message::assistant_text("Understood."),
+    ];
+
+    let transcript = build_transcript_for_extraction(&messages);
+
+    assert!(!transcript.contains("Session Context"));
+    assert!(!transcript.contains("Hardware: private"));
+    assert!(transcript.contains("tests use a temporary database"));
+    assert!(transcript.contains("Understood"));
+}
+
+#[test]
 fn infer_candidate_tag_uses_repeated_non_stopword() {
     let tag =
         infer_candidate_tag("scheduler retries failed jobs and scheduler metrics update dashboard");
@@ -134,6 +152,17 @@ fn should_run_rerank_cadence_and_overrides() {
     // cadence <= 1 disables gating (every turn fires).
     assert!(should_run_rerank(4, Some(3), 1, false));
     assert!(should_run_rerank(4, Some(3), 0, false));
+}
+
+#[test]
+fn hybrid_retrieval_uses_focused_query_with_empty_fallback() {
+    let context = "old session context and tool output";
+
+    assert_eq!(
+        retrieval_query(context, "current user question"),
+        "current user question"
+    );
+    assert_eq!(retrieval_query(context, "  \n"), context);
 }
 
 fn mem(content: &str) -> MemoryEntry {

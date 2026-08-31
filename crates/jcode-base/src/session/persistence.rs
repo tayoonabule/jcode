@@ -375,6 +375,22 @@ impl Session {
         self.updated_at = Utc::now();
         let path = session_path(&self.id)?;
         let journal_path = session_journal_path_from_snapshot(&path);
+
+        // A newly opened panel contains only its hidden session-context message.
+        // Do not turn that implementation detail into a transcript on disk. Once
+        // the user (or a programmatic caller) adds a real conversation message,
+        // the normal first snapshot includes all of the accumulated context.
+        if !self.persist_state.snapshot_exists
+            && !self
+                .messages
+                .iter()
+                .any(super::is_visible_conversation_message)
+            && !self.saved
+            && self.custom_title.is_none()
+        {
+            return Ok(());
+        }
+
         let start = std::time::Instant::now();
         let snapshot_bytes_before = file_len_or_zero(&path);
         let journal_bytes_before = file_len_or_zero(&journal_path);
@@ -557,6 +573,12 @@ impl Session {
             fields.push(("error", crate::util::format_error_chain(error)));
             crate::logging::event_warn("SESSION_PERSISTENCE", fields);
         } else {
+            if let Err(error) = crate::recent_session_index::upsert_session(self) {
+                crate::logging::warn(&format!(
+                    "Failed to update recent-session metadata for {}: {error}",
+                    self.id
+                ));
+            }
             crate::logging::event_info("SESSION_PERSISTENCE", fields);
         }
         result

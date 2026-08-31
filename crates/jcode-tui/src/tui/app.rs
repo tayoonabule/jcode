@@ -94,6 +94,7 @@ mod shortcut_hints;
 mod split_view;
 mod state_ui;
 mod state_ui_input_helpers;
+mod update_sim;
 pub(crate) use state_ui_input_helpers::registered_command_entries;
 mod state_ui_maintenance;
 mod state_ui_messages;
@@ -950,6 +951,9 @@ pub struct App {
     /// has sent. Without a budget, a model that stops updating its todos gets
     /// nudged on every turn forever, silently burning an API call per tick.
     todo_completion_gate_attempts: u8,
+    /// Whether the clean completion handoff has already requested a user-facing
+    /// final response for the current todo cycle.
+    todo_final_response_requested: bool,
     /// Exact continuation sent for the last incomplete todo state. An unchanged
     /// list must not trigger another automatic turn: the agent may be parked on
     /// a worker, wake, or human decision, and repeated pokes cannot help.
@@ -1072,6 +1076,8 @@ pub struct App {
     /// simulator seeds synthetic phases so a developer can step through every
     /// first-run screen via Alt+5 reset or Cmd+5 toggle without touching real auth state.
     onboarding_sim: Option<usize>,
+    /// Active time-based, non-destructive update experience preview.
+    update_sim: Option<update_sim::UpdateSimulator>,
     /// Active guided first-run onboarding flow (model select -> continue ->
     /// transcript pick -> suggestions). `None` when not onboarding.
     onboarding_flow: Option<onboarding_flow::OnboardingFlow>,
@@ -1344,6 +1350,10 @@ pub struct App {
     /// Last time the pinned todo band re-read todos from disk (1s throttle).
     #[allow(dead_code)]
     pinned_todos_checked_at: Option<Instant>,
+    /// User-expanded state for the pinned todo band's `+N more` row.
+    pinned_todos_expanded: bool,
+    /// Running and terminal background tasks shown beneath the pinned todo band.
+    background_task_rows: Vec<crate::tui::BackgroundTaskRow>,
     last_side_panel_refresh: Option<Instant>,
     // Most recently persisted focus target for dictation routing.
     last_client_focus_recorded_at: Option<Instant>,
@@ -1415,6 +1425,9 @@ pub struct App {
     // let `process_remote_followups` dispatch it, exactly like a staged startup
     // prompt.
     pending_prompt_before_history: Option<input::PreparedInput>,
+    /// User echo for a headed fork prompt sent before bootstrap History arrives.
+    /// History replaces the transcript, so the echo must be applied afterwards.
+    pending_startup_prompt_echo: Option<String>,
     // Pending account switch from inline picker (for remote mode async processing)
     pending_account_picker_action: Option<crate::tui::AccountPickerAction>,
     // Keybindings for model switching

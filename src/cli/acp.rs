@@ -103,6 +103,73 @@ struct SessionUiState {
     reasoning_effort: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct TurnUsage {
+    reported: bool,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_read_tokens: Option<u64>,
+    cached_write_tokens: Option<u64>,
+}
+
+impl TurnUsage {
+    fn add(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_read_tokens: Option<u64>,
+        cached_write_tokens: Option<u64>,
+    ) {
+        self.reported = true;
+        self.input_tokens = self.input_tokens.saturating_add(input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+        add_optional_tokens(&mut self.cached_read_tokens, cached_read_tokens);
+        add_optional_tokens(&mut self.cached_write_tokens, cached_write_tokens);
+    }
+
+    fn to_acp(&self) -> Option<Value> {
+        if !self.reported {
+            return None;
+        }
+
+        let total_tokens = self
+            .input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cached_read_tokens.unwrap_or(0))
+            .saturating_add(self.cached_write_tokens.unwrap_or(0));
+        let mut usage = json!({
+            "totalTokens": total_tokens,
+            "inputTokens": self.input_tokens,
+            "outputTokens": self.output_tokens,
+        });
+        let object = usage.as_object_mut().expect("usage is an object");
+        if let Some(tokens) = self.cached_read_tokens {
+            object.insert("cachedReadTokens".to_string(), json!(tokens));
+        }
+        if let Some(tokens) = self.cached_write_tokens {
+            object.insert("cachedWriteTokens".to_string(), json!(tokens));
+        }
+        Some(usage)
+    }
+}
+
+fn add_optional_tokens(total: &mut Option<u64>, tokens: Option<u64>) {
+    if let Some(tokens) = tokens {
+        *total = Some(total.unwrap_or(0).saturating_add(tokens));
+    }
+}
+
+fn prompt_response(stop_reason: &str, usage: &TurnUsage) -> Value {
+    let mut response = json!({ "stopReason": stop_reason });
+    if let Some(usage) = usage.to_acp() {
+        response
+            .as_object_mut()
+            .expect("prompt response is an object")
+            .insert("usage".to_string(), usage);
+    }
+    response
+}
+
 impl SessionUiState {
     fn from_history_fields(
         provider_name: Option<String>,
@@ -318,7 +385,7 @@ impl AcpRuntime {
                 return Ok(());
             }
         };
-        if let Err(err) = ensure_no_acp_mcp_servers(&message.params) {
+        if let Err(err) = validate_acp_mcp_servers(&message.params) {
             self.write_error_value(id, JSONRPC_INVALID_PARAMS, err)
                 .await?;
             return Ok(());
@@ -373,7 +440,7 @@ impl AcpRuntime {
                 return Ok(());
             }
         };
-        if let Err(err) = ensure_no_acp_mcp_servers(&message.params) {
+        if let Err(err) = validate_acp_mcp_servers(&message.params) {
             self.write_error_value(id, JSONRPC_INVALID_PARAMS, err)
                 .await?;
             return Ok(());
@@ -698,6 +765,7 @@ impl AcpRuntime {
         let subscribe_id = 1;
         session
             .send(&Request::Subscribe {
+                crash_on_disconnect: false,
                 id: subscribe_id,
                 working_dir: Some(cwd.display().to_string()),
                 selfdev: None,
@@ -749,6 +817,7 @@ impl AcpRuntime {
         let resume_id = 1;
         session
             .send(&Request::Subscribe {
+                crash_on_disconnect: false,
                 id: resume_id,
                 working_dir: Some(cwd.display().to_string()),
                 selfdev: None,
@@ -859,7 +928,7 @@ impl AcpRuntime {
                 }),
             )
             .await?;
-            self.write_result(rpc_id, json!({ "stopReason": "end_turn" }))
+            self.write_result(rpc_id, prompt_response("end_turn", &TurnUsage::default()))
                 .await?;
             return Ok(());
         }
@@ -876,6 +945,7 @@ impl AcpRuntime {
                 content: text,
                 images,
                 system_reminder: None,
+                active_skill: None,
                 no_reply: false,
             })
             .await;
@@ -886,6 +956,7 @@ impl AcpRuntime {
 
         let mut mapper = EventMapper::new(session.session_id.clone(), self.profile);
         let mut stop_reason = "end_turn".to_string();
+        let mut turn_usage = TurnUsage::default();
         loop {
             let event = match session.read_event().await {
                 Ok(event) => event,
@@ -912,10 +983,11 @@ impl AcpRuntime {
                 }
                 ServerEvent::TokenUsage {
                     input,
-                    output: _,
+                    output,
                     cache_read_input,
                     cache_creation_input,
                 } => {
+                    turn_usage.add(input, output, cache_read_input, cache_creation_input);
                     let (provider_name, context_limit) = {
                         let state = session.ui_state.lock().await;
                         (
@@ -990,7 +1062,7 @@ impl AcpRuntime {
         }
 
         cleanup_prompt_state(&session).await;
-        self.write_result(rpc_id, json!({ "stopReason": stop_reason }))
+        self.write_result(rpc_id, prompt_response(&stop_reason, &turn_usage))
             .await?;
         Ok(())
     }
@@ -1616,14 +1688,13 @@ fn required_session_id(params: &Value) -> std::result::Result<String, String> {
         .ok_or_else(|| "Missing required sessionId".to_string())
 }
 
-fn ensure_no_acp_mcp_servers(params: &Value) -> std::result::Result<(), String> {
+fn validate_acp_mcp_servers(params: &Value) -> std::result::Result<(), String> {
     match params.get("mcpServers") {
         None | Some(Value::Null) => Ok(()),
-        Some(Value::Array(items)) if items.is_empty() => Ok(()),
-        Some(_) => Err(
-            "ACP mcpServers are not supported yet; configure MCP servers in ~/.jcode/mcp.json or a project-local .jcode/mcp.json/.mcp.json"
-                .to_string(),
-        ),
+        // Session-scoped MCP is not supported yet, but rejecting this required
+        // ACP field prevents hosts with MCP servers from creating a session.
+        Some(Value::Array(_)) => Ok(()),
+        Some(_) => Err("ACP mcpServers must be an array".to_string()),
     }
 }
 
@@ -1843,6 +1914,49 @@ mod tests {
     }
 
     #[test]
+    fn prompt_response_reports_usage_accumulated_across_the_turn() {
+        let mut usage = TurnUsage::default();
+        usage.add(10, 2, Some(4), Some(5));
+        usage.add(20, 3, Some(6), Some(7));
+
+        assert_eq!(
+            prompt_response("end_turn", &usage),
+            json!({
+                "stopReason": "end_turn",
+                "usage": {
+                    "totalTokens": 57,
+                    "inputTokens": 30,
+                    "outputTokens": 5,
+                    "cachedReadTokens": 10,
+                    "cachedWriteTokens": 12,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_response_omits_unreported_usage_and_cache_fields() {
+        assert_eq!(
+            prompt_response("end_turn", &TurnUsage::default()),
+            json!({ "stopReason": "end_turn" })
+        );
+
+        let mut usage = TurnUsage::default();
+        usage.add(10, 2, None, None);
+        assert_eq!(
+            prompt_response("cancelled", &usage),
+            json!({
+                "stopReason": "cancelled",
+                "usage": {
+                    "totalTokens": 12,
+                    "inputTokens": 10,
+                    "outputTokens": 2,
+                }
+            })
+        );
+    }
+
+    #[test]
     fn initialize_standard_omits_jcode_meta() {
         let result = initialize_result(&json!({"protocolVersion": 1}), AcpProfile::Standard);
         assert_eq!(result["protocolVersion"], 1);
@@ -1885,14 +1999,12 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_mcp_servers_rejected_until_session_scoped_mcp_is_supported() {
+    fn non_empty_mcp_servers_are_tolerated_until_session_scoped_mcp_is_supported() {
         let params = json!({"mcpServers": [{"name": "fs"}]});
-        let error = ensure_no_acp_mcp_servers(&params).unwrap_err();
-        assert!(error.contains("~/.jcode/mcp.json"));
-        assert!(error.contains(".mcp.json"));
-        assert!(!error.contains("config.toml"));
+        assert!(validate_acp_mcp_servers(&params).is_ok());
+
         let params = json!({"mcpServers": []});
-        assert!(ensure_no_acp_mcp_servers(&params).is_ok());
+        assert!(validate_acp_mcp_servers(&params).is_ok());
     }
 
     #[test]

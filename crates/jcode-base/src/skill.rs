@@ -27,7 +27,14 @@ struct SkillFrontmatter {
     name: String,
     description: String,
     #[serde(rename = "allowed-tools")]
-    allowed_tools: Option<String>,
+    allowed_tools: Option<AllowedTools>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AllowedTools {
+    CommaDelimited(String),
+    Sequence(Vec<String>),
 }
 
 /// Registry of available skills
@@ -477,6 +484,17 @@ impl SkillRegistry {
 
     /// Parse a SKILL.md file
     fn parse_skill(path: &Path) -> Result<Skill> {
+        Self::parse_skill_inner(path).map_err(|error| {
+            crate::logging::warn(&format!(
+                "Failed to parse skill file '{}': {}",
+                path.display(),
+                error
+            ));
+            error
+        })
+    }
+
+    fn parse_skill_inner(path: &Path) -> Result<Skill> {
         let content = std::fs::read_to_string(path)?;
 
         // Parse YAML frontmatter
@@ -488,8 +506,13 @@ impl SkillRegistry {
             allowed_tools,
         } = frontmatter;
 
-        let allowed_tools =
-            allowed_tools.map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+        let allowed_tools = allowed_tools.map(|tools| match tools {
+            AllowedTools::CommaDelimited(tools) => tools
+                .split(',')
+                .map(|tool| tool.trim().to_string())
+                .collect(),
+            AllowedTools::Sequence(tools) => tools,
+        });
         let search_text = build_skill_search_text(&name, &description, &body);
 
         Ok(Skill {
@@ -962,6 +985,60 @@ mod tests {
         .expect("write skill");
     }
 
+    fn write_skill_file(skills_dir: &Path, name: &str, content: &str) -> PathBuf {
+        let dir = skills_dir.join(name);
+        std::fs::create_dir_all(&dir).expect("create skill dir");
+        let path = dir.join("SKILL.md");
+        std::fs::write(&path, content).expect("write skill");
+        path
+    }
+
+    #[test]
+    fn allowed_tools_accepts_legacy_string_sequence_and_absence() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cases = [
+            (
+                "allowed-tools: bash, read, write\n",
+                Some(vec!["bash", "read", "write"]),
+            ),
+            (
+                "allowed-tools:\n  - bash\n  - read\n  - write\n",
+                Some(vec!["bash", "read", "write"]),
+            ),
+            ("", None),
+        ];
+
+        for (index, (allowed_tools, expected)) in cases.into_iter().enumerate() {
+            let path = temp.path().join(format!("skill-{index}.md"));
+            std::fs::write(
+                &path,
+                format!("---\nname: test\ndescription: Test skill\n{allowed_tools}---\n\nBody\n"),
+            )
+            .expect("write skill");
+            let skill = SkillRegistry::parse_skill_inner(&path).expect("parse skill");
+            let expected = expected.map(|tools| {
+                tools
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<String>>()
+            });
+            assert_eq!(skill.allowed_tools, expected);
+        }
+    }
+
+    #[test]
+    fn allowed_tools_rejects_non_string_sequence_values() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: test\ndescription: Test skill\nallowed-tools: [bash, 1]\n---\n\nBody\n",
+        )
+        .expect("write skill");
+
+        assert!(SkillRegistry::parse_skill_inner(&path).is_err());
+    }
+
     #[test]
     fn parse_invocation_supports_a_trailing_prompt() {
         assert_eq!(
@@ -1099,6 +1176,37 @@ mod tests {
             .expect("project-local .agents skill should load");
         assert_eq!(skill.description, "Test skill agents-only");
         assert!(skill.path.starts_with(temp.path()));
+    }
+
+    #[test]
+    fn malformed_skill_does_not_block_directory_loaders() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = temp.path().join("skills");
+        write_skill_file(
+            &skills_dir,
+            "valid",
+            "---\nname: valid\ndescription: Valid skill\n---\n\nUse valid.\n",
+        );
+        write_skill_file(
+            &skills_dir,
+            "malformed",
+            "---\nname: malformed\ndescription: Triggers: invalid yaml\n---\n\nBroken.\n",
+        );
+
+        let mut registry = SkillRegistry::default();
+        registry
+            .load_from_dir(&skills_dir)
+            .expect("load skills while skipping malformed file");
+        assert!(registry.contains("valid"));
+        assert!(!registry.contains("malformed"));
+
+        let mut counted_registry = SkillRegistry::default();
+        let count = counted_registry
+            .load_from_dir_count(&skills_dir)
+            .expect("count skills while skipping malformed file");
+        assert_eq!(count, 1);
+        assert!(counted_registry.contains("valid"));
+        assert!(!counted_registry.contains("malformed"));
     }
 
     #[test]

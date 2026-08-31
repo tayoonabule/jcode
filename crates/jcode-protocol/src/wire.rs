@@ -45,6 +45,10 @@ pub enum Request {
         images: Vec<(String, String)>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system_reminder: Option<String>,
+        /// Skill selected by the client for this and subsequent turns. The
+        /// daemon resolves the name against its own skill registry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_skill: Option<String>,
         /// Append the user message as context only. The daemon persists it and
         /// acknowledges it without starting a model turn.
         #[serde(default, skip_serializing_if = "is_false")]
@@ -128,12 +132,21 @@ pub enum Request {
         client_has_local_history: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_session_takeover: bool,
+        /// Mark the attached session crashed if this connection disappears
+        /// without first sending `prepare_disconnect`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        crash_on_disconnect: bool,
         /// Terminal-identifying env vars (tmux/zellij/kitty/DISPLAY/...) captured
         /// from the connecting client so the server can route spawn/focus hooks
         /// to the client's terminal instead of its own stale startup env (#405).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         terminal_env: Vec<(String, String)>,
     },
+
+    /// Declare that this client is intentionally detaching before its transport
+    /// closes. This disarms `crash_on_disconnect` for graceful UI teardown.
+    #[serde(rename = "prepare_disconnect")]
+    PrepareDisconnect { id: u64 },
 
     /// Get full conversation history (for TUI sync on connect)
     #[serde(rename = "get_history")]
@@ -527,12 +540,6 @@ pub enum Request {
         request_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawn_mode: Option<String>,
-        /// Optional per-spawn model override. Takes precedence over
-        /// `agents.swarm_model` config. Supports explicit auth-route prefixes
-        /// (e.g. `openai-api:gpt-5.5`) and the `inherit`/`coordinator`
-        /// sentinels to force coordinator inheritance past a config pin.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
         /// Optional reasoning effort for the spawned agent (e.g. `none`,
         /// `low`, `medium`, `high`, `xhigh`, `max`). Unset = provider default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -651,10 +658,6 @@ pub enum Request {
         spawn_if_needed: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
-        /// Optional model override for workers spawned by this assignment
-        /// (same semantics as CommSpawn::model).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
         /// Optional reasoning effort for workers spawned by this assignment
         /// (same semantics as CommSpawn::effort).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -728,6 +731,15 @@ pub enum Request {
     reason = "wire protocol prioritizes straightforward serde payloads over boxing every larger event variant"
 )]
 pub enum ServerEvent {
+    /// An autonomous wake was requested. In external wake mode this event is
+    /// emitted instead of starting or injecting into a turn.
+    #[serde(rename = "wake_requested")]
+    WakeRequested {
+        session_id: String,
+        reason: String,
+        notification: String,
+    },
+
     /// Acknowledgment of request
     #[serde(rename = "ack")]
     Ack { id: u64 },

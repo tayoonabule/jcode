@@ -51,17 +51,35 @@ export interface HistoryMessage {
   content: string;
 }
 
+export type RenderedImageSource =
+  | { kind: "user_input" }
+  | { kind: "tool_result"; tool_name: string }
+  | { kind: "other"; role: string };
+
+export type RenderedImageAnchor =
+  | { kind: "tool_call"; id: string }
+  | { kind: "user_prompt"; ordinal: number };
+
+export interface RenderedImage {
+  media_type: string;
+  data: string;
+  label?: string;
+  source: RenderedImageSource;
+  anchor?: RenderedImageAnchor;
+}
+
 /** Base64 image attachment: [mediaType, base64Data]. */
 export type ImageAttachment = [string, string];
 
 export type ApiRequest =
   | { req: "hello"; min_version: number; max_version: number; client: string }
-  | { req: "list_sessions"; include_archived?: boolean }
+  | { req: "list_sessions"; include_archived?: boolean; limit?: number }
   | { req: "archive_session"; session_id: string }
   | { req: "restore_session"; session_id: string }
   | { req: "set_retention_policy"; archive_after_days?: number }
   | { req: "create_session"; working_dir?: string }
   | { req: "attach_session"; session_id: string }
+  | { req: "fork_session"; session_id: string }
   | { req: "detach_session"; session_id: string }
   | {
       req: "send_message";
@@ -109,7 +127,8 @@ export type ApiEvent =
   | { ev: "error"; code: ErrorCode; message: string }
   | { ev: "sessions"; sessions: SessionInfo[] }
   | { ev: "attached"; session: SessionInfo }
-  | { ev: "history"; session_id: string; messages: HistoryMessage[] }
+  | { ev: "session_forked"; session: SessionInfo }
+  | { ev: "history"; session_id: string; messages: HistoryMessage[]; images?: RenderedImage[] }
   | { ev: "pong" }
   | { ev: "text_delta"; session_id: string; text: string }
   | { ev: "reasoning_delta"; session_id: string; text: string }
@@ -125,6 +144,7 @@ export type ApiEvent =
       output: string;
       error?: string;
     }
+  | { ev: "side_pane_images"; session_id: string; images: RenderedImage[] }
   | {
       ev: "token_usage";
       session_id: string;
@@ -133,6 +153,12 @@ export type ApiEvent =
       cache_read_input?: number;
     }
   | { ev: "turn_done"; session_id: string }
+  | {
+      ev: "wake_requested";
+      session_id: string;
+      reason: string;
+      notification: string;
+    }
   | {
       ev: "background_progress";
       session_id: string;
@@ -151,13 +177,21 @@ export type ApiEvent =
       description: string;
     }
   | { ev: "session_status"; session_id: string; status: string }
-  | { ev: "model_info"; session_id: string; provider?: string; model?: string }
+  | { ev: "connection_phase"; session_id: string; phase: string }
+  | {
+      ev: "model_info";
+      session_id: string;
+      provider?: string;
+      model?: string;
+      reasoning_effort?: string;
+    }
   | { ev: "models"; session_id: string; models: string[]; current?: string }
   | {
       ev: "runtime_info";
       session_id: string;
       provider?: string;
       model?: string;
+      reasoning_effort?: string;
       routes: ModelRouteInfo[];
     }
   | { ev: "credential_updated"; provider: string; configured: boolean }
@@ -225,7 +259,9 @@ export const KNOWN_EVENT_KINDS = [
   "error",
   "sessions",
   "attached",
+  "session_forked",
   "history",
+  "side_pane_images",
   "pong",
   "text_delta",
   "reasoning_delta",
@@ -236,10 +272,12 @@ export const KNOWN_EVENT_KINDS = [
   "tool_done",
   "token_usage",
   "turn_done",
+  "wake_requested",
   "background_progress",
   "message_accepted",
   "permission_request",
   "session_status",
+  "connection_phase",
   "model_info",
   "models",
   "runtime_info",
@@ -261,6 +299,7 @@ export const KNOWN_REQUEST_KINDS = [
   "set_retention_policy",
   "create_session",
   "attach_session",
+  "fork_session",
   "detach_session",
   "send_message",
   "cancel",

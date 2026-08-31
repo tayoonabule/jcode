@@ -371,6 +371,44 @@ fn test_expand_badge_rendered_shortcut_expands_with_alt_lowercase_event() {
 }
 
 #[test]
+fn test_clicking_expand_edit_badge_expands_to_full_diff() {
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, mut terminal) = make_edit_badge_test_app(20);
+    render_and_snap(&app, &mut terminal);
+
+    let buf = terminal.backend().buffer();
+    let area = *buf.area();
+    let mut badge = None;
+    'rows: for row in 0..area.height {
+        let line = (0..area.width)
+            .map(|col| buf[(col, row)].symbol())
+            .collect::<String>();
+        if let Some(byte) = line.find("[E] expand") {
+            badge = Some((line[..byte].chars().count() as u16, row));
+            break 'rows;
+        }
+    }
+    let (column, row) = badge.expect("expand edit badge must be visible");
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.handle_mouse_event(MouseEvent {
+            kind,
+            column: column + 1,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+
+    assert_eq!(app.diff_mode, crate::config::DiffDisplayMode::FullInline);
+    assert_eq!(
+        app.status_notice(),
+        Some("Expanded edit diffs · Diffs: Inline Full".to_string())
+    );
+}
+
+#[test]
 fn test_expand_badge_shortcut_works_while_diff_pane_focused() {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -872,7 +910,8 @@ fn test_click_on_inline_image_label_line_cycles_level() {
     );
     assert_eq!(app.status_notice(), Some("Image size: large".to_string()));
 
-    // Further label clicks continue the cycle: Large -> Full -> Fit.
+    // Large and Full have identical geometry for this landscape image, so the
+    // redundant Full state is skipped and the next click returns to Fit.
     let click_label = |app: &mut App| {
         app.handle_mouse_event(MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
@@ -884,14 +923,8 @@ fn test_click_on_inline_image_label_line_cycles_level() {
     click_label(&mut app);
     assert_eq!(
         app.image_expand_level(IMAGE_ID),
-        ImageExpandLevel::Full,
-        "second click should expand Large -> Full"
-    );
-    click_label(&mut app);
-    assert_eq!(
-        app.image_expand_level(IMAGE_ID),
         ImageExpandLevel::Fit,
-        "cycle should wrap Full -> Fit"
+        "second click should skip duplicate Full geometry and return to Fit"
     );
 }
 
@@ -1311,18 +1344,13 @@ fn test_click_on_inline_image_body_cycles_level() {
         "clicking the image body should expand Fit -> Large"
     );
 
-    // Clicking the body again advances the cycle.
-    click(&mut app, body_col, body_row);
-    assert_eq!(
-        app.image_expand_level(IMAGE_ID),
-        ImageExpandLevel::Full,
-        "second body click should expand Large -> Full"
-    );
+    // Large and Full resolve to the same geometry for this landscape image, so
+    // the click cycle must omit Full rather than showing a duplicate size.
     click(&mut app, body_col, body_row);
     assert_eq!(
         app.image_expand_level(IMAGE_ID),
         ImageExpandLevel::Fit,
-        "third body click should wrap Full -> Fit"
+        "second body click should skip duplicate Full geometry and return to Fit"
     );
 
     // A click in the blank space to the right of the image must stay inert.

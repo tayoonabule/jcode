@@ -28,7 +28,7 @@ pub struct DisplayConfig {
     pub emoji: bool,
     /// Center all content (default: false)
     pub centered: bool,
-    /// Show thinking/reasoning content by default (default: false)
+    /// Show thinking/reasoning content by default (default: true)
     pub show_thinking: bool,
     /// How to display reasoning/thinking content (off/full/current).
     /// When unset, falls back to `show_thinking` (true => full, false => off).
@@ -79,6 +79,10 @@ pub struct DisplayConfig {
     /// just the one-line summary (default: false)
     #[serde(default)]
     pub show_agentgrep_output: bool,
+    /// Show up to the last three non-empty bash output lines beneath the tool
+    /// summary (default: false).
+    #[serde(default)]
+    pub show_bash_output: bool,
     /// Show the dimmed technical detail (command, path, args) after the
     /// model-provided intent on tool rows (default: false). When off, rows
     /// that have an intent show only the intent; rows without an intent
@@ -115,6 +119,8 @@ pub struct DisplayConfig {
     /// sessions (issue #674).
     #[serde(default = "default_true")]
     pub external_sessions: bool,
+    /// Usage percentage wording: "left" (default) or "used".
+    pub usage_display: String,
     /// When to show the overscroll status line below the input
     /// (off/on/overscroll, default: overscroll). "overscroll" is the elastic
     /// reveal when scrolling past the bottom, "on" keeps it always visible.
@@ -134,8 +140,8 @@ impl Default for DisplayConfig {
             debug_socket: false,
             emoji: true,
             centered: false,
-            show_thinking: false,
-            reasoning_display: Some(ReasoningDisplayMode::Off),
+            show_thinking: true,
+            reasoning_display: Some(ReasoningDisplayMode::Full),
             diagram_mode: DiagramDisplayMode::default(),
             markdown_spacing: MarkdownSpacingMode::default(),
             latex_rendering: LatexRenderingMode::default(),
@@ -150,6 +156,7 @@ impl Default for DisplayConfig {
             compact_notifications: false,
             copy_badge_alt_label: String::new(),
             show_agentgrep_output: false,
+            show_bash_output: false,
             tool_call_details: false,
             native_scrollbars: NativeScrollbarConfig::default(),
             keybinding_hints: true,
@@ -157,6 +164,7 @@ impl Default for DisplayConfig {
             colors: std::collections::BTreeMap::new(),
             active_sessions_manager: false,
             external_sessions: true,
+            usage_display: "left".to_string(),
             overscroll_status: OverscrollStatusMode::default(),
         }
     }
@@ -202,11 +210,27 @@ impl DisplayConfig {
     pub fn reasoning_enabled(&self) -> bool {
         !matches!(self.reasoning_display(), ReasoningDisplayMode::Off)
     }
+
+    pub fn usage_display_used(&self) -> bool {
+        self.usage_display.eq_ignore_ascii_case("used")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::DisplayConfig;
+    use crate::ReasoningDisplayMode;
+
+    #[test]
+    fn thinking_is_shown_in_full_by_default() {
+        let default = DisplayConfig::default();
+        assert!(default.show_thinking);
+        assert_eq!(default.reasoning_display(), ReasoningDisplayMode::Full);
+
+        let missing: DisplayConfig = serde_json::from_str("{}").expect("display config");
+        assert!(missing.show_thinking);
+        assert_eq!(missing.reasoning_display(), ReasoningDisplayMode::Full);
+    }
 
     #[test]
     fn todos_are_pinned_by_default_but_can_be_disabled() {
@@ -218,5 +242,14 @@ mod tests {
         let disabled: DisplayConfig =
             serde_json::from_str(r#"{"pin_todos":false}"#).expect("display config");
         assert!(!disabled.pin_todos);
+    }
+
+    #[test]
+    fn usage_percentage_wording_defaults_to_left_and_accepts_used() {
+        assert_eq!(DisplayConfig::default().usage_display, "left");
+
+        let used: DisplayConfig =
+            serde_json::from_str(r#"{"usage_display":"used"}"#).expect("display config");
+        assert!(used.usage_display_used());
     }
 }

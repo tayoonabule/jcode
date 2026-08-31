@@ -589,6 +589,14 @@ impl crate::tui::TuiState for App {
         self.pinned_todos_payload_ref()
     }
 
+    fn pinned_todos_expanded(&self) -> bool {
+        self.pinned_todos_expanded
+    }
+
+    fn background_task_rows(&self) -> &[crate::tui::BackgroundTaskRow] {
+        self.background_task_rows_ref()
+    }
+
     fn input(&self) -> &str {
         &self.input
     }
@@ -1334,8 +1342,6 @@ impl crate::tui::TuiState for App {
             }
         });
 
-        let memory_info = gather_memory_info(self.memory_enabled, self.session.working_dir.clone());
-
         // Gather swarm info
         let swarm_info = if self.swarm_enabled {
             let subagent_status = self.subagent_status.clone();
@@ -1589,10 +1595,13 @@ impl crate::tui::TuiState for App {
             session_name,
             working_dir: self.session.working_dir.clone(),
             client_count,
-            memory_info,
+            // Memory remains available through commands and tools, but no longer
+            // occupies a dedicated info widget.
+            memory_info: None,
             swarm_info,
             background_info,
             usage_info,
+            usage_display_used: crate::config::config().display.usage_display_used(),
             tokens_per_second,
             provider_name: if uses_remote_widget_metadata {
                 self.remote_provider_name
@@ -2158,6 +2167,11 @@ pub(crate) fn swarm_panel_action_for_key(
     // macOS Option+letter often arrives as a transformed glyph with no ALT
     // modifier; normalize through the shared shortcut helper.
     let macos_letter = crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
+    let macos_shift_letter =
+        crate::tui::keybind::shortcut_char_for_macos_option_shift_key(code, modifiers);
+    if macos_shift_letter == Some('p') {
+        return Some(SwarmPanelAction::OpenPrompt);
+    }
     match code {
         KeyCode::Down | KeyCode::Char('j') if alt => Some(SwarmPanelAction::SelectNext),
         KeyCode::Up | KeyCode::Char('k') if alt => Some(SwarmPanelAction::SelectPrev),

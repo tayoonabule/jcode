@@ -31,6 +31,45 @@ fn test_local_error_copy_badge_shortcut_supported() {
 }
 
 #[test]
+fn test_clicking_copy_badge_copies_its_target() {
+    let _render_lock = scroll_render_test_lock();
+    let clipboard = CapturedClipboard::new();
+    let (mut app, mut terminal) = create_error_copy_test_app();
+    render_and_snap(&app, &mut terminal);
+
+    let buf = terminal.backend().buffer();
+    let area = *buf.area();
+    let mut badge = None;
+    'rows: for row in 0..area.height {
+        let line = (0..area.width)
+            .map(|col| buf[(col, row)].symbol())
+            .collect::<String>();
+        if let Some(byte) = line.find("[S]") {
+            badge = Some((line[..byte].chars().count() as u16, row));
+            break 'rows;
+        }
+    }
+    let (column, row) = badge.expect("copy badge must be visible");
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.handle_mouse_event(MouseEvent {
+            kind,
+            column: column + 1,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+
+    assert_eq!(app.status_notice(), Some("Copied error".to_string()));
+    assert_eq!(
+        clipboard.text().as_deref(),
+        Some("permission denied while opening ~/.jcode/config.toml")
+    );
+}
+
+#[test]
 fn test_local_tool_error_copy_badge_shortcut_supported() {
     let _render_lock = scroll_render_test_lock();
     let clipboard = CapturedClipboard::new();
@@ -557,7 +596,7 @@ fn test_copy_selection_mouse_click_does_not_enter_mode() {
 }
 
 #[test]
-fn test_copy_selection_mouse_drag_auto_copies_and_exits_mode() {
+fn test_copy_selection_mouse_drag_auto_copies_and_keeps_highlight() {
     let _render_lock = scroll_render_test_lock();
     let (mut app, mut terminal) = create_copy_test_app();
     let copied = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -640,10 +679,13 @@ fn test_copy_selection_mouse_drag_auto_copies_and_exits_mode() {
     );
 
     assert!(!app.copy_selection_mode);
-    assert!(app.copy_selection_anchor.is_none());
-    assert!(app.copy_selection_cursor.is_none());
+    assert!(app.copy_selection_anchor.is_some());
+    assert!(app.copy_selection_cursor.is_some());
     assert!(copied.lock().unwrap().contains("println!(\"hello\");"));
-    assert_eq!(app.status_notice(), Some("Copied selection".to_string()));
+    assert_eq!(
+        app.status_notice(),
+        Some("Copied selection · highlight remains visible".to_string())
+    );
 }
 
 #[test]
@@ -1439,4 +1481,3 @@ fn test_changelog_overlay_mouse_drag_release_copies_text() {
         Some("Copied selection") | Some("Failed to copy selection") | Some("Selection is empty")
     ));
 }
-

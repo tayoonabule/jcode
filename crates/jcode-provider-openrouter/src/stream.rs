@@ -59,6 +59,7 @@ struct ToolCallAccumulator {
     id: String,
     name: String,
     arguments: String,
+    thought_signature: Option<String>,
 }
 
 impl OpenRouterStream {
@@ -134,7 +135,7 @@ impl OpenRouterStream {
         }
     }
 
-    fn push_completed_tool_call(&mut self, tc: ToolCallAccumulator) {
+    fn push_completed_tool_call(&mut self, index: u64, mut tc: ToolCallAccumulator) {
         if tc.id.trim().is_empty() {
             jcode_logging::warn(&format!(
                 "OpenRouter SSE dropped incomplete tool call for model {}: missing id (name={} args_len={})",
@@ -155,6 +156,13 @@ impl OpenRouterStream {
             return;
         }
 
+        // Some OpenAI-compatible providers synthesize a positional fallback when
+        // the model omits a call id. Since the position restarts every response,
+        // accepting it verbatim reuses ids across turns (for example `bash:0`).
+        if tc.id == format!("{}:{index}", tc.name) {
+            tc.id = jcode_core::id::new_id("toolu");
+        }
+
         self.pending.push_back(StreamEvent::ToolUseStart {
             id: tc.id,
             name: tc.name,
@@ -162,12 +170,16 @@ impl OpenRouterStream {
         self.pending
             .push_back(StreamEvent::ToolInputDelta(tc.arguments));
         self.pending.push_back(StreamEvent::ToolUseEnd);
+        if let Some(signature) = tc.thought_signature.filter(|value| !value.is_empty()) {
+            self.pending
+                .push_back(StreamEvent::ToolUseSignature(signature));
+        }
     }
 
     fn flush_tool_call_accumulators(&mut self) {
         let calls = std::mem::take(&mut self.tool_call_accumulators);
-        for (_index, tc) in calls {
-            self.push_completed_tool_call(tc);
+        for (index, tc) in calls {
+            self.push_completed_tool_call(index, tc);
         }
     }
 
@@ -177,6 +189,7 @@ impl OpenRouterStream {
         id: Option<&str>,
         name: Option<&str>,
         arguments: Option<&str>,
+        thought_signature: Option<&str>,
     ) {
         let incoming_id = id
             .map(str::trim)
@@ -193,7 +206,7 @@ impl OpenRouterStream {
             })
             && let Some(previous) = self.tool_call_accumulators.remove(&index)
         {
-            self.push_completed_tool_call(previous);
+            self.push_completed_tool_call(index, previous);
         }
 
         let tc = self.tool_call_accumulators.entry(index).or_default();
@@ -212,6 +225,10 @@ impl OpenRouterStream {
 
         if let Some(args) = arguments {
             tc.arguments.push_str(args);
+        }
+
+        if let Some(signature) = thought_signature.filter(|value| !value.is_empty()) {
+            tc.thought_signature = Some(signature.to_string());
         }
     }
 
@@ -379,6 +396,10 @@ impl OpenRouterStream {
                                     function
                                         .and_then(|f| f.get("arguments"))
                                         .and_then(|a| a.as_str()),
+                                    tc.get("extra_content")
+                                        .and_then(|value| value.get("google"))
+                                        .and_then(|value| value.get("thought_signature"))
+                                        .and_then(|value| value.as_str()),
                                 );
                             }
                         }
@@ -834,5 +855,79 @@ mod tests {
             StreamEvent::MessageEnd { stop_reason } if stop_reason.as_deref() == Some("tool_calls")
         ));
         assert!(stream.tool_call_accumulators.is_empty());
+    }
+
+    #[test]
+    fn vertex_sse_preserves_tool_call_thought_signature() {
+        let mut stream = test_stream();
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_vertex",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"},
+                        "extra_content": {
+                            "google": {"thought_signature": "AY89a1...verbatim"}
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        stream.buffer = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.parse_next_event() {
+            events.push(event);
+        }
+
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    StreamEvent::ToolUseStart { id, name },
+                    StreamEvent::ToolInputDelta(arguments),
+                    StreamEvent::ToolUseEnd,
+                    StreamEvent::ToolUseSignature(signature),
+                    StreamEvent::MessageEnd { stop_reason: Some(reason) },
+                ] if id == "call_vertex"
+                    && name == "read"
+                    && arguments == "{\"path\":\"README.md\"}"
+                    && signature == "AY89a1...verbatim"
+                    && reason == "tool_calls"
+            ),
+            "events: {events:?}"
+        );
+    }
+
+    #[test]
+    fn positional_fallback_tool_call_ids_are_unique_across_responses() {
+        fn parse_id() -> String {
+            let mut stream = test_stream();
+            stream.apply_tool_call_delta(
+                0,
+                Some("bash:0"),
+                Some("bash"),
+                Some(r#"{"command":"echo ok"}"#),
+                None,
+            );
+            stream.flush_tool_call_accumulators();
+
+            match stream.pending.pop_front() {
+                Some(StreamEvent::ToolUseStart { id, name }) => {
+                    assert_eq!(name, "bash");
+                    assert!(id.starts_with("toolu_"), "unexpected fallback id: {id}");
+                    id
+                }
+                event => panic!("expected tool-use start, got {event:?}"),
+            }
+        }
+
+        let first_turn_id = parse_id();
+        let second_turn_id = parse_id();
+
+        assert_ne!(first_turn_id, second_turn_id);
     }
 }

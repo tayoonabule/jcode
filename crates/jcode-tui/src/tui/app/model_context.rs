@@ -195,7 +195,7 @@ impl App {
 
     /// The api_method string of the route currently in use, used to exclude the
     /// failed route and to recognize same-model/different-method alternatives.
-    fn current_route_api_method(&self) -> Option<String> {
+    pub(super) fn current_route_api_method(&self) -> Option<String> {
         if self.is_remote {
             return self.session.route_api_method.clone();
         }
@@ -1789,11 +1789,10 @@ impl App {
         match completed.result {
             Ok(summary) => {
                 self.invalidate_model_picker_cache();
-                self.upsert_background_task_progress_message(
-                    crate::message::format_model_refresh_progress_markdown(
-                        "Model list refresh complete",
-                        Some(100),
-                    ),
+                self.finish_background_task(
+                    "refresh-model-list".to_string(),
+                    "Model list refresh".to_string(),
+                    crate::tui::BackgroundTaskRowStatus::Completed,
                 );
                 self.push_display_message(DisplayMessage::system(format_model_refresh_summary(
                     &summary,
@@ -1804,11 +1803,10 @@ impl App {
                 ));
             }
             Err(error) => {
-                self.upsert_background_task_progress_message(
-                    crate::message::format_model_refresh_progress_markdown(
-                        "Model list refresh failed",
-                        None,
-                    ),
+                self.finish_background_task(
+                    "refresh-model-list".to_string(),
+                    "Model list refresh".to_string(),
+                    crate::tui::BackgroundTaskRowStatus::Failed,
                 );
                 self.push_display_message(DisplayMessage::error(format!(
                     "Failed to refresh model list: {}",

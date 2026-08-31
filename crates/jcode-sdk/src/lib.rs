@@ -38,8 +38,8 @@ pub use client::{
 pub use diagnostics::{SocketState, Stage, describe_disconnect, explain, human_duration};
 pub use errors::{Error, ErrorKind, Result};
 pub use launch::{
-    LaunchOptions, LaunchedInstance, ensure_runtime, inherit_credentials, launch_instance,
-    socket_accepts, user_app_config_dir, user_jcode_home, wait_for_socket,
+    LaunchOptions, LaunchedInstance, WakeMode, ensure_runtime, inherit_credentials,
+    launch_instance, socket_accepts, user_app_config_dir, user_jcode_home, wait_for_socket,
 };
 pub use structured::{
     RunStructuredError, RunStructuredOptions, StructuredEventCallback, StructuredOutputAttempt,
@@ -50,6 +50,6 @@ pub use structured::{
 /// The protocol types, re-exported so a client needs one dependency, not two.
 pub use jcode_harness_api as api;
 pub use jcode_harness_api::{
-    ApiEvent, ApiRequest, HistoryMessage, ModelRouteInfo, PermissionDecision, SessionInfo,
-    TextMatch, api_socket_path,
+    ApiEvent, ApiRequest, HistoryMessage, ModelRouteInfo, PermissionDecision, RenderedImage,
+    RenderedImageAnchor, RenderedImageSource, SessionInfo, TextMatch, api_socket_path,
 };

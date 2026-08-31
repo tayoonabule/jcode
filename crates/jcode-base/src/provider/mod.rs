@@ -300,11 +300,11 @@ use self::dispatch::CompletionMode;
 pub use self::models::{
     AccountModelAvailability, AccountModelAvailabilityState, AnthropicModelCatalog,
     ModelCatalogHttpStatus, OpenAIModelCatalog, begin_anthropic_model_catalog_refresh,
-    begin_openai_model_catalog_refresh, cached_anthropic_model_ids, cached_openai_model_ids,
-    cached_openai_reasoning_efforts, clear_all_model_unavailability_for_account,
-    clear_all_provider_unavailability_for_account, clear_model_unavailable_for_account,
-    clear_provider_unavailable_for_account, context_limit_for_model,
-    context_limit_for_model_with_provider, fetch_anthropic_model_catalog,
+    begin_openai_model_catalog_refresh, cached_anthropic_model_ids, cached_context_limit_for_model,
+    cached_openai_model_ids, cached_openai_reasoning_efforts,
+    clear_all_model_unavailability_for_account, clear_all_provider_unavailability_for_account,
+    clear_model_unavailable_for_account, clear_provider_unavailable_for_account,
+    context_limit_for_model, context_limit_for_model_with_provider, fetch_anthropic_model_catalog,
     fetch_anthropic_model_catalog_oauth, fetch_openai_api_key_model_catalog,
     fetch_openai_context_limits, fetch_openai_model_catalog,
     finish_anthropic_model_catalog_refresh_for_scope, finish_openai_model_catalog_refresh,
@@ -324,6 +324,8 @@ pub use self::selection::DefaultModelSelection;
 use self::selection::{ActiveProvider, ProviderAvailability};
 use self::state::ProviderState;
 pub use self::state::{ProviderModelSelectionSource, ProviderRuntimeState, ProviderStateEvent};
+
+pub(crate) const GROK_BUILD_PROFILE_ID: &str = "grok-build";
 
 /// MultiProvider wraps multiple providers and allows seamless model switching
 pub struct MultiProvider {
@@ -964,6 +966,25 @@ impl MultiProvider {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Unknown provider profile '{}'", profile_name))?;
 
+        if matches!(
+            config.provider_type,
+            crate::config::NamedProviderType::AnthropicCompatible
+        ) {
+            crate::provider_catalog::apply_named_provider_profile_env(profile_name)?;
+            let provider =
+                external::instantiate_expected_external_provider(external::ANTHROPIC_RUNTIME)
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic runtime is not registered"))?;
+            crate::provider_catalog::clear_anthropic_profile_env();
+            provider.set_model(model)?;
+            *self
+                .anthropic
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(provider);
+            self.clear_active_openai_compatible_profile();
+            self.set_active_provider(ActiveProvider::Claude);
+            return Ok(());
+        }
+
         let expected_api_method = format!("openai-compatible:{}", profile_name);
         let registry = ProviderRegistry::new(self);
         let provider = {
@@ -1054,6 +1075,41 @@ impl MultiProvider {
 
         match provider {
             ActiveProvider::Claude => {
+                let switching_from_named_anthropic = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+                    .ok()
+                    .and_then(|name| crate::config::config().providers.get(&name))
+                    .is_some_and(|profile| {
+                        matches!(
+                            profile.provider_type,
+                            crate::config::NamedProviderType::AnthropicCompatible
+                        )
+                    });
+                if switching_from_named_anthropic {
+                    crate::env::remove_var("JCODE_NAMED_PROVIDER_PROFILE");
+                    crate::env::remove_var("JCODE_PROVIDER_PROFILE_ACTIVE");
+                    crate::env::remove_var("JCODE_PROVIDER_PROFILE_NAME");
+                    crate::provider_catalog::clear_anthropic_profile_env();
+                    crate::env::set_var(
+                        "JCODE_RUNTIME_PROVIDER",
+                        match anthropic_credential_mode {
+                            Some(mode) => match mode {
+                                anthropic::AnthropicCredentialMode::ApiKey => "anthropic-api",
+                                anthropic::AnthropicCredentialMode::OAuth => "claude-oauth",
+                                anthropic::AnthropicCredentialMode::Auto => "claude",
+                            },
+                            None => "claude",
+                        },
+                    );
+                    let official = external::instantiate_expected_external_provider(
+                        external::ANTHROPIC_RUNTIME,
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic runtime is not registered"))?;
+                    *self
+                        .anthropic
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(official);
+                }
+                crate::provider_catalog::clear_anthropic_profile_env();
                 let model = model_name_for_provider(provider, model);
                 if let Some(anthropic) = self.anthropic_provider() {
                     if let Some(mode) = anthropic_credential_mode {
@@ -1456,6 +1512,16 @@ impl MultiProvider {
                 Some(Arc::new(bedrock::BedrockProvider::new()));
         }
 
+        let registry = ProviderRegistry::new(self);
+        if crate::auth::grok_build::has_cached_login()
+            && registry.compatible_profile(GROK_BUILD_PROFILE_ID).is_none()
+            && let Some(grok) =
+                external::instantiate_expected_external_provider(external::GROK_BUILD_RUNTIME)
+        {
+            crate::logging::info("Hot-initialized Grok Build provider after login");
+            registry.install_compatible_profile(GROK_BUILD_PROFILE_ID, grok);
+        }
+
         if let Some(anthropic) = self.anthropic_provider() {
             self.spawn_post_auth_model_refresh(anthropic, "Anthropic");
         }
@@ -1479,6 +1545,9 @@ impl MultiProvider {
         }
         if let Some(bedrock) = self.bedrock_provider() {
             self.spawn_post_auth_model_refresh(bedrock, "AWS Bedrock");
+        }
+        if let Some(grok) = ProviderRegistry::new(self).compatible_profile(GROK_BUILD_PROFILE_ID) {
+            self.spawn_post_auth_model_refresh(grok, "Grok Build");
         }
         crate::logging::auth_event("auth_changed_completed", "multi-provider", &[]);
     }
@@ -1536,7 +1605,7 @@ impl MultiProvider {
             // Same reasoning for user-defined named provider profiles from
             // config: bind the named profile runtime directly instead of the
             // generic OpenRouter slot path.
-            if let selection::ConfigProviderSelection::NamedProfile(profile_name) = &selection {
+            if let selection::ConfigProviderSelection::NamedProfile(profile_name, _) = &selection {
                 return self.set_model_on_named_provider_profile(profile_name, model);
             }
 
@@ -1908,6 +1977,25 @@ impl Provider for MultiProvider {
         let requested_model = model.trim();
         if requested_model.is_empty() {
             anyhow::bail!("Model cannot be empty");
+        }
+
+        if let Some(target_model) = requested_model.strip_prefix("grok-build:") {
+            let target_model = target_model.trim();
+            if target_model.is_empty() {
+                anyhow::bail!("Grok Build model cannot be empty");
+            }
+            let registry = ProviderRegistry::new(self);
+            let provider = registry
+                .compatible_profile(GROK_BUILD_PROFILE_ID)
+                .or_else(|| {
+                    external::instantiate_expected_external_provider(external::GROK_BUILD_RUNTIME)
+                })
+                .ok_or_else(|| anyhow!("Grok Build is not authenticated"))?;
+            provider.set_model(target_model)?;
+            registry.install_compatible_profile(GROK_BUILD_PROFILE_ID, provider);
+            registry.set_active_compatible_profile(GROK_BUILD_PROFILE_ID);
+            self.set_active_provider(ActiveProvider::OpenRouter);
+            return Ok(());
         }
 
         if let Some((profile, target_model)) = Self::openai_compatible_model_prefix(requested_model)

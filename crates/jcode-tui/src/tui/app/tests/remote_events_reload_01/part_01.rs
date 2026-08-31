@@ -50,6 +50,38 @@ fn test_remote_bus_dictation_completion_ignores_other_session() {
 }
 
 #[test]
+fn test_remote_bus_productivity_failure_clears_refresh_state() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut remote = rt.block_on(async { crate::tui::backend::RemoteConnection::dummy() });
+    app.productivity_refreshing = true;
+    let session_id = app.session.id.clone();
+
+    let handled = rt.block_on(crate::tui::app::remote::handle_bus_event(
+        &mut app,
+        &mut remote,
+        Ok(crate::bus::BusEvent::ProductivityReportReady(
+            crate::bus::ProductivityReportReady {
+                session_id,
+                result: Err("generation failed".to_string()),
+            },
+        )),
+    ));
+
+    assert!(handled);
+    assert!(!app.productivity_refreshing);
+    assert_eq!(
+        app.status_notice.as_ref().map(|(notice, _)| notice.as_str()),
+        Some("Productivity report failed")
+    );
+    assert!(
+        app.display_messages()
+            .last()
+            .is_some_and(|message| message.content.contains("generation failed"))
+    );
+}
+
+#[test]
 fn test_handle_server_event_transcript_send_prefixes_user_message() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -243,6 +275,58 @@ fn test_handle_server_event_history_preserves_connection_type_for_same_session_w
 
     assert_eq!(app.remote_session_id.as_deref(), Some("session_same"));
     assert_eq!(app.connection_type.as_deref(), Some("websocket"));
+}
+
+#[test]
+fn test_handle_server_event_history_preserves_reasoning_effort_for_same_session_when_missing() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.remote_session_id = Some("session_same".to_string());
+    app.remote_reasoning_effort = Some("medium".to_string());
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::History {
+            id: 1,
+            session_id: "session_same".to_string(),
+            messages: vec![],
+            images: vec![],
+            provider_name: Some("anthropic".to_string()),
+            provider_model: Some("claude-opus-4-1".to_string()),
+            subagent_model: None,
+            autoreview_enabled: None,
+            autojudge_enabled: None,
+            available_models: vec![],
+            available_model_routes: vec![],
+            mcp_servers: vec![],
+            skills: vec![],
+            total_tokens: None,
+            token_usage_totals: None,
+            all_sessions: vec![],
+            client_count: None,
+            is_canary: None,
+            reload_recovery: None,
+            server_version: None,
+            server_name: None,
+            server_icon: None,
+            server_has_update: None,
+            was_interrupted: None,
+            connection_type: None,
+            status_detail: None,
+            upstream_provider: None,
+            resolved_credential: None,
+            reasoning_effort: None,
+            service_tier: None,
+            compaction_mode: crate::config::CompactionMode::Reactive,
+            activity: None,
+            side_panel: crate::side_panel::SidePanelSnapshot::default(),
+        },
+        &mut remote,
+    );
+
+    assert_eq!(app.remote_reasoning_effort.as_deref(), Some("medium"));
 }
 
 #[test]

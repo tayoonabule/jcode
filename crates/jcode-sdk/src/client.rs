@@ -63,15 +63,17 @@ pub trait Transport: Send {
     fn split(self: Box<Self>) -> Result<(Box<dyn BufRead + Send>, Box<dyn Write + Send>)>;
 }
 
-/// A Unix socket transport, the default.
-pub struct UnixTransport(std::os::unix::net::UnixStream);
+/// A Unix-domain socket transport, the default.
+type PlatformUnixStream = jcode_transport::SyncStream;
+
+pub struct UnixTransport(PlatformUnixStream);
 
 impl UnixTransport {
     pub fn connect(path: &std::path::Path) -> Result<Self> {
         // A bare `No such file or directory` names the syscall and hides the
         // cause: the bridge is not running. Connecting is the first thing
         // anyone does with this SDK, so say what to do about it.
-        let stream = std::os::unix::net::UnixStream::connect(path).map_err(|cause| {
+        let stream = PlatformUnixStream::connect(path).map_err(|cause| {
             Error::new(
                 ErrorKind::ConnectFailed,
                 match cause.kind() {
@@ -100,10 +102,19 @@ impl UnixTransport {
 
 impl Transport for UnixTransport {
     fn shutdown_handle(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
-        let socket = self.0.try_clone().ok()?;
-        Some(Arc::new(move || {
-            let _ = socket.shutdown(std::net::Shutdown::Both);
-        }))
+        #[cfg(unix)]
+        {
+            let socket = self.0.try_clone().ok()?;
+            return Some(Arc::new(move || {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }));
+        }
+        #[cfg(windows)]
+        {
+            // Closing the reader and writer handles interrupts named-pipe I/O.
+            // They are owned by the client and dropped during shutdown.
+            None
+        }
     }
 
     fn split(self: Box<Self>) -> Result<(Box<dyn BufRead + Send>, Box<dyn Write + Send>)> {
@@ -577,6 +588,21 @@ impl JcodeClient {
         match self
             .request_ok(ApiRequest::ListSessions {
                 include_archived: false,
+                limit: None,
+            })?
+            .event
+        {
+            ApiEvent::Sessions { sessions } => Ok(sessions),
+            other => Err(unexpected("sessions", &other)),
+        }
+    }
+
+    /// List only the newest persisted sessions, for bounded dashboard startup.
+    pub fn list_sessions_limited(&self, limit: u32) -> Result<Vec<SessionInfo>> {
+        match self
+            .request_ok(ApiRequest::ListSessions {
+                include_archived: false,
+                limit: Some(limit),
             })?
             .event
         {
@@ -628,6 +654,19 @@ impl JcodeClient {
         {
             ApiEvent::Attached { session } => Ok(session),
             other => Err(unexpected("attached", &other)),
+        }
+    }
+
+    /// Clone a session's complete persisted context into a new idle session.
+    pub fn fork_session(&self, session_id: &str) -> Result<SessionInfo> {
+        match self
+            .request_ok(ApiRequest::ForkSession {
+                session_id: session_id.to_string(),
+            })?
+            .event
+        {
+            ApiEvent::SessionForked { session } => Ok(session),
+            other => Err(unexpected("session_forked", &other)),
         }
     }
 
@@ -694,13 +733,23 @@ impl JcodeClient {
     }
 
     pub fn get_history(&self, session_id: &str) -> Result<Vec<HistoryMessage>> {
+        self.get_history_with_images(session_id)
+            .map(|(messages, _)| messages)
+    }
+
+    pub fn get_history_with_images(
+        &self,
+        session_id: &str,
+    ) -> Result<(Vec<HistoryMessage>, Vec<jcode_harness_api::RenderedImage>)> {
         match self
             .request_ok(ApiRequest::GetHistory {
                 session_id: session_id.to_string(),
             })?
             .event
         {
-            ApiEvent::History { messages, .. } => Ok(messages),
+            ApiEvent::History {
+                messages, images, ..
+            } => Ok((messages, images)),
             other => Err(unexpected("history", &other)),
         }
     }
@@ -780,6 +829,7 @@ impl JcodeClient {
                 session_id,
                 provider,
                 model,
+                reasoning_effort,
                 routes,
             } => {
                 let mut providers = Vec::new();
@@ -799,6 +849,7 @@ impl JcodeClient {
                     session_id,
                     provider,
                     model,
+                    reasoning_effort,
                     providers,
                     routes,
                 })
@@ -1084,6 +1135,8 @@ pub struct RuntimeInfo {
     pub session_id: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Reasoning effort, e.g. `high`, when the provider exposes it.
+    pub reasoning_effort: Option<String>,
     pub providers: Vec<String>,
     pub routes: Vec<ModelRouteInfo>,
 }
@@ -1152,6 +1205,7 @@ fn discover_global_sessions(
         let sessions = match parent
             .request_ok(ApiRequest::ListSessions {
                 include_archived: true,
+                limit: None,
             })
             .and_then(|frame| match frame.event {
                 ApiEvent::Sessions { sessions } => Ok(sessions),

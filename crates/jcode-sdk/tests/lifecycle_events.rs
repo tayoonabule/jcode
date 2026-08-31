@@ -19,12 +19,31 @@ fn session(id: &str) -> SessionInfo {
     SessionInfo {
         session_id: id.to_string(),
         working_dir: None,
-        title: None,
+        title: Some(format!("Title for {id}")),
         status: "idle".to_string(),
         transcript_bytes: None,
+        saved: false,
+        updated_at_ms: None,
+        last_active_at_ms: None,
         archived: false,
         archived_at_ms: None,
     }
+}
+
+#[test]
+fn public_client_exposes_titles_from_list_and_attach() {
+    let server = UnixHarness::start(0);
+    let client = server.connect();
+
+    let sessions = client.list_sessions().expect("list sessions");
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].title.as_deref(), Some("Title for persisted-1"));
+    assert_eq!(sessions[1].title.as_deref(), Some("Title for persisted-2"));
+
+    let attached = client
+        .attach_session("persisted-1")
+        .expect("attach session");
+    assert_eq!(attached.title.as_deref(), Some("Title for persisted-1"));
 }
 
 struct UnixHarness {
@@ -134,6 +153,7 @@ fn serve_connection(
             ),
             ApiRequest::ListSessions {
                 include_archived: requested,
+                ..
             } => {
                 include_archived.store(requested, Ordering::Release);
                 let listed = sessions

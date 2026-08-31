@@ -16,10 +16,11 @@ pub(in crate::tui::app) async fn begin_remote_send(
     retry_attempts: u8,
 ) -> Result<u64> {
     let msg_id = remote
-        .send_message_with_images_and_reminder(
+        .send_message_with_images_reminder_and_skill(
             content.clone(),
             images.clone(),
             system_reminder.clone(),
+            app.active_skill.clone(),
         )
         .await?;
     app.current_message_id = Some(msg_id);
@@ -80,6 +81,24 @@ pub(in crate::tui::app) fn history_matches_pending_startup_prompt(app: &App) -> 
         .rev()
         .find(|message| message.role == "user")
         .is_some_and(|message| message.content == app.input)
+}
+
+/// Restore the visible user turn for a startup prompt that was sent before the
+/// bootstrap History payload arrived. History replaces all display messages,
+/// and the server does not emit a separate user-message event for this request.
+pub(in crate::tui::app) fn restore_pending_startup_prompt_echo(app: &mut App) {
+    let Some(prompt) = app.pending_startup_prompt_echo.take() else {
+        return;
+    };
+    let already_visible = app
+        .display_messages()
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .is_some_and(|message| message.content == prompt);
+    if !already_visible {
+        app.push_display_message(DisplayMessage::user(prompt));
+    }
 }
 
 pub(in crate::tui::app) async fn submit_prepared_remote_input(

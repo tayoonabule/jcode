@@ -56,6 +56,9 @@ scroll_prompt_down = "ctrl+]"
 # Scroll bookmark toggle (stash position, jump to bottom, press again to return)
 scroll_bookmark = "ctrl+g"
 
+# Auto-poke toggle. Set "" to disable.
+auto_poke_toggle = "ctrl+p"
+
 # Optional fallback scroll bindings (useful on macOS terminals that forward Command)
 # Leave unset by default; on macOS Cmd+K / Cmd+J move up / down by prompt instead.
 scroll_up_fallback = ""
@@ -154,8 +157,11 @@ debug_socket = false
 # Set false here or set JCODE_NO_EMOJI=1 for ASCII fallbacks.
 emoji = true
 
-# Show thinking/reasoning content (default: false)
-show_thinking = false
+# Usage percentage wording: "left" (default) or "used".
+usage_display = "left"
+
+# Show thinking/reasoning content (default: true)
+show_thinking = true
 
 # How to display reasoning/thinking content: "off", "full", or "current".
 #   off     - never show reasoning
@@ -163,7 +169,7 @@ show_thinking = false
 #   current - show only the live reasoning; collapse it once the model commits
 #             an assistant message or runs a tool, then show the next one
 # When unset, falls back to show_thinking (true => full, false => off).
-reasoning_display = "off"
+reasoning_display = "full"
 
 # Markdown spacing style: "compact" (chat/TUI) or "document" (docs-like)
 # markdown_spacing = "compact"
@@ -187,6 +193,10 @@ prompt_entry_animation = true
 # the one-line summary (default: false). Useful when you want to read search
 # results directly in the chat.
 # show_agentgrep_output = false
+
+# Show up to the last three non-empty lines of bash output beneath the tool
+# summary (default: false).
+# show_bash_output = false
 
 # Show the dimmed technical detail (command, file path, args) next to the
 # model-provided intent on tool rows (default: false). When false, tool rows
@@ -261,6 +271,9 @@ prompt_entry_animation = true
 # error = "#ff6464"
 
 [features]
+# Check for and install updates during startup. Set to false for the persistent
+# equivalent of passing --no-update on every invocation.
+check_updates = true
 # Memory: retrieval + extraction sidecar features
 memory = true
 # Swarm: multi-session coordination features
@@ -316,6 +329,12 @@ profile = "full"
 # disabled = ["browser", "gmail", "swarm"]
 # Disable all built-in tools unless enabled is set.
 disable_base_tools = false
+# MCP tool exposure: "eager" sends every server tool definition, "deferred"
+# sends only fixed mcp_search/mcp_call tools, and "auto" switches to deferred
+# when the filtered MCP definitions exceed the token threshold below.
+# Env overrides: JCODE_MCP_TOOLS, JCODE_MCP_TOOLS_TOKEN_THRESHOLD.
+mcp_tools = "auto"
+mcp_tools_token_threshold = 8000
 
 [acp]
 # Agent Client Protocol adapter compatibility profile: standard, extended, or full.
@@ -379,6 +398,20 @@ cross_provider_failover = "countdown"
 # This is the base budget: high reasoning efforts scale it up automatically
 # (high 2x, xhigh 3x, max/swarm 4x) since they think silently for much longer.
 # stream_idle_timeout_secs = 600
+# Maximum attempts for transient 429/5xx/network failures, including the first
+# request. Retries honor Retry-After and use capped exponential backoff.
+# Env overrides: JCODE_MAX_RETRIES, JCODE_RETRY_BACKOFF_CAP_SECS.
+# max_retries = 8
+# retry_backoff_cap_secs = 30
+
+[server]
+# Who executes autonomous wake requests from background completion/stall,
+# swarm await completion, and communication delivery.
+# "internal" starts or interrupts turns in the daemon (default).
+# "external" emits typed wake_requested events for an operator to handle and
+# never starts a turn or injects into a running turn.
+# Env override: JCODE_WAKE_MODE
+wake_mode = "internal"
 
 [agents]
 # Defaults for spawned helper agents (swarm workers, subagents, sidecars).
@@ -687,7 +720,19 @@ mod tests {
     #[test]
     fn default_config_template_parses() {
         let template = Config::default_config_file_contents();
-        toml::from_str::<Config>(&template).expect("the shipped config template must parse");
+        let config =
+            toml::from_str::<Config>(&template).expect("the shipped config template must parse");
+        assert_eq!(config.tools.mcp_tools, McpToolsMode::Auto);
+        assert_eq!(config.tools.mcp_tools_token_threshold, 8_000);
+        assert!(
+            config.display.show_thinking,
+            "the shipped user config must request model reasoning"
+        );
+        assert_eq!(
+            config.display.reasoning_display(),
+            ReasoningDisplayMode::Full,
+            "the shipped user config must keep the full reasoning trace visible"
+        );
     }
 
     /// Colors are only discoverable if the template mentions them, since most

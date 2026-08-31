@@ -193,7 +193,6 @@ pub fn append_swarm_effort_directive(split: &mut SplitSystemPrompt, effort: Opti
 pub const MISSION_CONTINUATION_TEMPLATE: &str = include_str!("prompt/mission_continuation.md");
 const SELFDEV_MODE_PROMPT: &str = include_str!("prompt/selfdev_mode.txt");
 const SELFDEV_FOCUS_TUI_PROMPT: &str = include_str!("prompt/selfdev_focus_tui.txt");
-const SELFDEV_FOCUS_DESKTOP2_PROMPT: &str = include_str!("prompt/selfdev_focus_desktop2.txt");
 /// Split system prompt for efficient caching
 /// Static content is cached, dynamic content is not
 #[derive(Debug, Clone, Default)]
@@ -229,6 +228,41 @@ impl SplitSystemPrompt {
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
+}
+
+const SKILL_DESC_MAX_CHARS: usize = 120;
+
+fn clip_skill_description(description: &str) -> String {
+    let one_line = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= SKILL_DESC_MAX_CHARS {
+        return one_line;
+    }
+
+    let mut clipped: String = one_line
+        .chars()
+        .take(SKILL_DESC_MAX_CHARS.saturating_sub(1))
+        .collect();
+    clipped.push('…');
+    clipped
+}
+
+fn build_available_skills_section(available_skills: &[SkillInfo]) -> Option<String> {
+    if available_skills.is_empty() {
+        return None;
+    }
+
+    let mut section = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n".to_string();
+    for skill in available_skills {
+        section.push_str(&format!(
+            "\n- `/{} ` - {}",
+            skill.name,
+            clip_skill_description(&skill.description)
+        ));
+    }
+    section.push_str(
+        "\n\nWhen a user asks about available skills or capabilities, mention these skills.",
+    );
+    Some(section)
 }
 
 /// Information about what's loaded in the context window
@@ -453,14 +487,7 @@ pub fn build_system_prompt_full_with_capabilities(
     }
 
     // Add available skills list
-    if !available_skills.is_empty() {
-        let mut skills_section = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n".to_string();
-        for skill in available_skills {
-            skills_section.push_str(&format!("\n- `/{} ` - {}", skill.name, skill.description));
-        }
-        skills_section.push_str(
-            "\n\nWhen a user asks about available skills or capabilities, mention these skills.",
-        );
+    if let Some(skills_section) = build_available_skills_section(available_skills) {
         info.skills_chars = skills_section.len();
         parts.push(skills_section);
     }
@@ -503,6 +530,51 @@ pub fn build_system_prompt_split_with_capabilities(
     working_dir: Option<&Path>,
     capabilities: PromptCapabilities,
 ) -> (SplitSystemPrompt, ContextInfo) {
+    let agents_md = load_agents_md_files_from_dir(working_dir);
+    build_system_prompt_split_with_capabilities_and_agents_md(
+        skill_prompt,
+        available_skills,
+        is_selfdev,
+        memory_prompt,
+        working_dir,
+        capabilities,
+        agents_md,
+    )
+}
+
+/// Build a split prompt using an already captured AGENTS.md snapshot.
+///
+/// Long-lived agents use this to keep their provider-cache prefix stable when a
+/// tool edits AGENTS.md during the session. New sessions still capture the
+/// latest instructions.
+pub fn build_system_prompt_split_with_agents_md(
+    skill_prompt: Option<&str>,
+    available_skills: &[SkillInfo],
+    is_selfdev: bool,
+    memory_prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    agents_md: (Option<String>, ContextInfo),
+) -> (SplitSystemPrompt, ContextInfo) {
+    build_system_prompt_split_with_capabilities_and_agents_md(
+        skill_prompt,
+        available_skills,
+        is_selfdev,
+        memory_prompt,
+        working_dir,
+        PromptCapabilities::current(),
+        agents_md,
+    )
+}
+
+fn build_system_prompt_split_with_capabilities_and_agents_md(
+    skill_prompt: Option<&str>,
+    available_skills: &[SkillInfo],
+    is_selfdev: bool,
+    memory_prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    capabilities: PromptCapabilities,
+    agents_md: (Option<String>, ContextInfo),
+) -> (SplitSystemPrompt, ContextInfo) {
     let mut static_parts = base_system_prompt_parts(capabilities, working_dir);
     let mut dynamic_parts = Vec::new();
     let mut info = ContextInfo {
@@ -521,7 +593,7 @@ pub fn build_system_prompt_split_with_capabilities(
     }
 
     // Add AGENTS.md instructions (static per project)
-    let (md_content, md_info) = load_agents_md_files_from_dir(working_dir);
+    let (md_content, md_info) = agents_md;
     if let Some(content) = md_content {
         static_parts.push(content);
     }
@@ -546,14 +618,7 @@ pub fn build_system_prompt_split_with_capabilities(
     }
 
     // Add available skills list (fairly static)
-    if !available_skills.is_empty() {
-        let mut skills_section = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n".to_string();
-        for skill in available_skills {
-            skills_section.push_str(&format!("\n- `/{} ` - {}", skill.name, skill.description));
-        }
-        skills_section.push_str(
-            "\n\nWhen a user asks about available skills or capabilities, mention these skills.",
-        );
+    if let Some(skills_section) = build_available_skills_section(available_skills) {
         info.skills_chars = skills_section.len();
         static_parts.push(skills_section);
     }
@@ -599,27 +664,17 @@ fn build_selfdev_prompt() -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelfDevProductContext {
     Tui,
-    Desktop2,
 }
 
 impl SelfDevProductContext {
     fn from_working_dir(working_dir: Option<&Path>) -> Self {
-        let Some(working_dir) = working_dir else {
-            return Self::Tui;
-        };
-
-        let path = working_dir.to_string_lossy().replace('\\', "/");
-        if path.contains("/crates/jcode-desktop") || path.ends_with("crates/jcode-desktop2") {
-            Self::Desktop2
-        } else {
-            Self::Tui
-        }
+        let _ = working_dir;
+        Self::Tui
     }
 
     fn prompt_block(self) -> &'static str {
         match self {
             Self::Tui => SELFDEV_FOCUS_TUI_PROMPT,
-            Self::Desktop2 => SELFDEV_FOCUS_DESKTOP2_PROMPT,
         }
     }
 }
@@ -644,10 +699,7 @@ fn build_selfdev_prompt_for_context(context: SelfDevProductContext) -> String {
 pub fn build_session_context(working_dir: Option<&Path>) -> String {
     let mut lines = vec!["# Session Context".to_string()];
 
-    let now_utc = chrono::Utc::now();
-    lines.push(format!("Date: {}", now_utc.format("%Y-%m-%d")));
-    lines.push(format!("Time: {} UTC", now_utc.format("%H:%M:%S")));
-    lines.push("Timezone: UTC".to_string());
+    lines.extend(session_datetime_lines());
     lines.push(format!("OS: {}", std::env::consts::OS));
     lines.push(format!("Architecture: {}", std::env::consts::ARCH));
     lines.push(format!(
@@ -669,6 +721,23 @@ pub fn build_session_context(working_dir: Option<&Path>) -> String {
     }
 
     lines.join("\n")
+}
+
+fn session_datetime_lines() -> [String; 3] {
+    std::panic::catch_unwind(|| format_session_datetime(chrono::Local::now()))
+        .unwrap_or_else(|_| format_session_datetime(chrono::Utc::now()))
+}
+
+fn format_session_datetime<Tz>(now: chrono::DateTime<Tz>) -> [String; 3]
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    [
+        format!("Date: {}", now.format("%Y-%m-%d")),
+        format!("Time: {}", now.format("%H:%M:%S")),
+        format!("Timezone: {}", now.format("%Z")),
+    ]
 }
 
 /// Get git branch and status summary
@@ -840,8 +909,10 @@ fn gpu_summary() -> Option<String> {
     }
 }
 
-/// Load AGENTS.md files from a specific working directory
-pub fn load_agents_md_files_from_dir(working_dir: Option<&Path>) -> (Option<String>, ContextInfo) {
+fn load_agents_md_files_from_dirs(
+    project_dir: &Path,
+    global_agents_md: Option<&Path>,
+) -> (Option<String>, ContextInfo) {
     let mut contents = vec![];
     let mut info = ContextInfo::default();
 
@@ -858,21 +929,31 @@ pub fn load_agents_md_files_from_dir(working_dir: Option<&Path>) -> (Option<Stri
         }
     };
 
-    // Project-level files (from specified working directory or current directory)
-    let project_dir = working_dir.unwrap_or(Path::new("."));
-    if let Some((content, size)) = load_file(
-        &project_dir.join("AGENTS.md"),
-        "Project Instructions (AGENTS.md)",
-    ) {
+    let project_agents_md = project_dir.join("AGENTS.md");
+    if let Some((content, size)) = load_file(&project_agents_md, "Project Instructions (AGENTS.md)")
+    {
         info.has_project_agents_md = true;
         info.project_agents_md_chars = size;
         contents.push(content);
     }
 
-    // Home directory files
-    if let Ok(global_agents_md) = crate::storage::user_home_path("AGENTS.md")
+    // Canonical file identity handles cwd=$HOME as well as symlinked aliases.
+    // If either file is absent or cannot be resolved, loading below remains the
+    // source of truth and simply skips unreadable files.
+    let global_duplicates_project = global_agents_md.is_some_and(|global_agents_md| {
+        match (
+            std::fs::canonicalize(&project_agents_md),
+            std::fs::canonicalize(global_agents_md),
+        ) {
+            (Ok(project), Ok(global)) => project == global,
+            _ => false,
+        }
+    });
+
+    if !global_duplicates_project
+        && let Some(global_agents_md) = global_agents_md
         && let Some((content, size)) =
-            load_file(&global_agents_md, "Global Instructions (~/AGENTS.md)")
+            load_file(global_agents_md, "Global Instructions (~/AGENTS.md)")
     {
         info.has_global_agents_md = true;
         info.global_agents_md_chars = size;
@@ -884,6 +965,13 @@ pub fn load_agents_md_files_from_dir(working_dir: Option<&Path>) -> (Option<Stri
     } else {
         (Some(contents.join("\n\n")), info)
     }
+}
+
+/// Load AGENTS.md files from a specific working directory.
+pub fn load_agents_md_files_from_dir(working_dir: Option<&Path>) -> (Option<String>, ContextInfo) {
+    let project_dir = working_dir.unwrap_or(Path::new("."));
+    let global_agents_md = crate::storage::user_home_path("AGENTS.md").ok();
+    load_agents_md_files_from_dirs(project_dir, global_agents_md.as_deref())
 }
 
 /// Load optional prompt overlay markdown from ~/.jcode/ and ./.jcode/

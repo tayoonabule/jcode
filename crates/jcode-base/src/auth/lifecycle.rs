@@ -217,6 +217,32 @@ pub fn provider_model_to_select_after_auth(
     matching_routes.first().map(|route| route.model.clone())
 }
 
+/// Reconcile a provider after auth while preserving an explicit configured
+/// default when that model is available for the activated provider.
+pub fn provider_model_to_select_after_auth_with_configured_default(
+    activation: &AuthActivationResult,
+    configured_model: Option<&str>,
+    selected_model: Option<&str>,
+    routes: &[ModelRoute],
+) -> Option<String> {
+    let configured_model = configured_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    if let Some(configured) = configured_model
+        && routes.iter().any(|route| {
+            route.available
+                && route.model == configured
+                && route_matches_activation(route, activation)
+        })
+    {
+        if selected_model.map(str::trim) != Some(configured) {
+            return Some(configured.to_string());
+        }
+    }
+
+    provider_model_to_select_after_auth(activation, selected_model, routes)
+}
+
 /// Pick the strongest available route across every authenticated provider.
 ///
 /// This is intentionally separate from [`provider_model_to_select_after_auth`],
@@ -895,6 +921,10 @@ pub fn provider_display_label(provider_id: Option<&str>) -> Option<String> {
 pub fn activate_auth_change(request: &AuthActivationRequest) -> AuthActivationResult {
     let provider_id = request.provider_id();
     sync_process_env_from_saved_credentials(request, provider_id.as_deref());
+    // The notification handler may have probed auth while the newly saved
+    // credential was not yet reflected in the process environment. Discard
+    // that snapshot after activation so catalog rebuilding sees the new auth.
+    super::AuthStatus::invalidate_cache();
     let provider_label = provider_display_label(provider_id.as_deref());
     let activated_model = apply_auth_provider_runtime(provider_id.as_deref());
     AuthActivationResult {
@@ -1126,6 +1156,7 @@ fn direct_provider_activation(provider_id: &str) -> Option<ProviderActivation> {
         "copilot" => (RuntimeProviderId::Copilot, ActiveProvider::Copilot),
         "gemini" => (RuntimeProviderId::Gemini, ActiveProvider::Gemini),
         "antigravity" => (RuntimeProviderId::Antigravity, ActiveProvider::Antigravity),
+        "grok-build" => (RuntimeProviderId::GrokBuild, ActiveProvider::OpenRouter),
         _ => return None,
     };
     Some(ProviderActivation::initial(runtime_id, active))
@@ -1234,6 +1265,29 @@ mod tests {
             .as_deref(),
             Some("fresh-login-key"),
             "credential resolution must use the freshly saved key"
+        );
+    }
+
+    #[test]
+    fn api_key_login_invalidates_auth_status_cached_before_activation() {
+        let sandbox = crate::auth::test_sandbox::AuthTestSandbox::new().expect("sandbox");
+        assert_eq!(
+            crate::auth::AuthStatus::check_fast().openrouter,
+            crate::auth::AuthState::NotConfigured
+        );
+        sandbox
+            .write_env_file("openrouter.env", "OPENROUTER_API_KEY", "fresh-login-key")
+            .expect("write env file");
+
+        let mut auth = AuthChanged::new("openrouter");
+        auth.credential_source = Some(crate::protocol::AuthCredentialSource::ApiKeyFile);
+        auth.auth_method = Some(crate::protocol::AuthMethod::TuiPasteApiKey);
+        let _ = activate_auth_change(&AuthActivationRequest::new(None, Some(auth)));
+
+        assert_eq!(
+            crate::auth::AuthStatus::check_fast().openrouter,
+            crate::auth::AuthState::Available,
+            "catalog refresh must not reuse the pre-activation auth snapshot"
         );
     }
 
@@ -1820,6 +1874,37 @@ mod tests {
             provider_model_to_select_after_auth(&activation, None, &routes).as_deref(),
             Some("claude-opus-5"),
             "API-key login should auto-select the Anthropic flagship, not the first catalog route"
+        );
+    }
+
+    #[test]
+    fn post_auth_model_selection_preserves_configured_claude_model() {
+        let activation = AuthActivationResult {
+            provider_id: Some("claude-api".to_string()),
+            provider_label: Some("Anthropic".to_string()),
+            activated_model: None,
+            expected_runtime: None,
+            expected_catalog_namespace: None,
+        };
+        let routes = vec![
+            route(
+                jcode_provider_core::DEFAULT_CLAUDE_MODEL,
+                "Anthropic",
+                "claude-api",
+                true,
+            ),
+            route("claude-opus-4-6", "Anthropic", "claude-api", true),
+        ];
+
+        assert_eq!(
+            provider_model_to_select_after_auth_with_configured_default(
+                &activation,
+                Some("claude-opus-4-6"),
+                Some(jcode_provider_core::DEFAULT_CLAUDE_MODEL),
+                &routes,
+            )
+            .as_deref(),
+            Some("claude-opus-4-6")
         );
     }
 
