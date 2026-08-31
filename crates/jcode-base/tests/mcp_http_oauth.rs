@@ -285,10 +285,10 @@ async fn unauthorized_server_triggers_oauth_and_then_connects() {
         "a valid stored token must be sent on the first request, avoiding a 401"
     );
 
-    // Now force a genuine re-authorization: keep the registered client_id but
-    // make the access token invalid and remove any refresh token, so the only
-    // way back in is a fresh authorization. The stored client_id must be
-    // reused rather than registering a second client.
+    // Now force a genuine re-authorization: keep the registered client_id and
+    // redirect URI but make the access token invalid and remove any refresh
+    // token, so the only way back in is a fresh authorization. Both values must
+    // be reused rather than registering a second client or changing the URI.
     jcode_base::mcp::oauth::save_tokens(
         "oauth-test",
         &jcode_base::mcp::oauth::McpOAuthTokens {
@@ -297,6 +297,7 @@ async fn unauthorized_server_triggers_oauth_and_then_connects() {
             expires_at: 0,
             client_id: stored.client_id.clone(),
             token_endpoint: stored.token_endpoint.clone(),
+            redirect_uri: stored.redirect_uri.clone(),
         },
     )
     .expect("seed stale credentials");
