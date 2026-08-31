@@ -331,6 +331,7 @@ impl App {
         let compaction = self.registry.compaction();
         match compaction.try_write() {
             Ok(mut manager) => {
+                manager.set_durable_state_context(self.durable_state_context_snapshot());
                 let discarded_oversized_native =
                     manager.discard_oversized_openai_native_compaction();
                 if self.provider.uses_jcode_compaction() {
@@ -373,6 +374,21 @@ impl App {
             return true;
         }
         false
+    }
+
+    fn durable_state_context_snapshot(&self) -> Option<String> {
+        let todos = crate::todo::load_todos(&self.session.id).ok()?;
+        let goals = crate::todo::load_goals(&self.session.id).unwrap_or_default();
+        let plan = crate::todo::load_plan(&self.session.id).unwrap_or_default();
+        if todos.is_empty() && goals.is_empty() && plan == crate::todo::TodoPlan::default() {
+            return None;
+        }
+        serde_json::to_string_pretty(&serde_json::json!({
+            "todos": todos,
+            "goals": goals,
+            "plan": plan,
+        }))
+        .ok()
     }
 
     pub(super) fn handle_compaction_event(&mut self, event: CompactionEvent) {
