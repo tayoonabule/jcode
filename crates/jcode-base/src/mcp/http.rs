@@ -193,6 +193,15 @@ impl HttpTransport {
     async fn ensure_auth(&self, challenge: Option<&str>) -> Result<()> {
         let flow_lock = auth_flow_lock(&self.name).await;
         let _flow_guard = flow_lock.lock().await;
+        // Another transport may have completed the interactive flow while we
+        // were waiting for this server's lock. Refresh the in-memory view from
+        // disk before deciding that authorization is still required. Without
+        // this reload, concurrent MCP initialization attempts each opened a
+        // new browser window even though the first one had already persisted
+        // valid credentials.
+        if let Some(persisted) = oauth::load_tokens(&self.name) {
+            *self.tokens.write().await = Some(persisted);
+        }
         {
             let current = self.tokens.read().await.clone();
             if let Some(tokens) = current {
