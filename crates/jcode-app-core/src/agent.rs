@@ -683,6 +683,7 @@ impl Agent {
             let compaction = self.registry.compaction();
             match compaction.try_write() {
                 Ok(mut manager) => {
+                    manager.set_durable_state_context(self.durable_state_context_snapshot());
                     let discarded_oversized_native =
                         manager.discard_oversized_openai_native_compaction();
                     let messages = {
@@ -751,6 +752,24 @@ impl Agent {
             assistant_count,
         ));
         (messages, None)
+    }
+
+    /// Todo state is persisted outside the transcript. Include a fresh,
+    /// model-readable snapshot in compaction so summarization cannot forget
+    /// work whose original tool call has already fallen out of the prefix.
+    fn durable_state_context_snapshot(&self) -> Option<String> {
+        let todos = crate::todo::load_todos(&self.session.id).ok()?;
+        let goals = crate::todo::load_goals(&self.session.id).unwrap_or_default();
+        let plan = crate::todo::load_plan(&self.session.id).unwrap_or_default();
+        if todos.is_empty() && goals.is_empty() && plan == crate::todo::TodoPlan::default() {
+            return None;
+        }
+        serde_json::to_string_pretty(&serde_json::json!({
+            "todos": todos,
+            "goals": goals,
+            "plan": plan,
+        }))
+        .ok()
     }
 
     fn record_client_cache_request(&mut self, messages: &[Message]) {

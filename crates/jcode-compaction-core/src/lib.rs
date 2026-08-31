@@ -81,6 +81,8 @@ Write in natural language with these sections:
 - **What we did:** Key actions taken, files changed, problems solved
 - **Current state:** What works, what's broken, what's next
 - **User preferences:** Specific requirements or decisions they made
+- **Durable work state:** Preserve the todo list, plan, goals, statuses, and
+  blockers exactly when a durable session state snapshot is provided.
 
 Be concise but preserve important details. You can search the full conversation later if you need exact error messages or code snippets."#;
 
@@ -140,13 +142,36 @@ pub fn build_compaction_prompt(
     existing_summary: Option<&Summary>,
     max_prompt_chars: usize,
 ) -> String {
+    build_compaction_prompt_with_context(messages, existing_summary, max_prompt_chars, None)
+}
+
+/// Build a compaction prompt with durable state that may not be present in the
+/// transcript being summarized. This is intentionally appended after the
+/// conversation so the normal size guard truncates old conversation first,
+/// never the current todo/plan snapshot.
+pub fn build_compaction_prompt_with_context(
+    messages: &[Message],
+    existing_summary: Option<&Summary>,
+    max_prompt_chars: usize,
+    state_context: Option<&str>,
+) -> String {
     let mut conversation_text = build_compaction_conversation_text(messages, existing_summary);
+    let durable_state = state_context
+        .filter(|context| !context.trim().is_empty())
+        .map(|context| format!("\n## Durable session state\n\n{context}\n"));
     let overhead = SUMMARY_PROMPT.len() + 50;
-    if conversation_text.len() + overhead > max_prompt_chars && max_prompt_chars > overhead {
-        let budget = max_prompt_chars - overhead;
+    let state_len = durable_state.as_ref().map_or(0, String::len);
+    let conversation_budget = max_prompt_chars
+        .saturating_sub(overhead)
+        .saturating_sub(state_len);
+    if conversation_text.len() > conversation_budget && conversation_budget > 0 {
+        let budget = conversation_budget;
         conversation_text = truncate_str_boundary(&conversation_text, budget).to_string();
         conversation_text
             .push_str("\n\n... [earlier conversation truncated to fit context window]\n");
+    }
+    if let Some(durable_state) = durable_state {
+        conversation_text.push_str(&durable_state);
     }
     format!("{}\n\n---\n\n{}", conversation_text, SUMMARY_PROMPT)
 }
@@ -782,6 +807,18 @@ mod tests {
         assert!(prompt.contains("prior work"));
         assert!(prompt.contains("**User:**"));
         assert!(prompt.contains(SUMMARY_PROMPT));
+    }
+
+    #[test]
+    fn compaction_prompt_keeps_durable_state_after_conversation_truncation() {
+        let prompt = build_compaction_prompt_with_context(
+            &[Message::user(&"old conversation ".repeat(100))],
+            None,
+            SUMMARY_PROMPT.len() + 100,
+            Some(r#"{"todos":[{"id":"keep-me","status":"in_progress"}]}"#),
+        );
+        assert!(prompt.contains("## Durable session state"));
+        assert!(prompt.contains("keep-me"));
     }
 
     #[test]
