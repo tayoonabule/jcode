@@ -1,0 +1,1 @@
+{"nodes": [{"id": "$graphify-root$_telemetry_worker_token_value_daily_sql", "label": "token-value-daily.sql", "file_type": "code", "source_file": "telemetry-worker/token-value-daily.sql", "source_location": null}], "edges": []}

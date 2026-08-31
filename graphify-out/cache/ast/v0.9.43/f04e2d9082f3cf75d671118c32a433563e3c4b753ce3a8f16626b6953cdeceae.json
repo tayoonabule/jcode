@@ -1,0 +1,1 @@
+{"nodes": [{"id": "$graphify-root$_telemetry_worker_prompt_users_sql", "label": "prompt-users.sql", "file_type": "code", "source_file": "telemetry-worker/prompt-users.sql", "source_location": null}], "edges": []}
