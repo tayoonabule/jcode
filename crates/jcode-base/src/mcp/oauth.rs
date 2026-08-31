@@ -27,6 +27,13 @@ pub struct McpOAuthTokens {
     pub client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_endpoint: Option<String>,
+    /// Redirect URI registered with the dynamic OAuth client.
+    ///
+    /// Dynamic clients are bound to their redirect URI. Reusing a stored
+    /// client id with a newly allocated loopback port makes Atlassian reject
+    /// the authorization request, often as an opaque internal server error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
 }
 
 impl McpOAuthTokens {
@@ -314,8 +321,10 @@ where
 
     // Bind the callback before opening the browser. A fixed URI is useful for
     // OAuth web clients that require an exact redirect registration.
+    let saved_redirect_uri = load_tokens(server_name).and_then(|tokens| tokens.redirect_uri);
     let (listener, redirect_uri) = if let Some(configured) = oauth_config
         .and_then(|config| config.redirect_uri.as_deref())
+        .or(saved_redirect_uri.as_deref())
     {
         let redirect = url::Url::parse(configured).context("Invalid OAuth redirect_uri")?;
         if redirect.scheme() != "http"
@@ -341,7 +350,15 @@ where
 
     let client_id = oauth_config
         .and_then(|config| config.client_id.clone())
-        .or_else(|| load_tokens(server_name).and_then(|t| t.client_id))
+        // A dynamically registered client is bound to the redirect URI used
+        // during registration. Only reuse it when we also persisted that URI.
+        .or_else(|| {
+            load_tokens(server_name).and_then(|t| {
+                t.redirect_uri
+                    .filter(|registered| registered == &redirect_uri)
+                    .and(t.client_id)
+            })
+        })
         .unwrap_or_else(|| {
             // This sentinel is replaced below for dynamic registration. Keeping
             // the branch explicit avoids accidentally registering when a static
@@ -470,6 +487,7 @@ where
             .unwrap_or(0),
         client_id: Some(client_id),
         token_endpoint: Some(token_endpoint),
+        redirect_uri: Some(redirect_uri),
     };
     save_tokens(server_name, &tokens)?;
     Ok(tokens)
@@ -513,6 +531,7 @@ pub async fn refresh(
             .unwrap_or(0),
         client_id: tokens.client_id.clone(),
         token_endpoint: tokens.token_endpoint.clone(),
+        redirect_uri: tokens.redirect_uri.clone(),
     };
     let _ = save_tokens(server_name, &refreshed);
     Some(refreshed)
@@ -600,6 +619,7 @@ mod tests {
             expires_at: 0,
             client_id: None,
             token_endpoint: None,
+            redirect_uri: None,
         };
         assert!(!tokens.is_expired(), "0 means unknown expiry, not expired");
         tokens.expires_at = chrono::Utc::now().timestamp() + 10;
