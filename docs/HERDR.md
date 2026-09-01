@@ -14,11 +14,27 @@ Jcode already:
 - exports `JCODE_HOOK_SESSION_ID`, `JCODE_HOOK_CWD`, event fields, and a JSON `JCODE_HOOK_PAYLOAD`;
 - resumes a native session with `jcode --resume <session-id>`.
 
+When running inside Herdr, Jcode also automatically sends a best-effort
+`pane.report_agent_session` request through `HERDR_BIN_PATH` and
+`HERDR_SOCKET_PATH` on session create, attach, and resume. It reports the
+opaque Jcode session ID as `herdr:jcode` with the `jcode` label, while leaving
+lifecycle state to Herdr's screen-manifest detection. The bridge is a no-op
+outside Herdr and needs no Jcode configuration.
+
+For long-running plan execution, `swarm run_plan` waits for terminal completion
+by default. Pass `background: true` only when you deliberately want an
+asynchronous coordinator and will follow the resulting progress state.
+
 ## Recommended first Herdr integration
 
-The initial upstream Herdr integration should provide **native session identity plus screen-manifest state**, matching Herdr's Claude Code and Codex model. Jcode's current hooks reliably identify session and turn boundaries, but do not yet provide a complete authoritative `blocked` lifecycle. Reporting only `working` and `idle` as lifecycle authority would suppress Herdr's screen fallback and make approval/question detection worse.
+The implemented Jcode-side bridge provides **native session identity plus
+screen-manifest state**, matching Herdr's Claude Code and Codex model. Jcode's
+current hooks reliably identify session and turn boundaries, but do not yet
+provide a complete authoritative `blocked` lifecycle. Reporting only `working`
+and `idle` as lifecycle authority would suppress Herdr's screen fallback and
+make approval/question detection worse.
 
-On Jcode `session_start`, the Herdr hook should send one newline-delimited JSON request to `HERDR_SOCKET_PATH`:
+On Jcode `session_start`, Jcode sends the equivalent newline-delimited JSON request to `HERDR_SOCKET_PATH`:
 
 ```json
 {

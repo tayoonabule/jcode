@@ -3131,11 +3131,12 @@ impl Tool for CommunicateTool {
             }
 
             "run_plan" => {
-                // Background-by-default: the plan driver runs as a managed
-                // background task (progress card, bg tool, notify/wake) so the
-                // coordinating agent stays responsive. Pass background=false
-                // to block inline until the plan reaches a terminal state.
-                if params.background.unwrap_or(true) {
+                // Foreground-by-default: a plan is an implementation contract,
+                // so the coordinating turn must not be allowed to produce a
+                // premature "done" response while the driver is still running.
+                // Callers that deliberately want a responsive coordinator can
+                // opt into the managed background driver with background=true.
+                if params.background.unwrap_or(false) {
                     run_swarm_plan_in_background(&ctx, params.clone()).await
                 } else {
                     run_swarm_plan_to_terminal(&ctx, &params, &RunPlanReporter::inline()).await

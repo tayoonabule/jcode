@@ -22,6 +22,7 @@
 //! hook that itself invokes jcode does not recursively trigger hooks.
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 tokio::task_local! {
     /// Terminal identity for the client whose request is currently executing.
@@ -126,6 +127,82 @@ pub fn hook_command(event: &str) -> Option<String> {
 /// skip payload construction entirely when no hook is set.
 pub fn hook_configured(event: &str) -> bool {
     !hook_commands(event).is_empty()
+}
+
+/// Report Jcode's resumable session identity to Herdr when running in a Herdr
+/// pane. This intentionally reports identity only, not lifecycle state: Jcode's
+/// turn hooks do not cover every blocked/approval/interrupt transition, so
+/// taking over Herdr's screen-manifest authority would make detection less
+/// accurate. The command is detached and best-effort, just like observer hooks.
+pub fn dispatch_herdr_session_identity(session_id: &str, source: &str) {
+    let client_env = CLIENT_TERMINAL_ENV
+        .try_with(|env| env.clone())
+        .unwrap_or_default();
+    let env_value = |key: &str| {
+        client_env
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var_os(key).map(|value| value.to_string_lossy().into_owned()))
+    };
+    let in_herdr = env_value("HERDR_ENV").is_some() && env_value("HERDR_PANE_ID").is_some();
+    if !in_herdr || session_id.trim().is_empty() {
+        return;
+    }
+
+    let herdr = env_value("HERDR_BIN_PATH")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "herdr".to_string());
+    let pane = env_value("HERDR_PANE_ID").expect("checked above");
+    let seq = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| "1".to_string());
+
+    let mut command = std::process::Command::new(herdr);
+    command.args([
+        "pane",
+        "report-agent-session",
+        &pane,
+        "--source",
+        "herdr:jcode",
+        "--agent",
+        "jcode",
+        "--seq",
+        &seq,
+        "--agent-session-id",
+        session_id,
+        "--session-start-source",
+        match source {
+            "resume" => "resume",
+            _ => "startup",
+        },
+    ]);
+    for key in [
+        "HERDR_ENV",
+        "HERDR_SOCKET_PATH",
+        "HERDR_PANE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_WORKSPACE_ID",
+        "HERDR_BIN_PATH",
+        "HERDR_SESSION",
+        "HERDR_AGENT",
+    ] {
+        if let Some(value) = env_value(key) {
+            command.env(key, value);
+        }
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    match crate::platform::spawn_detached(&mut command) {
+        Ok(child) => crate::platform::reap_detached(child),
+        Err(error) => crate::logging::debug(&format!(
+            "Herdr session identity report failed to start: {error}"
+        )),
+    }
 }
 
 /// True when running inside a hook process (recursion guard).
