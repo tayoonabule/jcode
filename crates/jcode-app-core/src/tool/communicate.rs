@@ -1942,6 +1942,13 @@ fn canonical_swarm_action(action: &str) -> &str {
     }
 }
 
+/// Whole-plan execution must remain synchronous unless the caller explicitly
+/// opts into background coordination. Keeping this policy pure makes the
+/// user-visible completion contract regression-testable without a live swarm.
+fn run_plan_uses_background_driver(background: Option<bool>) -> bool {
+    background.unwrap_or(false)
+}
+
 #[async_trait]
 impl Tool for CommunicateTool {
     fn name(&self) -> &str {
@@ -3136,7 +3143,7 @@ impl Tool for CommunicateTool {
                 // premature "done" response while the driver is still running.
                 // Callers that deliberately want a responsive coordinator can
                 // opt into the managed background driver with background=true.
-                if params.background.unwrap_or(false) {
+                if run_plan_uses_background_driver(params.background) {
                     run_swarm_plan_in_background(&ctx, params.clone()).await
                 } else {
                     run_swarm_plan_to_terminal(&ctx, &params, &RunPlanReporter::inline()).await

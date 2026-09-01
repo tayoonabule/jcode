@@ -31,6 +31,13 @@ fn tool_is_named_swarm() {
 }
 
 #[test]
+fn run_plan_is_foreground_by_default_but_background_when_explicit() {
+    assert!(!super::run_plan_uses_background_driver(None));
+    assert!(!super::run_plan_uses_background_driver(Some(false)));
+    assert!(super::run_plan_uses_background_driver(Some(true)));
+}
+
+#[test]
 fn task_graph_seed_collision_is_detected_from_server_error() {
     let response = ServerEvent::Error {
         id: 1,
