@@ -581,6 +581,9 @@ fn swarm_effort_directive_is_appended_only_for_swarm_sentinel() {
     append_swarm_effort_directive(&mut split, Some("swarm"));
     assert!(split.dynamic_part.contains("# Swarm Effort"));
     assert!(split.dynamic_part.contains("swarm` tool"));
+    assert!(split.dynamic_part.contains("swarm task_graph"));
+    assert!(split.dynamic_part.contains("mode: \"deep\""));
+    assert!(split.dynamic_part.contains("plan_status"));
 
     // None / empty effort should not inject.
     let mut other = SplitSystemPrompt::default();
