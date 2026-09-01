@@ -2452,14 +2452,6 @@ pub async fn run_single_message_command(
     emit_json: bool,
     emit_ndjson: bool,
 ) -> Result<()> {
-    // Headless `jcode run` executes the agent in-process, but swarm tools and
-    // spawned workers communicate through the daemon socket. Start the daemon
-    // before the first turn so a plan-document run can actually create and
-    // drive its swarm instead of discovering the missing server mid-turn.
-    // `spawn_server` is a no-op when the selected socket already has a live
-    // listener, so ordinary one-shot runs keep using the shared daemon.
-    super::dispatch::spawn_server(choice, model, None).await?;
-
     let provider = if emit_json || emit_ndjson {
         super::provider_init::init_provider_quiet(choice, model).await?
     } else {
