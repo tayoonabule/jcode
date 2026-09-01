@@ -1263,7 +1263,7 @@ impl Default for ProviderConfig {
             default_provider: None,
             openai_reasoning_effort: Some("low".to_string()),
             anthropic_reasoning_effort: None,
-            openai_transport: None,
+            openai_transport: Some("https".to_string()),
             openai_service_tier: Some("priority".to_string()),
             openai_native_compaction_mode: "auto".to_string(),
             openai_native_compaction_threshold_tokens: 200_000,

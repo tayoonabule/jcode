@@ -14,9 +14,99 @@ use super::protocol::{JsonRpcResponse, McpOAuthConfig, McpServerConfig};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, OnceLock, RwLock};
 
 const SESSION_HEADER: &str = "mcp-session-id";
+const INTERACTIVE_AUTH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+static AUTH_STARTS: OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+    OnceLock::new();
+
+/// One interactive OAuth flow per server at a time. Multiple sessions can
+/// discover the same expired remote server concurrently; without this gate
+/// each request would open its own browser consent page before any of them had
+/// a chance to persist the newly issued token.
+async fn auth_flow_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let locks = LOCKS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let mut guard = locks.lock().await;
+    guard
+        .entry(name.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn interactive_auth_allowed(name: &str) -> bool {
+    // The integration harness intentionally performs a second authorization
+    // in one process to verify stale-token recovery.
+    if std::env::var_os("JCODE_MCP_AUTH_AUTOFOLLOW").is_some() {
+        return true;
+    }
+    let starts = AUTH_STARTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut starts = starts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    if starts
+        .get(name)
+        .is_some_and(|started| now.duration_since(*started) < INTERACTIVE_AUTH_COOLDOWN)
+    {
+        return false;
+    }
+
+    // Jcode starts a fresh server process for each session, so an in-memory
+    // cooldown alone still allows every new session to reopen the same stale
+    // Google consent flow. Persist only the small timestamp, not credentials,
+    // so the cooldown survives process restarts without changing token storage.
+    let cooldown_path = interactive_auth_cooldown_path(name);
+    if let Ok(value) = std::fs::read_to_string(&cooldown_path)
+        && let Ok(started) = value.trim().parse::<u64>()
+        && std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|now| now.as_secs().saturating_sub(started) < INTERACTIVE_AUTH_COOLDOWN.as_secs())
+            .unwrap_or(false)
+    {
+        return false;
+    }
+
+    starts.insert(name.to_string(), now);
+    if let Some(parent) = cooldown_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let _ = std::fs::write(cooldown_path, epoch.as_secs().to_string());
+    }
+    true
+}
+
+fn interactive_auth_cooldown_path(name: &str) -> std::path::PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if let Some(home) = std::env::var_os("JCODE_HOME") {
+        std::path::PathBuf::from(home)
+            .join("mcp-auth")
+            .join(format!("{safe}.prompt"))
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".jcode")
+            .join("mcp-auth")
+            .join(format!("{safe}.prompt"))
+    }
+}
+
+/// The marker prevents concurrent sessions from opening duplicate browser
+/// windows, but it must not survive the authorization attempt itself. If the
+/// provider or browser flow fails, leaving it behind strands the next tool call
+/// behind the ten-minute cooldown even though there are no usable credentials.
+fn clear_interactive_auth_attempt(name: &str) {
+    if let Some(starts) = AUTH_STARTS.get() {
+        let mut starts = starts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        starts.remove(name);
+    }
+    let _ = std::fs::remove_file(interactive_auth_cooldown_path(name));
+}
 
 /// One HTTP client shared by every remote MCP server.
 ///
@@ -54,8 +144,16 @@ impl HttpTransport {
             .url
             .clone()
             .context("HTTP MCP server config has no `url`")?;
+        let tokens = oauth::load_tokens(&name);
+        // Older builds left the prompt marker behind after a successful flow.
+        // If credentials are already persisted, that marker cannot represent
+        // the only active authorization attempt and should not block recovery
+        // after an expired-token refresh fails.
+        if tokens.is_some() {
+            clear_interactive_auth_attempt(&name);
+        }
         Ok(Self {
-            tokens: tokio::sync::RwLock::new(oauth::load_tokens(&name)),
+            tokens: tokio::sync::RwLock::new(tokens),
             name,
             url,
             client: shared_client(),
@@ -93,6 +191,17 @@ impl HttpTransport {
 
     /// Ensure a usable access token, refreshing or re-authorizing as needed.
     async fn ensure_auth(&self, challenge: Option<&str>) -> Result<()> {
+        let flow_lock = auth_flow_lock(&self.name).await;
+        let _flow_guard = flow_lock.lock().await;
+        // Another transport may have completed the interactive flow while we
+        // were waiting for this server's lock. Refresh the in-memory view from
+        // disk before deciding that authorization is still required. Without
+        // this reload, concurrent MCP initialization attempts each opened a
+        // new browser window even though the first one had already persisted
+        // valid credentials.
+        if let Some(persisted) = oauth::load_tokens(&self.name) {
+            *self.tokens.write().await = Some(persisted);
+        }
         {
             let current = self.tokens.read().await.clone();
             if let Some(tokens) = current {
@@ -115,14 +224,23 @@ impl HttpTransport {
             );
         }
 
-        let tokens = oauth::authorize(
+        if !interactive_auth_allowed(&self.name) {
+            anyhow::bail!(
+                "MCP server '{}' recently opened an OAuth sign-in window; refusing to open another for 10 minutes",
+                self.name
+            );
+        }
+
+        let auth_result = oauth::authorize(
             &self.name,
             &self.url,
             challenge,
             self.oauth_config.as_ref(),
             false,
         )
-        .await?;
+        .await;
+        clear_interactive_auth_attempt(&self.name);
+        let tokens = auth_result?;
         *self.tokens.write().await = Some(tokens);
         Ok(())
     }
@@ -218,14 +336,16 @@ impl HttpTransport {
 
     /// Explicitly start the browser sign-in flow (used by `mcp login`).
     pub async fn login(&self) -> Result<()> {
-        let tokens = oauth::authorize(
+        let auth_result = oauth::authorize(
             &self.name,
             &self.url,
             None,
             self.oauth_config.as_ref(),
             false,
         )
-        .await?;
+        .await;
+        clear_interactive_auth_attempt(&self.name);
+        let tokens = auth_result?;
         *self.tokens.write().await = Some(tokens);
         Ok(())
     }
@@ -285,7 +405,14 @@ impl SseDecoder {
             return None;
         }
         let data = std::mem::take(&mut self.data);
-        serde_json::from_str::<JsonRpcResponse>(&data).ok()
+        // Streamable HTTP servers may emit JSON-RPC notifications such as
+        // `notifications/progress` before the response to the request. They
+        // deserialize into this type with no id/result, but are not the tool
+        // response. Keep scanning the SSE stream until an actual response
+        // arrives instead of reporting "No result from tool call".
+        serde_json::from_str::<JsonRpcResponse>(&data)
+            .ok()
+            .filter(|response| response.id.is_some())
     }
 }
 
@@ -349,5 +476,15 @@ mod tests {
         let parsed = sse("data: not json\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\n\n")
             .expect("second event");
         assert_eq!(parsed.id, Some(3));
+    }
+
+    #[test]
+    fn skips_json_rpc_notifications_before_response() {
+        let parsed = sse(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n\
+             data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n\n",
+        )
+        .expect("response after notification");
+        assert_eq!(parsed.id, Some(9));
     }
 }

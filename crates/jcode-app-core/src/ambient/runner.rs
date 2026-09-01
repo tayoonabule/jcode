@@ -137,6 +137,7 @@ impl AmbientRunnerHandle {
             AmbientStatus::Scheduled { .. } | AmbientStatus::Idle
         ) {
             state.status = AmbientStatus::Idle;
+            let _ = state.save();
         }
         drop(state);
         self.inner.wake_notify.notify_one();
@@ -385,7 +386,19 @@ impl AmbientRunnerHandle {
         session_id: &str,
     ) -> anyhow::Result<()> {
         let session = Session::load(session_id)?;
-        let cycle_provider = provider.fork();
+        // Ambient runs are long-lived server work, so a plain fork can preserve
+        // the server's stale provider selection. Rebuild the provider first so
+        // current auth/config state is available, then apply the explicit
+        // ambient route below.
+        let cycle_provider = provider.fork_for_new_session();
+        if let Some(model) = config().ambient.model.as_deref()
+            && let Err(error) = cycle_provider.set_model(model)
+        {
+            logging::warn(&format!(
+                "Ambient cycle could not apply configured model '{}': {}",
+                model, error
+            ));
+        }
         let registry = tool::Registry::new(cycle_provider.clone()).await;
         if session.is_canary {
             registry.register_selfdev_tools().await;
@@ -462,7 +475,15 @@ impl AmbientRunnerHandle {
         let child_session_id = child.id.clone();
         let child_is_canary = child.is_canary;
         let child_is_debug = child.is_debug;
-        let cycle_provider = provider.fork();
+        let cycle_provider = provider.fork_for_new_session();
+        if let Some(model) = config().ambient.model.as_deref()
+            && let Err(error) = cycle_provider.set_model(model)
+        {
+            logging::warn(&format!(
+                "Ambient cycle could not apply configured model '{}': {}",
+                model, error
+            ));
+        }
         let registry = tool::Registry::new(cycle_provider.clone()).await;
         if child_is_canary {
             registry.register_selfdev_tools().await;
@@ -547,6 +568,18 @@ impl AmbientRunnerHandle {
             *running = true;
         }
         logging::info("Ambient runner: starting background loop");
+
+        // A process can die while a cycle is in progress, leaving the
+        // persisted state as Running. Treat that state as stale when a new
+        // runner starts, otherwise AmbientManager::should_run() will refuse
+        // every future cycle forever.
+        if let Ok(mut state) = AmbientState::load()
+            && matches!(state.status, AmbientStatus::Running { .. })
+        {
+            logging::warn("Ambient runner: recovering stale running state");
+            state.status = AmbientStatus::Idle;
+            let _ = state.save();
+        }
 
         let ambient_enabled = config().ambient.enabled;
 
@@ -722,6 +755,7 @@ impl AmbientRunnerHandle {
             logging::info("Ambient runner: starting ambient cycle");
             self.set_running_detail("starting cycle").await;
 
+            let transcript_provider = self.configured_cycle_provider(&provider);
             let cycle_result = self.run_cycle(&provider).await;
 
             // Clear the soft interrupt queue — cycle is done
@@ -759,8 +793,8 @@ impl AmbientRunnerHandle {
                             }
                             CycleStatus::Incomplete => crate::safety::TranscriptStatus::Incomplete,
                         },
-                        provider: provider.name().to_string(),
-                        model: provider.model(),
+                        provider: transcript_provider.name().to_string(),
+                        model: transcript_provider.model(),
                         actions: Vec::new(),
                         pending_permissions: self.inner.safety.pending_requests().len(),
                         summary: Some(result.summary.clone()),
@@ -885,6 +919,32 @@ impl AmbientRunnerHandle {
         Ok((system_prompt, initial_message))
     }
 
+    /// Return a fresh provider configured with Ambient's explicit route.
+    ///
+    /// The server provider is shared with interactive sessions and may point at
+    /// a different route. Ambient must apply its own provider and model before
+    /// creating the agent, and the same route must be recorded in transcripts.
+    fn configured_cycle_provider(&self, provider: &Arc<dyn Provider>) -> Arc<dyn Provider> {
+        let cycle_provider = provider.fork_for_new_session();
+        if let Some(provider_name) = config().ambient.provider.as_deref()
+            && let Err(error) = cycle_provider.switch_active_provider_to(provider_name)
+        {
+            logging::warn(&format!(
+                "Ambient cycle could not apply configured provider '{}': {}",
+                provider_name, error
+            ));
+        }
+        if let Some(model) = config().ambient.model.as_deref()
+            && let Err(error) = cycle_provider.set_model(model)
+        {
+            logging::warn(&format!(
+                "Ambient cycle could not apply configured model '{}': {}",
+                model, error
+            ));
+        }
+        cycle_provider
+    }
+
     /// Run a single ambient cycle. Returns the cycle result.
     async fn run_cycle(&self, provider: &Arc<dyn Provider>) -> anyhow::Result<AmbientCycleResult> {
         self.run_cycle_with_visible_launcher(provider, config().ambient.visible, || {
@@ -919,8 +979,12 @@ impl AmbientRunnerHandle {
     {
         let started_at = Utc::now();
 
+        // Ambient has its own route selection. Do not inherit the shared
+        // server's provider when the user explicitly configured one.
+        let cycle_provider = self.configured_cycle_provider(provider);
+
         self.set_running_detail("gathering context").await;
-        let (system_prompt, initial_message) = self.build_cycle_context(provider).await?;
+        let (system_prompt, initial_message) = self.build_cycle_context(&cycle_provider).await?;
 
         // Visible mode: spawn a full TUI instead of running headlessly
         if visible {
@@ -941,7 +1005,6 @@ impl AmbientRunnerHandle {
         // Headless mode: run agent directly
         self.set_running_detail("setting up tools").await;
 
-        let cycle_provider = provider.fork();
         let registry = tool::Registry::new(cycle_provider.clone()).await;
         registry.register_ambient_tools().await;
 

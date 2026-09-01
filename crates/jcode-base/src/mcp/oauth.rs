@@ -27,6 +27,13 @@ pub struct McpOAuthTokens {
     pub client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_endpoint: Option<String>,
+    /// Redirect URI registered with the dynamic OAuth client.
+    ///
+    /// Dynamic clients are bound to their redirect URI. Reusing a stored
+    /// client id with a newly allocated loopback port makes Atlassian reject
+    /// the authorization request, often as an opaque internal server error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
 }
 
 impl McpOAuthTokens {
@@ -84,6 +91,14 @@ pub fn clear_tokens(server: &str) {
 struct ProtectedResourceMetadata {
     #[serde(default)]
     authorization_servers: Vec<String>,
+    /// The resource server may advertise the scopes its authorization request
+    /// must include. Atlassian's authv2 endpoint publishes the Jira work
+    /// scopes here, while its authorization-server metadata omits
+    /// `scopes_supported`. Ignoring this field causes Atlassian to mint the
+    /// narrower agent-interface grant, which then fails Jira data tools with
+    /// "Unauthorized; scope does not match".
+    #[serde(default)]
+    scopes_supported: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -155,7 +170,19 @@ pub fn resource_metadata_from_challenge(header: &str) -> Option<String> {
 
 fn well_known(base: &url::Url, suffix: &str) -> String {
     let mut u = base.clone();
-    u.set_path(suffix);
+    // OAuth issuers are allowed to include a tenant or authorization-server
+    // path. Atlassian uses exactly that shape, for example
+    // `/VCeDsk8ZHncYF1g234fKtc4lNipbBhu3`. Replacing the path with the
+    // well-known suffix silently queries the provider root and makes a valid
+    // server look like it has no dynamic registration support.
+    let base_path = u.path().trim_end_matches('/');
+    let suffix = suffix.trim_start_matches('/');
+    let path = if base_path.is_empty() {
+        format!("/{suffix}")
+    } else {
+        format!("{base_path}/{suffix}")
+    };
+    u.set_path(&path);
     u.set_query(None);
     u.to_string()
 }
@@ -184,10 +211,15 @@ async fn discover(
         .and_then(resource_metadata_from_challenge)
         .unwrap_or_else(|| well_known(&base, "/.well-known/oauth-protected-resource"));
 
-    let issuer = fetch_json::<ProtectedResourceMetadata>(client, &resource_metadata_url)
+    let resource_meta = fetch_json::<ProtectedResourceMetadata>(client, &resource_metadata_url)
         .await
-        .and_then(|meta| meta.authorization_servers.into_iter().next())
+        .unwrap_or_default();
+    let issuer = resource_meta
+        .authorization_servers
+        .into_iter()
+        .next()
         .unwrap_or_else(|| base.origin().ascii_serialization());
+    let resource_scopes = resource_meta.scopes_supported.clone();
 
     let issuer_url = url::Url::parse(&issuer).unwrap_or(base.clone());
 
@@ -199,7 +231,14 @@ async fn discover(
             && meta.authorization_endpoint.is_some()
             && meta.token_endpoint.is_some()
         {
-            return Ok(meta);
+            return Ok(AuthServerMetadata {
+                scopes_supported: if meta.scopes_supported.is_empty() {
+                    resource_scopes.clone()
+                } else {
+                    meta.scopes_supported
+                },
+                ..meta
+            });
         }
     }
 
@@ -208,7 +247,7 @@ async fn discover(
         authorization_endpoint: Some(well_known(&issuer_url, "/authorize")),
         token_endpoint: Some(well_known(&issuer_url, "/token")),
         registration_endpoint: Some(well_known(&issuer_url, "/register")),
-        scopes_supported: Vec::new(),
+        scopes_supported: resource_scopes,
     })
 }
 
@@ -236,7 +275,12 @@ pub async fn authorize(
                 return;
             }
             if !no_browser {
-                let _ = open::that(url);
+                // Do not wait on the browser process. On macOS, `open::that`
+                // can inherit the MCP transport's lifetime and leave the
+                // authorization flow looking stalled even though no visible
+                // prompt was opened. The detached variant returns immediately
+                // and lets the system browser own the OAuth tab.
+                let _ = open::that_detached(url);
             }
         },
     )
@@ -277,8 +321,10 @@ where
 
     // Bind the callback before opening the browser. A fixed URI is useful for
     // OAuth web clients that require an exact redirect registration.
+    let saved_redirect_uri = load_tokens(server_name).and_then(|tokens| tokens.redirect_uri);
     let (listener, redirect_uri) = if let Some(configured) = oauth_config
         .and_then(|config| config.redirect_uri.as_deref())
+        .or(saved_redirect_uri.as_deref())
     {
         let redirect = url::Url::parse(configured).context("Invalid OAuth redirect_uri")?;
         if redirect.scheme() != "http"
@@ -304,7 +350,15 @@ where
 
     let client_id = oauth_config
         .and_then(|config| config.client_id.clone())
-        .or_else(|| load_tokens(server_name).and_then(|t| t.client_id))
+        // A dynamically registered client is bound to the redirect URI used
+        // during registration. Only reuse it when we also persisted that URI.
+        .or_else(|| {
+            load_tokens(server_name).and_then(|t| {
+                t.redirect_uri
+                    .filter(|registered| registered == &redirect_uri)
+                    .and(t.client_id)
+            })
+        })
         .unwrap_or_else(|| {
             // This sentinel is replaced below for dynamic registration. Keeping
             // the branch explicit avoids accidentally registering when a static
@@ -333,9 +387,17 @@ where
             .await
             .context("Dynamic client registration failed")?;
         if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::FORBIDDEN {
+                anyhow::bail!(
+                    "Dynamic client registration rejected (403): the OAuth provider does not allow this MCP client; Figma remote MCP currently requires an approved client integration"
+                );
+            }
             anyhow::bail!(
-                "Dynamic client registration rejected ({})",
-                resp.status().as_u16()
+                "Dynamic client registration rejected ({}): {}",
+                status.as_u16(),
+                detail.chars().take(200).collect::<String>()
             );
         }
         resp.json::<RegistrationResponse>().await?.client_id
@@ -354,6 +416,24 @@ where
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", &state)
         .append_pair("resource", server_url);
+    // Google access tokens are short-lived. Request offline access so the
+    // first interactive login also gives us a refresh token instead of
+    // reopening a browser every hour. Providers that ignore these standard
+    // parameters simply continue to receive the normal authorization request.
+    auth_url
+        .query_pairs_mut()
+        .append_pair("access_type", "offline");
+    if load_tokens(server_name)
+        .as_ref()
+        .is_some_and(|tokens| tokens.refresh_token.is_none())
+    {
+        // An existing grant may otherwise omit a refresh token. This is only
+        // reached when re-authorizing an already-expired, non-refreshable
+        // credential, so consent is not part of the normal request path.
+        auth_url
+            .query_pairs_mut()
+            .append_pair("prompt", "consent");
+    }
     if let Some(scope) = &scope {
         auth_url.query_pairs_mut().append_pair("scope", scope);
     }
@@ -407,6 +487,7 @@ where
             .unwrap_or(0),
         client_id: Some(client_id),
         token_endpoint: Some(token_endpoint),
+        redirect_uri: Some(redirect_uri),
     };
     save_tokens(server_name, &tokens)?;
     Ok(tokens)
@@ -450,6 +531,7 @@ pub async fn refresh(
             .unwrap_or(0),
         client_id: tokens.client_id.clone(),
         token_endpoint: tokens.token_endpoint.clone(),
+        redirect_uri: tokens.redirect_uri.clone(),
     };
     let _ = save_tokens(server_name, &refreshed);
     Some(refreshed)
@@ -475,6 +557,18 @@ mod tests {
     }
 
     #[test]
+    fn well_known_preserves_issuer_path() {
+        let issuer = url::Url::parse(
+            "https://auth.atlassian.com/VCeDsk8ZHncYF1g234fKtc4lNipbBhu3",
+        )
+        .unwrap();
+        assert_eq!(
+            well_known(&issuer, "/.well-known/oauth-authorization-server"),
+            "https://auth.atlassian.com/VCeDsk8ZHncYF1g234fKtc4lNipbBhu3/.well-known/oauth-authorization-server"
+        );
+    }
+
+    #[test]
     fn no_advertised_scopes_means_no_scope_parameter() {
         // Granola advertises "mcp" but some servers advertise nothing; sending
         // an empty scope can be rejected, so omit it entirely.
@@ -485,6 +579,19 @@ mod tests {
     fn advertised_scopes_are_requested_verbatim() {
         let scopes = ["mcp.access".to_string()];
         assert_eq!(requested_scope(&scopes).as_deref(), Some("mcp.access"));
+    }
+
+    #[test]
+    fn protected_resource_scopes_can_supply_missing_authorization_scopes() {
+        let metadata: ProtectedResourceMetadata = serde_json::from_value(serde_json::json!({
+            "authorization_servers": ["https://auth.example/issuer"],
+            "scopes_supported": ["read:jira-work", "search:jira-work"]
+        }))
+        .unwrap();
+        assert_eq!(
+            requested_scope(&metadata.scopes_supported).as_deref(),
+            Some("read:jira-work search:jira-work")
+        );
     }
 
     #[test]
@@ -512,6 +619,7 @@ mod tests {
             expires_at: 0,
             client_id: None,
             token_endpoint: None,
+            redirect_uri: None,
         };
         assert!(!tokens.is_expired(), "0 means unknown expiry, not expired");
         tokens.expires_at = chrono::Utc::now().timestamp() + 10;

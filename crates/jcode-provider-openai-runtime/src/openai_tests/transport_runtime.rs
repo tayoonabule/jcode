@@ -111,9 +111,14 @@ fn test_should_prefer_websocket_enabled_for_named_models() {
 }
 
 #[test]
-fn test_openai_transport_mode_defaults_to_auto() {
-    let mode = OpenAITransportMode::from_config(None);
-    assert_eq!(mode.as_str(), "auto");
+fn test_openai_transport_mode_config_default_is_https() {
+    let mode = OpenAITransportMode::from_config(
+        jcode_base::config::Config::default()
+            .provider
+            .openai_transport
+            .as_deref(),
+    );
+    assert_eq!(mode.as_str(), "https");
 }
 
 #[test]

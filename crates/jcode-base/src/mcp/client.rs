@@ -22,6 +22,7 @@ enum Transport {
         writer_tx: mpsc::Sender<String>,
     },
     Http(Arc<super::http::HttpTransport>),
+    Sse(Arc<super::sse::SseTransport>),
 }
 
 /// Shared communication handle for an MCP server.
@@ -47,6 +48,10 @@ impl McpHandle {
         let response = match &self.transport {
             Transport::Http(http) => http
                 .send(&body, true)
+                .await?
+                .context("MCP server returned no JSON-RPC response")?,
+            Transport::Sse(sse) => sse
+                .send(&body, id, true)
                 .await?
                 .context("MCP server returned no JSON-RPC response")?,
             Transport::Stdio { pending, writer_tx } => {
@@ -76,6 +81,9 @@ impl McpHandle {
         match &self.transport {
             Transport::Http(http) => {
                 http.send(&body, false).await?;
+            }
+            Transport::Sse(sse) => {
+                sse.notify(&body).await?;
             }
             Transport::Stdio { writer_tx, .. } => {
                 writer_tx.send(body + "\n").await?;
@@ -112,6 +120,10 @@ impl McpHandle {
             {
                 if let Transport::Http(http) = &self.transport {
                     http.reauthenticate().await?;
+                    continue;
+                }
+                if let Transport::Sse(sse) = &self.transport {
+                    sse.reauthenticate().await?;
                     continue;
                 }
             }
@@ -187,6 +199,13 @@ impl McpClient {
         working_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
         if !config.is_stdio() {
+            if config
+                .transport
+                .as_deref()
+                .is_some_and(|transport| transport.eq_ignore_ascii_case("sse"))
+            {
+                return Self::connect_sse(name, config).await;
+            }
             return Self::connect_http(name, config).await;
         }
         let working_dir = working_dir.filter(|dir| dir.is_dir());
@@ -365,6 +384,45 @@ impl McpClient {
 
         crate::logging::info(&format!(
             "MCP: Connected to '{}' over HTTP with {} tools",
+            name,
+            client.handle.tools().len()
+        ));
+        Ok(client)
+    }
+
+    /// Connect to a legacy MCP server using a long-lived SSE GET stream and
+    /// the POST endpoint announced by its initial `endpoint` event.
+    async fn connect_sse(name: String, config: &McpServerConfig) -> Result<Self> {
+        let url = config.url.as_deref().unwrap_or_default();
+        crate::logging::info(&format!("MCP: Connecting to '{name}' over SSE ({url})"));
+
+        let transport = super::sse::SseTransport::new(name.clone(), config)?;
+        transport.connect().await?;
+        let handle = McpHandle {
+            name: name.clone(),
+            request_id: Arc::new(AtomicU64::new(1)),
+            transport: Transport::Sse(Arc::new(transport)),
+            server_info: Arc::new(std::sync::RwLock::new(None)),
+            capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
+            tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+        };
+
+        let mut client = Self {
+            handle,
+            child: None,
+        };
+        client
+            .initialize()
+            .await
+            .with_context(|| format!("MCP server '{name}' failed to initialize"))?;
+        client
+            .handle
+            .refresh_tools()
+            .await
+            .with_context(|| format!("MCP server '{name}' failed to list tools"))?;
+
+        crate::logging::info(&format!(
+            "MCP: Connected to '{}' over SSE with {} tools",
             name,
             client.handle.tools().len()
         ));

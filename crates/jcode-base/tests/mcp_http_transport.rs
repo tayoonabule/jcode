@@ -253,6 +253,7 @@ async fn auth_like_forbidden_response_retries_with_stored_oauth_token() {
             expires_at: 0,
             client_id: None,
             token_endpoint: None,
+            redirect_uri: None,
         },
     )
     .expect("persist test token");

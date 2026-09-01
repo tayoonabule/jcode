@@ -37,7 +37,7 @@ pub use jcode_compaction_core::{
     emergency_strip_large_images, emergency_truncate_large_payloads, estimate_compaction_tokens,
     is_request_payload_too_large_error, mean_embedding, message_char_count, safe_compaction_cutoff,
     semantic_cache_key, semantic_goal_text, semantic_message_text, strip_large_images_in_contents,
-    summary_payload_char_count,
+    summary_payload_char_count, build_compaction_prompt_with_context,
 };
 
 const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 15_000;
@@ -139,6 +139,11 @@ pub struct CompactionManager {
     /// Active summary (if we've compacted before)
     active_summary: Option<Summary>,
 
+    /// Durable session state that must survive transcript compaction, such as
+    /// the current todo list and plan. Refreshed by the session owner before a
+    /// compaction trigger is evaluated.
+    durable_state_context: Option<String>,
+
     /// Rolling char estimate for the active (non-compacted) message suffix.
     ///
     /// In the common append-only case this is maintained incrementally, so token
@@ -211,6 +216,7 @@ impl CompactionManager {
         Self {
             compacted_count: 0,
             active_summary: None,
+            durable_state_context: None,
             active_chars: ActiveCharEstimate::default(),
             pending_task: None,
             pending_trigger: None,
@@ -243,6 +249,11 @@ impl CompactionManager {
     /// Update the token budget (e.g., when model changes)
     pub fn set_budget(&mut self, budget: usize) {
         self.token_budget = budget;
+    }
+
+    /// Set the latest durable state snapshot for the next compaction task.
+    pub fn set_durable_state_context(&mut self, context: Option<String>) {
+        self.durable_state_context = context;
     }
 
     /// Get current token budget
@@ -888,6 +899,7 @@ impl CompactionManager {
         let messages_to_summarize: Vec<Message> = active[..cutoff].to_vec();
         let msg_count = messages_to_summarize.len();
         let existing_summary = self.active_summary.clone();
+        let durable_state_context = self.durable_state_context.clone();
         let mode_label = self.mode_trigger_label().to_string();
         let estimated_tokens = self.effective_token_count_with(all_messages);
         crate::logging::info(&format!(
@@ -906,7 +918,12 @@ impl CompactionManager {
         self.pending_task = Some(tokio::spawn(async move {
             let start = std::time::Instant::now();
             let result =
-                generate_compaction_artifact(provider, messages_to_summarize, existing_summary)
+                generate_compaction_artifact(
+                    provider,
+                    messages_to_summarize,
+                    existing_summary,
+                    durable_state_context,
+                )
                     .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             crate::logging::info(&format!(
@@ -1112,6 +1129,7 @@ impl CompactionManager {
         let messages_to_summarize: Vec<Message> = active[..cutoff].to_vec();
         let msg_count = messages_to_summarize.len();
         let existing_summary = self.active_summary.clone();
+        let durable_state_context = self.durable_state_context.clone();
 
         self.pending_cutoff = cutoff;
         self.pending_trigger = Some("manual".to_string());
@@ -1119,7 +1137,12 @@ impl CompactionManager {
         self.pending_task = Some(tokio::spawn(async move {
             let start = std::time::Instant::now();
             let result =
-                generate_compaction_artifact(provider, messages_to_summarize, existing_summary)
+                generate_compaction_artifact(
+                    provider,
+                    messages_to_summarize,
+                    existing_summary,
+                    durable_state_context,
+                )
                     .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             crate::logging::info(&format!(
@@ -1676,6 +1699,7 @@ async fn generate_compaction_artifact(
     provider: Arc<dyn Provider>,
     messages: Vec<Message>,
     mut existing_summary: Option<Summary>,
+    durable_state_context: Option<String>,
 ) -> Result<CompactionResult> {
     let start = Instant::now();
     if let Some(summary) = existing_summary.as_mut()
@@ -1731,7 +1755,12 @@ async fn generate_compaction_artifact(
     }
 
     let max_prompt_chars = provider.context_window().saturating_sub(4000) * CHARS_PER_TOKEN;
-    let prompt = build_compaction_prompt(&messages, existing_summary.as_ref(), max_prompt_chars);
+    let prompt = build_compaction_prompt_with_context(
+        &messages,
+        existing_summary.as_ref(),
+        max_prompt_chars,
+        durable_state_context.as_deref(),
+    );
 
     // Generate summary using simple completion
     let summary = provider
@@ -1773,7 +1802,7 @@ pub async fn build_transfer_compaction_state(
         .as_ref()
         .map(|state| state.original_turn_count.max(state.covers_up_to_turn))
         .unwrap_or(0);
-    let result = generate_compaction_artifact(provider, messages.clone(), existing_summary).await?;
+    let result = generate_compaction_artifact(provider, messages.clone(), existing_summary, None).await?;
     let total_turns = prior_turns + messages.len();
 
     Ok(Some(crate::session::StoredCompactionState {

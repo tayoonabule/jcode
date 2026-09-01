@@ -54,7 +54,11 @@ pub(crate) fn tool_name_is_allowed(allowed: &HashSet<String>, name: &str) -> boo
 }
 
 pub(crate) fn tool_name_is_disabled(disabled: &HashSet<String>, name: &str) -> bool {
-    disabled.contains(name) || (disabled.contains("mcp") && is_mcp_tool_name(name))
+    disabled.contains(name)
+        || (disabled.contains("mcp") && is_mcp_tool_name(name))
+        || disabled
+            .iter()
+            .any(|prefix| prefix.ends_with("__") && name.starts_with(prefix))
 }
 
 fn is_fixed_mcp_tool(name: &str) -> bool {
@@ -1088,7 +1092,11 @@ impl Registry {
             let registry = self.clone();
             tokio::spawn(async move {
                 let (successes, failures) = {
-                    let manager = mcp_manager.write().await;
+                    // `connect_all` only needs shared access. Holding a write
+                    // lock here blocks every MCP tool call while an HTTP
+                    // server waits for browser OAuth, including unrelated
+                    // local or already-connected servers.
+                    let manager = mcp_manager.read().await;
                     manager.connect_all().await.unwrap_or((0, Vec::new()))
                 };
 
@@ -1315,6 +1323,14 @@ mod mcp_allow_list_tests {
         ));
         assert!(!tool_name_is_disabled(&disabled, "mcpish"));
         assert!(!tool_name_is_disabled(&disabled, "bash"));
+    }
+
+    #[test]
+    fn disabling_an_mcp_server_prefix_hides_only_that_server() {
+        let disabled = HashSet::from(["mcp__dokploy__".to_string()]);
+
+        assert!(tool_name_is_disabled(&disabled, "mcp__dokploy__deploy"));
+        assert!(!tool_name_is_disabled(&disabled, "mcp__gmail__send"));
     }
 }
 
