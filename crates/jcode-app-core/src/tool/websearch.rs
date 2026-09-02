@@ -2,8 +2,18 @@ use super::{Tool, ToolContext, ToolOutput};
 use crate::config::WebSearchEngine;
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::{
+    Engine as _,
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::time::Duration;
+
+/// A search provider must fail quickly enough for the configured fallback to
+/// be useful. Public HTML endpoints can accept a connection and then stall
+/// while presenting a bot challenge, so a connect timeout is not enough.
+const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Web search using DuckDuckGo or Bing (HTML scraping, with optional Bing API)
 pub struct WebSearchTool {
@@ -199,6 +209,7 @@ impl WebSearchTool {
                 "application/x-www-form-urlencoded",
             )
             .form(&[("q", query), ("kl", "us-en")])
+            .timeout(ENGINE_REQUEST_TIMEOUT)
             .send()
             .await?;
 
@@ -269,6 +280,7 @@ impl WebSearchTool {
                 ("mkt", market),
             ])
             .header("Ocp-Apim-Subscription-Key", api_key)
+            .timeout(ENGINE_REQUEST_TIMEOUT)
             .send()
             .await?;
 
@@ -301,6 +313,7 @@ impl WebSearchTool {
                 reqwest::header::USER_AGENT,
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             )
+            .timeout(ENGINE_REQUEST_TIMEOUT)
             .send()
             .await?;
 
@@ -361,6 +374,7 @@ impl WebSearchTool {
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             )
             .header(reqwest::header::ACCEPT, "application/json")
+            .timeout(ENGINE_REQUEST_TIMEOUT)
             .send()
             .await?;
 
@@ -524,7 +538,7 @@ fn parse_bing_html_results(html: &str, max_results: usize) -> Vec<SearchResult> 
         let Some(link) = link_re.captures(&block[1]) else {
             continue;
         };
-        let url = html_decode(&link[1]);
+        let url = decode_bing_url(&link[1]);
         if !url.starts_with("http") || url.contains("bing.com") {
             continue;
         }
@@ -630,6 +644,41 @@ fn decode_ddg_url(url: &str) -> String {
     }
 }
 
+/// Bing's public HTML results increasingly link through `bing.com/ck/a` and put
+/// the destination in a URL-safe base64 `u=a1…` query value.  Treating every
+/// Bing-owned URL as an ad used to discard all organic results on current SERPs.
+fn decode_bing_url(url: &str) -> String {
+    let decoded = html_decode(url);
+    if !decoded.contains("bing.com/ck/") {
+        return decoded;
+    }
+
+    let Some(encoded) = decoded
+        .split('?')
+        .nth(1)
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|part| part.strip_prefix("u="))
+    else {
+        return decoded;
+    };
+    let encoded = urlencoding::decode(encoded)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| encoded.to_string());
+    let encoded = encoded.strip_prefix("a1").unwrap_or(&encoded);
+
+    for engine in [&URL_SAFE_NO_PAD, &URL_SAFE] {
+        if let Ok(bytes) = engine.decode(encoded)
+            && let Ok(destination) = String::from_utf8(bytes)
+            && destination.starts_with("http")
+        {
+            return destination;
+        }
+    }
+
+    decoded
+}
+
 fn html_decode(s: &str) -> String {
     s.replace("&nbsp;", " ")
         .replace("&lt;", "<")
@@ -667,6 +716,23 @@ mod tests {
         assert_eq!(results[0].url, "https://example.com/rust");
         assert_eq!(results[0].snippet, "A systems language.");
         assert_eq!(results[1].title, "Jcode");
+    }
+
+    #[test]
+    fn parses_current_bing_redirect_results() {
+        // Current Bing HTML wraps organic links in `bing.com/ck/a` and carries
+        // the real destination as `u=a1` plus URL-safe base64 without padding.
+        let html = r#"
+            <li class="b_algo" data-id iid=SERP.100>
+              <h2 class=""><a target="_blank" href="https://www.bing.com/ck/a?ptn=3&amp;u=a1aHR0cHM6Ly9wbGF5d3JpZ2h0LmRldi9kb2NzL3Rlc3Qtc25hcHNob3Rz&amp;ntb=1">Visual comparisons | Playwright</a></h2>
+              <div class="b_caption"><p>Compare screenshots in Playwright.</p></div>
+            </li>
+        "#;
+
+        let results = parse_bing_html_results(html, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://playwright.dev/docs/test-snapshots");
+        assert_eq!(results[0].title, "Visual comparisons | Playwright");
     }
 
     #[test]
