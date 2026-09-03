@@ -274,11 +274,7 @@ impl WebSearchTool {
         let response = self
             .client
             .get("https://api.bing.microsoft.com/v7.0/search")
-            .query(&[
-                ("q", query),
-                ("count", &num_results.to_string()),
-                ("mkt", market),
-            ])
+            .query(&bing_api_query_parameters(query, num_results, market))
             .header("Ocp-Apim-Subscription-Key", api_key)
             .timeout(ENGINE_REQUEST_TIMEOUT)
             .send()
@@ -500,6 +496,25 @@ struct BingWebPage {
     url: String,
     #[serde(default)]
     snippet: String,
+}
+
+/// Build a web-pages-only Bing API request. The Web Search API otherwise ranks
+/// several answer types in a response, while this tool consumes only
+/// `webPages`. Requesting that answer type keeps the returned result budget
+/// aligned with the output the tool can actually present.
+///
+/// See <https://learn.microsoft.com/en-us/bing/search-apis/bing-web-search/reference/query-parameters>.
+fn bing_api_query_parameters(
+    query: &str,
+    num_results: usize,
+    market: &str,
+) -> [(String, String); 4] {
+    [
+        ("q".to_string(), query.to_string()),
+        ("count".to_string(), num_results.to_string()),
+        ("mkt".to_string(), market.to_string()),
+        ("responseFilter".to_string(), "Webpages".to_string()),
+    ]
 }
 
 fn parse_bing_api_results(response: BingApiResponse, max_results: usize) -> Vec<SearchResult> {
@@ -751,6 +766,19 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "One");
         assert_eq!(results[0].url, "https://one.test");
+    }
+
+    #[test]
+    fn bing_api_request_filters_to_webpages() {
+        assert_eq!(
+            bing_api_query_parameters("rust async", 8, "en-US"),
+            [
+                ("q".to_string(), "rust async".to_string()),
+                ("count".to_string(), "8".to_string()),
+                ("mkt".to_string(), "en-US".to_string()),
+                ("responseFilter".to_string(), "Webpages".to_string()),
+            ]
+        );
     }
 
     #[test]
