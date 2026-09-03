@@ -19,6 +19,10 @@ struct Args {
     /// Include network-backed tools (webfetch/websearch).
     #[arg(long)]
     include_network: bool,
+
+    /// Use a specific web-search engine for the network smoke test.
+    #[arg(long, requires = "include_network")]
+    websearch_engine: Option<String>,
 }
 
 struct NoopProvider;
@@ -168,7 +172,13 @@ async fn main() -> Result<()> {
         cases.push(ToolCase {
             name: "websearch",
             label: "websearch rust async",
-            input: json!({"query": "rust async await"}),
+            input: {
+                let mut input = json!({"query": "rust async await"});
+                if let Some(engine) = &args.websearch_engine {
+                    input["engine"] = json!(engine);
+                }
+                input
+            },
         });
     }
 
