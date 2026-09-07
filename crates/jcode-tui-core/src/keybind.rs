@@ -58,8 +58,17 @@ impl KeyBinding {
         // another terminal can report the same physical intent as Super. Let
         // a configured Cmd binding have a Ctrl fallback (and vice versa), so
         // keybindings remain usable in both terminal environments.
+        //
+        // Arrow keys are excluded: Ctrl+Left/Right/Up/Down is a universal,
+        // distinct terminal convention (word/line navigation) that must never
+        // be reinterpreted as a Cmd+Arrow binding such as the effort-cycle
+        // shortcut, even when a Cmd binding is configured for the same arrow.
         if is_macos
             && code == bind_code
+            && !matches!(
+                code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+            )
             && ((bind_mods == KeyModifiers::SUPER && modifiers == KeyModifiers::CONTROL)
                 || (bind_mods == KeyModifiers::CONTROL && modifiers == KeyModifiers::SUPER))
         {
@@ -623,6 +632,24 @@ mod tests {
             KeyModifiers::CONTROL,
             false
         ));
+    }
+
+    #[test]
+    fn cmd_arrow_binding_does_not_swallow_ctrl_arrow_word_navigation() {
+        // Regression: Ctrl+Left/Right is the universal terminal convention for
+        // word navigation and must reach the input handler even when a
+        // Cmd+Left/Right binding (e.g. the macOS effort-cycle default) is
+        // configured for the same arrow. Multiplexers such as Herdr encode
+        // Ctrl+Left/Right as the standard xterm CSI `1;5D`/`1;5C` sequence,
+        // which crossterm reports as KeyModifiers::CONTROL, so the SUPER<->
+        // CONTROL fallback below must not treat it as Cmd+Left/Right.
+        let binding = parse_keybinding("cmd+left").expect("cmd+left parses");
+        assert!(!binding.matches_for_platform(KeyCode::Left, KeyModifiers::CONTROL, true));
+        assert!(binding.matches_for_platform(KeyCode::Left, KeyModifiers::SUPER, true));
+
+        let binding = parse_keybinding("cmd+right").expect("cmd+right parses");
+        assert!(!binding.matches_for_platform(KeyCode::Right, KeyModifiers::CONTROL, true));
+        assert!(binding.matches_for_platform(KeyCode::Right, KeyModifiers::SUPER, true));
     }
 
     #[test]
