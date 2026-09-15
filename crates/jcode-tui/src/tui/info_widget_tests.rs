@@ -2,10 +2,10 @@ use super::{
     BackgroundInfo, CacheHitInfo, CacheMissAttribution, GraphEdge, GraphNode, InfoWidgetData,
     Margins, MemoryActivity, MemoryEvent, MemoryEventKind, MemoryInfo, MemoryState, PipelineState,
     StepStatus, SwarmInfo, UsageInfo, UsageProvider, WidgetKind, calculate_placements,
-    calculate_widget_height, effective_prompt_tokens, occasional_status_tip,
-    render_kv_cache_widget, render_memory_compact, render_memory_widget, render_model_widget,
-    render_todos_compact, render_todos_expanded, render_todos_widget, render_usage_compact,
-    render_usage_widget, swarm_plan_todos, truncate_smart,
+    calculate_widget_height, current_swarm_plan_items, effective_prompt_tokens,
+    occasional_status_tip, render_kv_cache_widget, render_memory_compact, render_memory_widget,
+    render_model_widget, render_todos_compact, render_todos_expanded, render_todos_widget,
+    render_usage_compact, render_usage_widget, swarm_plan_todos, truncate_smart,
 };
 use crate::protocol::SwarmMemberStatus;
 use ratatui::layout::Rect;
@@ -575,6 +575,27 @@ fn swarm_plan_gate_items_render_like_normal_items() {
     let text = lines_text(&render_todos_expanded(&data, Rect::new(0, 0, 80, 14)));
     assert!(text.contains("Critique the work"), "{text}");
     assert!(text.contains("(blocked)"), "gate blocked on parent: {text}");
+}
+
+#[test]
+fn current_swarm_plan_items_excludes_terminal_history_but_keeps_prerequisites() {
+    let mut items: Vec<crate::plan::PlanItem> = (0..399)
+        .map(|i| plan_item(&format!("old-{i}"), "completed"))
+        .collect();
+    let mut prerequisite = plan_item("needed", "completed");
+    prerequisite.blocked_by.clear();
+    let mut active = plan_item("active", "queued");
+    active.blocked_by = vec!["needed".to_string()];
+    items.extend([prerequisite, active]);
+
+    let current = current_swarm_plan_items(&items);
+    assert_eq!(
+        current
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["needed", "active"]
+    );
 }
 
 #[test]

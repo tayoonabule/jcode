@@ -157,6 +157,19 @@ pub struct AmbientCycleResult {
     /// Full conversation transcript (markdown) for email notifications
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// Provider and model that actually ran the cycle.
+    ///
+    /// Recorded by the cycle itself so the transcript does not have to build a
+    /// second provider just to name one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<CycleRoute>,
+}
+
+/// The provider/model pair a cycle ran on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CycleRoute {
+    pub provider: String,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

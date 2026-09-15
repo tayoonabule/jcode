@@ -21,3 +21,9 @@ captures/
 /*.avif
 /*.mp4
 /*.png
+
+# Generated graph analysis artifacts (graphify)
+graphify-out/
+
+# Packaged skill bundles (build artifacts)
+dist/

@@ -1243,7 +1243,6 @@ mod cache_prefix_invariant_tests {
             tool_def("subagent"),
             tool_def("websearch"),
             tool_def("webfetch"),
-            tool_def("browser"),
             tool_def("codesearch"),
             tool_def("memory"),
         ];
@@ -1259,7 +1258,7 @@ mod cache_prefix_invariant_tests {
             );
         }
         // The previously-dropped custom tools are now forwarded.
-        for custom in ["websearch", "webfetch", "browser", "codesearch", "memory"] {
+        for custom in ["websearch", "webfetch", "codesearch", "memory"] {
             assert!(
                 names.contains(&custom),
                 "custom tool {custom} was dropped on OAuth; got {names:?}"

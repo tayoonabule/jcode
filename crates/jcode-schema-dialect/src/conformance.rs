@@ -129,6 +129,20 @@ fn walk(schema: &Value, spec: &DialectSpec, path: &str, errors: &mut Vec<Conform
                         message: format!("format `{format}` is not in dialect `{}`", spec.id),
                     });
                 }
+                if key == "pattern"
+                    && spec.transforms.re2_patterns_only
+                    && let Some(pattern) = value.as_str()
+                    && let Some(found) = crate::regex_dialect::unsupported_construct(pattern)
+                {
+                    errors.push(ConformanceError {
+                        path: path.to_string(),
+                        message: format!(
+                            "`pattern` uses {}, which dialect `{}` cannot compile",
+                            found.description(),
+                            spec.id
+                        ),
+                    });
+                }
                 if spec.transforms.flatten_all_combiners
                     && matches!(key.as_str(), "anyOf" | "oneOf" | "allOf")
                 {

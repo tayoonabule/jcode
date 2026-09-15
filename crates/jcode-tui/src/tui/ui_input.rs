@@ -260,7 +260,7 @@ fn command_suggestion_lines(
     // Highlight the characters of each command that the typed query matched.
     // We only highlight the command token itself (the part before the first
     // space), matched against the corresponding leading token of the input.
-    let needle = command_suggestion_needle(app.input());
+    let needle = command_suggestion_needle(app);
     let highlight = |cmd: &str, base: Style| -> Vec<Span<'static>> {
         highlight_command_spans(cmd, needle.as_deref(), base)
     };
@@ -320,12 +320,14 @@ fn command_suggestion_lines(
 
 /// Extract the slash-command portion of the typed input that should be matched
 /// against suggestion command tokens for highlighting purposes.
-fn command_suggestion_needle(input: &str) -> Option<String> {
-    let trimmed = input.trim_start();
-    if !trimmed.starts_with('/') {
-        return None;
+fn command_suggestion_needle(app: &dyn TuiState) -> Option<String> {
+    let input = app.input();
+    if let Some((start, end)) = crate::tui::app::App::slash_completion_span(input, app.cursor_pos())
+    {
+        return Some(input[start..end].to_string());
     }
-    Some(trimmed.to_string())
+    let trimmed = input.trim_start();
+    trimmed.starts_with('/').then(|| trimmed.to_string())
 }
 
 /// Build spans for a suggestion command, recoloring the characters that the

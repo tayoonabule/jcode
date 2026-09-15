@@ -285,6 +285,8 @@ fn remove_snapshot_files(swarm_id: &str) -> bool {
 }
 
 fn from_persisted_plan(mut plan: PersistedVersionedPlan, updated_at_unix_ms: u64) -> VersionedPlan {
+    let mut seen_ids = std::collections::HashSet::new();
+    plan.items.retain(|item| seen_ids.insert(item.id.clone()));
     for item in &mut plan.items {
         if item.status == "running" {
             item.status = "running_stale".to_string();

@@ -742,11 +742,10 @@ fn retrieval_candidates_include_local_skills() {
                 .collect()
         });
         let project_dir = home.join("project-with-skill");
-        fs::create_dir_all(project_dir.join(".jcode/skills/firefox-browser"))
-            .expect("create skills dir");
+        fs::create_dir_all(project_dir.join(".jcode/skills/aside")).expect("create skills dir");
         fs::write(
-                project_dir.join(".jcode/skills/firefox-browser/SKILL.md"),
-                "---\nname: firefox-browser\ndescription: Control Firefox browser sessions\nallowed-tools: bash, read, write\n---\n\nUse this skill to open sites and click buttons.",
+                project_dir.join(".jcode/skills/aside/SKILL.md"),
+                "---\nname: aside\ndescription: Use Aside for complete browser tasks\nallowed-tools: bash, read, write\n---\n\nGive Aside one complete browser task.",
             )
             .expect("write skill");
 
@@ -762,11 +761,7 @@ fn retrieval_candidates_include_local_skills() {
 
         std::env::set_current_dir(old_cwd).expect("restore current dir");
 
-        assert!(
-            candidates
-                .iter()
-                .any(|entry| entry.id == "skill:firefox-browser")
-        );
+        assert!(candidates.iter().any(|entry| entry.id == "skill:aside"));
         assert!(candidates.iter().any(|entry| {
             matches!(
                 entry.category,

@@ -120,7 +120,17 @@ fn stored_message_is_user_turn(msg: &super::StoredMessage) -> bool {
     matches!(msg.role, Role::User)
         && msg.display_role.is_none()
         && !is_auto_poke_user_message(msg)
+        // Tool results are stored with Role::User for provider compatibility,
+        // but they are not user prompts and must never consume a rewind number.
+        && !msg
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
         && stored_message_renders_visible_message(msg)
+}
+
+pub(crate) fn is_rewind_target_user_message(msg: &super::StoredMessage) -> bool {
+    stored_message_is_user_turn(msg)
 }
 
 fn compacted_history_render_window(

@@ -80,6 +80,23 @@ fn is_mcp_tool_name(name: &str) -> bool {
 use std::sync::{LazyLock, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 
+/// Render a path as a complete local `file://` URL for model- and user-facing
+/// output. Relative paths are resolved against the current directory and
+/// existing paths are canonicalized when possible.
+pub(crate) fn file_url(path: &std::path::Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let absolute = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+    url::Url::from_file_path(&absolute)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| absolute.to_string_lossy().into_owned())
+}
+
 pub(crate) use jcode_tool_core::intent_schema_property;
 pub use jcode_tool_core::{StdinInputRequest, Tool, ToolContext, ToolExecutionMode};
 pub use jcode_tool_types::{ToolImage, ToolOutput};

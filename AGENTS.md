@@ -20,6 +20,13 @@
   and integrate that contribution regardless of author status. Do not pull in
   unrelated branches or merge a PR without user authorization.
 
+- **Finish through `/jcode-update`** - After a task is complete and the user has
+  authorized integration, use the repository-local `.jcode/skills/jcode-update`
+  workflow to fetch the original `upstream`, rebase the completed branch, fast-
+  forward local `main`, install the resulting build, reload the shared daemon,
+  and safely prune only unreferenced old build versions. Do not force-push,
+  discard unrelated work, or merge while another agent's branch is active.
+
 ## Install Notes
 - `~/.local/bin/jcode` is the launcher symlink used from `PATH`.
 - `~/.jcode/builds/current/jcode` is the active local/source-build channel; self-dev builds and `scripts/install_release.sh` point the launcher here.

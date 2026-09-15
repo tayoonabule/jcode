@@ -21,6 +21,7 @@ fn test_ambient_state_lifecycle() {
         ended_at: chrono::Utc::now(),
         status: CycleStatus::Complete,
         conversation: None,
+        route: None,
     };
 
     state.record_cycle(&result);

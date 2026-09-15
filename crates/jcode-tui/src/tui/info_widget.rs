@@ -49,6 +49,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+pub(crate) use todos_render::current_swarm_plan_items;
 use unicode_width::UnicodeWidthStr;
 
 use git::{render_git_compact, render_git_widget};
