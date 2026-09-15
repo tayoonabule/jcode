@@ -1795,6 +1795,37 @@ fn test_handle_server_event_side_pane_images_populates_pane_live() {
 }
 
 #[test]
+fn test_remote_clear_discards_cached_side_pane_images() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.is_remote = true;
+    app.remote_session_id = Some("session_active".to_string());
+    app.remote_side_pane_images
+        .push(crate::session::RenderedImage {
+            media_type: "image/png".to_string(),
+            data: "stale-image".to_string(),
+            label: Some("old session".to_string()),
+            source: crate::session::RenderedImageSource::UserInput,
+            anchor: None,
+            history_message_index: None,
+        });
+
+    app.input = "/clear".to_string();
+    app.cursor_pos = app.input.len();
+    rt.block_on(app.handle_remote_key(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::empty(),
+        &mut remote,
+    ))
+    .expect("remote /clear should succeed");
+
+    assert!(app.remote_side_pane_images.is_empty());
+}
+
+#[test]
 fn test_native_generated_image_renders_inline_without_opening_side_panel() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();

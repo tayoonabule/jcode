@@ -17,6 +17,18 @@ fn test_default_system_prompt_no_claude_code_identity() {
 }
 
 #[test]
+fn test_default_system_prompt_prefers_native_integrations_to_browser_use() {
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("use a suitable native integration before a browser"),
+        "DEFAULT_SYSTEM_PROMPT should require native integrations before browser use"
+    );
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("State the fallback reason before browsing"),
+        "DEFAULT_SYSTEM_PROMPT should require an explicit browser fallback reason"
+    );
+}
+
+#[test]
 fn mermaid_prompt_module_follows_capability() {
     let (enabled, _) = build_system_prompt_split_with_capabilities(
         None,
@@ -596,6 +608,9 @@ fn swarm_effort_directive_is_appended_only_for_swarm_sentinel() {
     append_swarm_effort_directive(&mut split, Some("swarm"));
     assert!(split.dynamic_part.contains("# Swarm Effort"));
     assert!(split.dynamic_part.contains("swarm` tool"));
+    assert!(split.dynamic_part.contains("swarm task_graph"));
+    assert!(split.dynamic_part.contains("mode: \"deep\""));
+    assert!(split.dynamic_part.contains("plan_status"));
 
     // None / empty effort should not inject.
     let mut other = SplitSystemPrompt::default();

@@ -8,20 +8,35 @@ use unicode_segmentation::UnicodeSegmentation;
 
 static EMOJI_ENABLED: AtomicBool = AtomicBool::new(true);
 
+/// Terminal output is best effort. In headless runs and shell pipelines the
+/// consumer can exit while an agent is still rendering a result; the standard
+/// `print!`/`println!` macros panic on that broken pipe and mask the real tool
+/// error.
+pub fn write_stdout(text: &str) {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(text.as_bytes());
+}
+
+pub fn write_stderr(text: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(text.as_bytes());
+}
+
 #[macro_export]
 macro_rules! terminal_print {
     ($($arg:tt)*) => {{
         let message = ::std::format!($($arg)*);
-        ::std::print!("{}", $crate::output_style::terminal_text(&message));
+        $crate::output_style::write_stdout(&$crate::output_style::terminal_text(&message));
     }};
 }
 
 #[macro_export]
 macro_rules! terminal_println {
-    () => { ::std::println!() };
+    () => { $crate::output_style::write_stdout("\n") };
     ($($arg:tt)*) => {{
         let message = ::std::format!($($arg)*);
-        ::std::println!("{}", $crate::output_style::terminal_text(&message));
+        let rendered = $crate::output_style::terminal_text(&message);
+        $crate::output_style::write_stdout(&::std::format!("{}\n", rendered));
     }};
 }
 
@@ -29,16 +44,17 @@ macro_rules! terminal_println {
 macro_rules! terminal_eprint {
     ($($arg:tt)*) => {{
         let message = ::std::format!($($arg)*);
-        ::std::eprint!("{}", $crate::output_style::terminal_text(&message));
+        $crate::output_style::write_stderr(&$crate::output_style::terminal_text(&message));
     }};
 }
 
 #[macro_export]
 macro_rules! terminal_eprintln {
-    () => { ::std::eprintln!() };
+    () => { $crate::output_style::write_stderr("\n") };
     ($($arg:tt)*) => {{
         let message = ::std::format!($($arg)*);
-        ::std::eprintln!("{}", $crate::output_style::terminal_text(&message));
+        let rendered = $crate::output_style::terminal_text(&message);
+        $crate::output_style::write_stderr(&::std::format!("{}\n", rendered));
     }};
 }
 

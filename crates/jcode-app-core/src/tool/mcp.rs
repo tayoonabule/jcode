@@ -10,6 +10,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Render an error together with everything that caused it.
+///
+/// MCP connection failures are wrapped several layers deep, so the outermost
+/// message is a generic "Failed to connect to MCP server '<name>'" that hides
+/// the actionable cause. Joining the chain keeps the summary first while still
+/// reporting the specific failure.
+fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    for cause in error.chain().skip(1) {
+        let cause = cause.to_string();
+        // Contexts often repeat their child's text; do not print it twice.
+        if !parts.last().is_some_and(|last| last == &cause) {
+            parts.push(cause);
+        }
+    }
+    parts.join(": ")
+}
+
 #[derive(Debug, Deserialize)]
 struct McpSearchInput {
     #[serde(default)]
@@ -337,6 +355,11 @@ struct McpToolInput {
     args: Option<Vec<String>>,
     #[serde(default)]
     env: Option<HashMap<String, String>>,
+    /// URL of a remote (Streamable HTTP) MCP server.
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
 }
 
 pub struct McpManagementTool {
@@ -385,6 +408,15 @@ impl Tool for McpManagementTool {
                 "command": {
                     "type": "string",
                     "description": "Server command."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "URL of a remote MCP server (Streamable HTTP). Use instead of 'command'. Browser OAuth runs automatically if the server requires it."
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Extra HTTP headers for a remote server."
                 },
                 "args": {
                     "type": "array",
@@ -554,7 +586,21 @@ impl McpManagementTool {
         // back to the configured server of that name, which also lets disabled
         // configured servers be connected on demand, session-scoped, without
         // rewriting config (issue #436).
-        let config = if let Some(command) = params.command {
+        let config = if let Some(url) = params.url {
+            McpServerConfig {
+                command: String::new(),
+                args: Vec::new(),
+                env: Default::default(),
+                shared: true,
+                transport: Some("http".to_string()),
+                url: Some(url),
+                headers: params.headers.unwrap_or_default(),
+                oauth: None,
+                enabled: None,
+                disabled: None,
+                timeout_secs: None,
+            }
+        } else if let Some(command) = params.command {
             McpServerConfig {
                 command,
                 args: params.args.unwrap_or_default(),
@@ -563,17 +609,28 @@ impl McpManagementTool {
                 transport: None,
                 url: None,
                 headers: std::collections::HashMap::new(),
+                oauth: None,
                 enabled: None,
                 disabled: None,
                 timeout_secs: None,
             }
         } else {
             let manager = self.manager.read().await;
-            let configured = manager.config().servers.get(&server_name).cloned();
+            // Read the config from disk rather than the manager's in-memory
+            // snapshot. A long-lived session (or shared daemon) otherwise keeps
+            // serving the config as it looked at startup, so editing
+            // `~/.jcode/mcp.json` to fix a broken server has no effect until
+            // the whole process restarts.
+            let fresh = manager.load_fresh_config();
+            let configured = fresh
+                .servers
+                .get(&server_name)
+                .or_else(|| manager.config().servers.get(&server_name))
+                .cloned();
             drop(manager);
             configured.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "'command' is required for connect action ('{}' is not in the MCP config)",
+                    "'command' or 'url' is required for connect action ('{}' is not in the MCP config)",
                     server_name
                 )
             })?
@@ -657,19 +714,26 @@ impl McpManagementTool {
                     .with_metadata(json!({ "tool_references": references })))
             }
             Err(e) => {
+                // `{}` on an anyhow error prints only the outermost context,
+                // which for a failed connect is always the generic
+                // "Failed to connect to MCP server '<name>'". The actual cause
+                // (an OAuth registration rejection, a refused port, a bad URL)
+                // lives further down the chain and is what the user needs.
+                let detail = format_error_chain(&e);
                 crate::logging::event_warn(
                     "MCP_LIFECYCLE",
                     vec![
                         ("phase", "connect_failed".to_string()),
                         ("server", server_name.clone()),
                         ("session_id", session_id.to_string()),
-                        ("error", e.to_string()),
+                        ("error", detail.clone()),
                     ],
                 );
-                Ok(
-                    ToolOutput::new(format!("Failed to connect to '{}': {}", server_name, e))
-                        .with_title("MCP: Connection failed"),
-                )
+                Ok(ToolOutput::new(format!(
+                    "Failed to connect to '{}': {}",
+                    server_name, detail
+                ))
+                .with_title("MCP: Connection failed"))
             }
         }
     }
@@ -1006,6 +1070,7 @@ mod tests {
                 transport: None,
                 url: None,
                 headers: HashMap::new(),
+                oauth: None,
                 enabled: Some(false),
                 disabled: None,
                 timeout_secs: None,
@@ -1088,5 +1153,32 @@ mod tests {
                 || result.output.contains("Connected servers: 0")
                 || result.output.contains("Reloaded MCP config")
         );
+    }
+}
+
+#[cfg(test)]
+mod error_chain_tests {
+    use super::format_error_chain;
+    use anyhow::Context;
+
+    #[test]
+    fn reports_the_root_cause_not_just_the_outer_context() {
+        let error = Err::<(), _>(anyhow::anyhow!(
+            "Dynamic client registration rejected (403)"
+        ))
+        .context("MCP server 'Figma Desktop' failed to initialize")
+        .context("Failed to connect to MCP server 'Figma Desktop'")
+        .unwrap_err();
+        let rendered = format_error_chain(&error);
+        assert!(
+            rendered.contains("Dynamic client registration rejected (403)"),
+            "root cause missing from {rendered}"
+        );
+        assert!(rendered.starts_with("Failed to connect to MCP server 'Figma Desktop'"));
+    }
+
+    #[test]
+    fn a_bare_error_is_unchanged() {
+        assert_eq!(format_error_chain(&anyhow::anyhow!("boom")), "boom");
     }
 }

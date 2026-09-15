@@ -254,6 +254,17 @@ pub(crate) fn registered_command_names() -> impl Iterator<Item = &'static str> {
 }
 
 impl App {
+    const SKILL_SUGGESTION_HELP: &'static str =
+        "Insert skill reference, then add an optional prompt";
+
+    // Skill descriptions are owned by the registry, while autocomplete keeps
+    // static help text for the lifetime of the cached candidate list. Skills
+    // are few and descriptions are tiny, so leak the copied display string
+    // rather than widening every command-suggestion type just for this field.
+    fn skill_suggestion_help(skill: &crate::skill::Skill) -> &'static str {
+        Box::leak(skill.description.clone().into_boxed_str())
+    }
+
     /// Find word boundary going backward (for Ctrl+W, Alt+B)
     pub(super) fn find_word_boundary_back(&self) -> usize {
         if self.cursor_pos == 0 {
@@ -374,7 +385,7 @@ impl App {
             for skill in skills.list() {
                 let command = format!("/{}", skill.name);
                 if seen.insert(command.clone()) {
-                    commands.push((command, "Activate skill"));
+                    commands.push((command, App::skill_suggestion_help(skill)));
                 }
             }
         }
@@ -396,7 +407,7 @@ impl App {
             for skill in &self.remote_skills {
                 let command = format!("/{skill}");
                 if seen.insert(command.clone()) {
-                    commands.push((command, "Activate skill"));
+                    commands.push((command, App::SKILL_SUGGESTION_HELP));
                 }
             }
         }
@@ -404,6 +415,27 @@ impl App {
         *self.command_candidates_cache.borrow_mut() = Some(CommandCandidatesCache {
             candidates: commands.clone(),
         });
+        commands
+    }
+
+    fn skill_command_candidates(&self) -> Vec<(String, &'static str)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut commands = Vec::new();
+        let skills = self.current_skills_snapshot();
+        for skill in skills.list() {
+            let command = format!("/{}", skill.name);
+            if seen.insert(command.clone()) {
+                commands.push((command, Self::skill_suggestion_help(skill)));
+            }
+        }
+        if self.is_remote {
+            for skill in &self.remote_skills {
+                let command = format!("/{skill}");
+                if seen.insert(command.clone()) {
+                    commands.push((command, Self::SKILL_SUGGESTION_HELP));
+                }
+            }
+        }
         commands
     }
 
@@ -1234,6 +1266,47 @@ impl App {
         self.rank_suggestions(&prefix, self.command_candidates())
     }
 
+    /// Get suggestions for the slash token currently being edited. A slash
+    /// command at the start of the buffer keeps the existing whole-buffer
+    /// behavior; inline slash tokens are matched independently so prose can
+    /// precede a skill reference.
+    pub(super) fn get_suggestions_for_at(
+        &self,
+        input: &str,
+        cursor_pos: usize,
+    ) -> Vec<(String, &'static str)> {
+        let Some((start, end)) = Self::slash_completion_span(input, cursor_pos) else {
+            return self.get_suggestions_for(input);
+        };
+        if start == 0 && end == input.len() {
+            return self.get_suggestions_for(input);
+        }
+        self.rank_suggestions(
+            &input[start..end],
+            if start == 0 {
+                self.command_candidates()
+            } else {
+                self.skill_command_candidates()
+            },
+        )
+    }
+
+    /// Find the slash token under the cursor. The returned range ends at the
+    /// cursor so completion never rewrites the rest of the prompt.
+    pub(crate) fn slash_completion_span(input: &str, cursor_pos: usize) -> Option<(usize, usize)> {
+        let cursor_pos = cursor_pos.min(input.len());
+        if !input.is_char_boundary(cursor_pos) {
+            return None;
+        }
+        let start = input[..cursor_pos]
+            .char_indices()
+            .rev()
+            .find_map(|(index, ch)| ch.is_whitespace().then_some(index + ch.len_utf8()))
+            .unwrap_or(0);
+        (start < cursor_pos && input[start..cursor_pos].starts_with('/'))
+            .then_some((start, cursor_pos))
+    }
+
     /// Get command suggestions based on current input
     pub fn command_suggestions(&self) -> Vec<(String, &'static str)> {
         // Read up to eight times per frame; recomputing each time re-ranks
@@ -1246,6 +1319,7 @@ impl App {
             && cache.epoch == epoch
             && cache.signature == signature
             && cache.input == self.input
+            && cache.cursor_pos == self.cursor_pos
         {
             return cache.suggestions.clone();
         }
@@ -1253,6 +1327,7 @@ impl App {
         let suggestions = self.command_suggestions_uncached(&signature);
         *self.command_suggestions_cache.borrow_mut() = Some(CommandSuggestionsCache {
             input: self.input.clone(),
+            cursor_pos: self.cursor_pos,
             signature,
             epoch,
             suggestions: suggestions.clone(),
@@ -1322,7 +1397,7 @@ impl App {
                 return Vec::new();
             }
         }
-        self.get_suggestions_for(&self.input)
+        self.get_suggestions_for_at(&self.input, self.cursor_pos)
     }
 
     fn clamp_command_suggestion_selection(&mut self) -> Vec<(String, &'static str)> {
@@ -1393,9 +1468,12 @@ impl App {
             return false;
         }
 
+        let (replace_start, replace_end) =
+            Self::slash_completion_span(&self.input, self.cursor_pos)
+                .unwrap_or((0, self.input.len()));
         self.remember_input_undo_state();
-        self.input = cmd;
-        self.cursor_pos = self.input.len();
+        self.input.replace_range(replace_start..replace_end, &cmd);
+        self.cursor_pos = replace_start + cmd.len();
         self.tab_completion_state = None;
         self.command_suggestion_selected = 0;
         self.sync_model_picker_preview_from_input();
@@ -1600,21 +1678,36 @@ impl App {
         }
 
         // Get suggestions for current input
-        let current_suggestions = self.get_suggestions_for(&self.input);
+        let current_suggestions = self.get_suggestions_for_at(&self.input, self.cursor_pos);
+        let (replace_start, replace_end) =
+            Self::slash_completion_span(&self.input, self.cursor_pos)
+                .unwrap_or((0, self.input.len()));
+        let inline = replace_start > 0;
 
         // Check if we're continuing a tab cycle from a previous base
         if let Some((ref base, idx)) = self.tab_completion_state.clone() {
-            let base_suggestions = self.get_suggestions_for(base);
+            let base_suggestions = if inline {
+                current_suggestions.clone()
+            } else {
+                self.get_suggestions_for(base)
+            };
 
             // If current input is in base suggestions AND there are multiple options, continue cycling
+            let current_value = if inline {
+                self.input[replace_start..replace_end].to_string()
+            } else {
+                self.input.clone()
+            };
             if base_suggestions.len() > 1
-                && base_suggestions.iter().any(|(cmd, _)| cmd == &self.input)
+                && base_suggestions
+                    .iter()
+                    .any(|(cmd, _)| cmd == &current_value)
             {
                 let next_index = (idx + 1) % base_suggestions.len();
                 let (cmd, _) = &base_suggestions[next_index];
                 self.remember_input_undo_state();
-                self.input = cmd.clone();
-                self.cursor_pos = self.input.len();
+                self.input.replace_range(replace_start..replace_end, cmd);
+                self.cursor_pos = replace_start + cmd.len();
                 self.tab_completion_state = Some((base.clone(), next_index));
                 return true;
             }
@@ -1629,11 +1722,15 @@ impl App {
 
         // If only one suggestion and it matches exactly, add trailing space for commands
         // that accept arguments, then we're done
-        if current_suggestions.len() == 1 && current_suggestions[0].0 == self.input {
-            if !self.input.ends_with(' ') && Self::command_accepts_args(&self.input) {
+        if current_suggestions.len() == 1
+            && current_suggestions[0].0 == self.input[replace_start..replace_end]
+        {
+            if !self.input[replace_end..].starts_with(char::is_whitespace)
+                && self.command_accepts_args(&self.input[replace_start..replace_end])
+            {
                 self.remember_input_undo_state();
-                self.input.push(' ');
-                self.cursor_pos = self.input.len();
+                self.input.insert(replace_end, ' ');
+                self.cursor_pos = replace_end + 1;
                 return true;
             }
             self.tab_completion_state = None;
@@ -1647,12 +1744,20 @@ impl App {
         let (cmd, _) = &current_suggestions[selected];
         let base = self.input.clone();
         self.remember_input_undo_state();
-        self.input = cmd.clone();
+        self.input.replace_range(replace_start..replace_end, cmd);
         // If unique match, add trailing space for arg-accepting commands
-        if current_suggestions.len() == 1 && Self::command_accepts_args(&self.input) {
-            self.input.push(' ');
+        let mut added_space = false;
+        if current_suggestions.len() == 1 && self.command_accepts_args(cmd) {
+            let end = replace_start + cmd.len();
+            if !self.input[end..].starts_with(char::is_whitespace) {
+                self.input.insert(end, ' ');
+                added_space = true;
+            }
         }
-        self.cursor_pos = self.input.len();
+        self.cursor_pos = replace_start + cmd.len();
+        if added_space {
+            self.cursor_pos += 1;
+        }
         self.tab_completion_state = Some((base, selected));
         self.command_suggestion_selected = 0;
         true
@@ -1759,9 +1864,26 @@ impl App {
         }
     }
 
-    pub(super) fn command_accepts_args(cmd: &str) -> bool {
+    pub(super) fn command_accepts_args(&self, cmd: &str) -> bool {
+        let trimmed = cmd.trim();
+        if self
+            .current_skills_snapshot()
+            .get(trimmed.strip_prefix('/').unwrap_or_default())
+            .is_some()
+        {
+            return true;
+        }
+        if self.is_remote
+            && self
+                .remote_skills
+                .iter()
+                .any(|skill| format!("/{skill}") == trimmed)
+        {
+            return true;
+        }
+
         matches!(
-            cmd.trim(),
+            trimmed,
             "/help"
                 | "/?"
                 | "/btw"

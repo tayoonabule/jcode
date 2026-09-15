@@ -8,6 +8,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::ffi::OsString;
 
+#[test]
+fn file_url_resolves_relative_paths_to_absolute_urls() {
+    let url = file_url(std::path::Path::new("relative/file.txt"));
+    assert!(url.starts_with("file://"), "unexpected URL: {url}");
+    assert!(url.ends_with("/relative/file.txt"), "unexpected URL: {url}");
+}
+
 struct TestHomeGuard {
     previous: Option<OsString>,
 }

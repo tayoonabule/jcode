@@ -1701,6 +1701,44 @@ fn test_retrieve_pending_message_edits_queued_message() {
 }
 
 #[test]
+fn test_plain_up_retrieves_only_latest_queued_message_for_editing() {
+    let mut app = create_test_app();
+    app.queue_mode = true;
+    app.is_processing = true;
+    app.queued_messages = vec!["first queued".to_string(), "latest queued".to_string()];
+
+    app.handle_key(KeyCode::Up, KeyModifiers::empty()).unwrap();
+
+    assert_eq!(app.input(), "latest queued");
+    assert_eq!(app.queued_messages, vec!["first queued"]);
+    assert_eq!(
+        app.status_notice(),
+        Some(
+            "Retrieved latest queued message for editing (Ctrl/Alt/Cmd+Up edits all)".to_string(),
+        )
+    );
+}
+
+#[test]
+fn test_plain_up_editing_latest_message_preserves_earlier_queue_order() {
+    let mut app = create_test_app();
+    app.queue_mode = true;
+    app.is_processing = true;
+    app.queued_messages = vec!["first queued".to_string(), "latest queued".to_string()];
+
+    app.handle_key(KeyCode::Up, KeyModifiers::empty()).unwrap();
+    app.input.push_str(" revised");
+    app.cursor_pos = app.input.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty()).unwrap();
+
+    assert!(app.input().is_empty());
+    assert_eq!(
+        app.queued_messages,
+        vec!["first queued".to_string(), "latest queued revised".to_string()]
+    );
+}
+
+#[test]
 fn test_retrieve_pending_message_with_alt_and_super_up() {
     // Ctrl+Up, Alt(Option)+Up and Cmd(Super)+Up must all recall a queued message
     // so the gesture works regardless of which modifier the terminal forwards.

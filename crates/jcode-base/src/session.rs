@@ -798,6 +798,11 @@ impl Session {
             memory_profile_dirty: false,
         };
         session.reset_persist_state(false);
+        // Classify presence at creation, not at first save. A child or debug
+        // session that dies before it is ever persisted would otherwise keep
+        // an active-PID marker that nothing can classify, and presence UIs
+        // would show it forever as an unnamed entry.
+        session.sync_internal_presence_flag();
         session
     }
 
@@ -855,6 +860,11 @@ impl Session {
             memory_profile_dirty: false,
         };
         session.reset_persist_state(false);
+        // Classify presence at creation, not at first save. A child or debug
+        // session that dies before it is ever persisted would otherwise keep
+        // an active-PID marker that nothing can classify, and presence UIs
+        // would show it forever as an unnamed entry.
+        session.sync_internal_presence_flag();
         session
     }
 
@@ -1440,25 +1450,19 @@ request in this new forked session, using the inherited conversation only as con
         None
     }
 
-    /// Stored-message indices of the rewind targets shown in the TUI's
-    /// numbered `/rewind` list, in display order.
+    /// Stored-message indices of the user prompts shown in the TUI's numbered
+    /// `/rewind` list, in conversation order.
     ///
-    /// The TUI numbers user/assistant *transcript entries* (what the user
-    /// actually sees), not raw stored messages. Stored tool-result messages
-    /// and tool-call-only assistant messages render as tool cards or nothing,
-    /// so counting raw stored messages diverges wildly from the on-screen
-    /// numbering in tool-heavy sessions (issue #432). Deriving targets from
-    /// the same rendering used for the transcript keeps `/rewind N` aligned
-    /// with the numbers `/rewind` prints.
-    ///
-    /// A single stored message can produce multiple transcript entries (text
-    /// split around a tool result); each entry keeps its own number and maps
-    /// to the same stored index so numbering matches the visible list exactly.
+    /// Assistant replies, tool-result messages, synthetic continuations, and
+    /// internal reminders do not consume a number. This deliberately walks the
+    /// authoritative stored transcript rather than the compacted render window,
+    /// so prompts hidden behind compaction remain rewindable.
     pub fn rewind_target_stored_indices(&self) -> Vec<usize> {
-        render_messages(self)
-            .into_iter()
-            .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
-            .filter_map(|message| message.stored_index)
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| render::is_rewind_target_user_message(message))
+            .map(|(stored_index, _)| stored_index)
             .collect()
     }
 

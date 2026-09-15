@@ -1,5 +1,45 @@
 use super::*;
 
+/// Return the actionable portion of a swarm plan for the todo surface.
+///
+/// The authoritative plan is a durable DAG and intentionally retains terminal
+/// nodes for graph/history purposes. The todo widget is not a history view,
+/// though, so counting every completed node makes an old plan grow into values
+/// such as `11/400`. Keep unfinished nodes plus completed prerequisites needed
+/// to explain the current frontier.
+pub(crate) fn current_swarm_plan_items(
+    items: &[crate::plan::PlanItem],
+) -> Vec<crate::plan::PlanItem> {
+    let mut needed: std::collections::HashSet<String> = items
+        .iter()
+        .filter(|item| !matches!(item.status.as_str(), "completed" | "done"))
+        .map(|item| item.id.clone())
+        .collect();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let dependencies: Vec<String> = items
+            .iter()
+            .filter(|item| needed.contains(&item.id))
+            .flat_map(|item| item.blocked_by.iter().cloned())
+            .collect();
+        for dependency in dependencies {
+            if needed.insert(dependency) {
+                changed = true;
+            }
+        }
+    }
+
+    items
+        .iter()
+        .filter(|item| {
+            !matches!(item.status.as_str(), "completed" | "done") || needed.contains(&item.id)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Below this many todos we always render an exact 1:1 pip per todo,
 /// even if the panel is a bit narrow, so small lists are never normalized.
 const EXACT_PIP_FLOOR: usize = 12;

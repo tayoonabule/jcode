@@ -32,7 +32,7 @@ pub fn spawn_background_session_rebuild(session_id: String) {
 
 fn pull_latest_changes_for_rebuild(repo_dir: &Path) {
     eprintln!("Pulling latest changes...");
-    if let Err(e) = update::run_git_pull_ff_only(repo_dir, true) {
+    if let Err(e) = update::update_source_checkout(repo_dir, true) {
         eprintln!("Warning: {}. Continuing with current version.", e);
     }
 }
@@ -156,7 +156,7 @@ impl BackgroundRebuildPublisher {
 
 fn background_pull_latest_changes(publisher: &BackgroundRebuildPublisher, repo_dir: &Path) {
     publisher.status("Pulling latest changes in the background...");
-    if let Err(error) = update::run_git_pull_ff_only(repo_dir, true) {
+    if let Err(error) = update::update_source_checkout(repo_dir, true) {
         publisher.status(format!(
             "Git pull skipped: {}. Continuing with the current checkout.",
             error

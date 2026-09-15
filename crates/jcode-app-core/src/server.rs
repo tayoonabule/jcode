@@ -145,6 +145,9 @@ const SERVER_NAME_ENV: &str = "JCODE_SERVER_NAME";
 const SERVER_DISPLAY_NAME_ENV: &str = "JCODE_SERVER_DISPLAY_NAME";
 const MAX_CONFIGURED_SERVER_NAME_LEN: usize = 64;
 const SWARM_TERMINAL_MEMBER_GC_BATCH_SIZE: usize = 64;
+/// How long an active-PID marker may exist without a persisted session before
+/// the reaper treats it as debris. Comfortably longer than session startup.
+const ORPHAN_ACTIVE_PID_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(120);
 
 async fn prune_expired_terminal_swarm_members(
     sessions: &SessionAgents,
@@ -1413,6 +1416,21 @@ impl Server {
                     &gc_soft_interrupt_queues,
                 )
                 .await;
+                // Drop active-PID markers left by sessions that were
+                // registered but never persisted. They share the long-lived
+                // server PID, so liveness never retires them and presence UIs
+                // would list them forever as unnamed entries.
+                let removed = crate::storage::prune_orphan_active_pids(
+                    ORPHAN_ACTIVE_PID_MIN_AGE,
+                    |session_id| {
+                        crate::session::session_path(session_id).is_ok_and(|path| path.exists())
+                    },
+                );
+                if removed > 0 {
+                    crate::logging::info(&format!(
+                        "Presence: pruned {removed} orphaned active-pid marker(s)"
+                    ));
+                }
             }
         });
 

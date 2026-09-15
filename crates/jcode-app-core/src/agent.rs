@@ -368,6 +368,29 @@ pub struct Agent {
     concurrency_session: Option<crate::telemetry::ConcurrencySession>,
 }
 
+/// Build the durable session state that must survive transcript compaction.
+///
+/// Returned as a callback so the todo, goal and plan files are read only when
+/// a compaction task actually starts rather than on every turn.
+pub fn durable_state_context_builder(
+    session_id: String,
+) -> jcode_base::compaction::DurableStateContextFn {
+    std::sync::Arc::new(move || {
+        let todos = crate::todo::load_todos(&session_id).ok()?;
+        let goals = crate::todo::load_goals(&session_id).unwrap_or_default();
+        let plan = crate::todo::load_plan(&session_id).unwrap_or_default();
+        if todos.is_empty() && goals.is_empty() && plan == crate::todo::TodoPlan::default() {
+            return None;
+        }
+        serde_json::to_string_pretty(&serde_json::json!({
+            "todos": todos,
+            "goals": goals,
+            "plan": plan,
+        }))
+        .ok()
+    })
+}
+
 impl Agent {
     fn refresh_agents_md_snapshot(&mut self) {
         let working_dir = self
@@ -866,6 +889,9 @@ impl Agent {
             let compaction = self.registry.compaction();
             match compaction.try_write() {
                 Ok(mut manager) => {
+                    manager.set_durable_state_context(Some(
+                        crate::agent::durable_state_context_builder(self.session.id.clone()),
+                    ));
                     let discarded_oversized_native =
                         manager.discard_oversized_openai_native_compaction();
                     let messages = {
@@ -936,6 +962,9 @@ impl Agent {
         (messages, None)
     }
 
+    /// Todo state is persisted outside the transcript. Include a fresh,
+    /// model-readable snapshot in compaction so summarization cannot forget
+    /// work whose original tool call has already fallen out of the prefix.
     fn record_client_cache_request(&mut self, messages: &[Message]) {
         if !self.should_track_client_cache() {
             return;
@@ -1132,8 +1161,11 @@ impl Agent {
     }
 
     /// Fire a session lifecycle observer hook (`session_start`/`session_end`).
-    /// No-op when the hook is not configured.
+    /// Herdr session identity is reported independently of user hook config.
     pub(crate) fn fire_session_lifecycle_hook(&self, event_name: &'static str, source: &str) {
+        if event_name == "session_start" {
+            crate::hooks::dispatch_herdr_session_identity(&self.session.id, source);
+        }
         if !crate::hooks::hook_configured(event_name) {
             return;
         }

@@ -36,6 +36,22 @@ fn plan_cycle_error(items: &[PlanItem]) -> Option<String> {
     ))
 }
 
+/// Merge an approved proposal into the shared plan without retaining duplicate
+/// task ids. Proposals are retried across agent turns and may contain a task
+/// that was already accepted, so treating approval as a blind append turns a
+/// small plan into hundreds of repeated todo rows over time.
+fn merge_unique_plan_items(existing: &[PlanItem], incoming: &[PlanItem]) -> Vec<PlanItem> {
+    let mut merged = existing.to_vec();
+    let mut ids: std::collections::HashSet<String> =
+        merged.iter().map(|item| item.id.clone()).collect();
+    for item in incoming {
+        if ids.insert(item.id.clone()) {
+            merged.push(item.clone());
+        }
+    }
+    merged
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "plan proposal updates sessions, swarm coordination, shared context, interrupts, and event history"
@@ -389,13 +405,14 @@ pub(super) async fn handle_comm_approve_plan(
     };
 
     if let Ok(items) = serde_json::from_str::<Vec<PlanItem>>(&proposal) {
-        let existing_count = swarm_plans
+        let existing_items = swarm_plans
             .read()
             .await
             .get(&swarm_id)
-            .map(|plan| plan.items.len())
+            .map(|plan| plan.items.clone())
             .unwrap_or_default();
-        let merged_count = existing_count.saturating_add(items.len());
+        let merged_items = merge_unique_plan_items(&existing_items, &items);
+        let merged_count = merged_items.len();
         if merged_count > jcode_plan::MAX_PLAN_ITEMS {
             finish_request(
                 swarm_mutation_runtime,
@@ -415,15 +432,7 @@ pub(super) async fn handle_comm_approve_plan(
         // dependency cycles before committing. A cycle here permanently wedges
         // every task that depends on it, so reject the approval and keep the
         // proposal pending for the proposer to fix and re-propose.
-        let merged_cycle_error = {
-            let plans = swarm_plans.read().await;
-            let mut merged: Vec<PlanItem> = plans
-                .get(&swarm_id)
-                .map(|plan| plan.items.clone())
-                .unwrap_or_default();
-            merged.extend(items.iter().cloned());
-            plan_cycle_error(&merged)
-        };
+        let merged_cycle_error = { plan_cycle_error(&merged_items) };
         if let Some(message) = merged_cycle_error {
             finish_request(
                 swarm_mutation_runtime,
@@ -442,7 +451,7 @@ pub(super) async fn handle_comm_approve_plan(
             let plan = plans
                 .entry(swarm_id.clone())
                 .or_insert_with(VersionedPlan::new);
-            plan.items.extend(items.clone());
+            plan.items = merge_unique_plan_items(&plan.items, &items);
             plan.version += 1;
             plan.participants.insert(req_session_id.clone());
             plan.participants.insert(proposer_session.clone());

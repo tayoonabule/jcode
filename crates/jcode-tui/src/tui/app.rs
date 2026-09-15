@@ -724,6 +724,9 @@ struct CommandCandidatesCache {
 struct CommandSuggestionsCache {
     /// Exact (untrimmed) input buffer the suggestions were computed from.
     input: String,
+    /// Cursor position, because inline slash completion depends on the token
+    /// under the cursor rather than only on the full input buffer.
+    cursor_pos: usize,
     /// Guard state that changes the answer independently of `input`, so a
     /// stale entry can never outlive a prompt/picker transition.
     signature: CommandSuggestionsSignature,

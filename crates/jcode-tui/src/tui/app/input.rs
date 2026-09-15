@@ -1066,6 +1066,18 @@ pub(super) fn handle_text_input(app: &mut App, text: &str) -> bool {
         return false;
     }
 
+    // Skill installs can happen while a TUI session is open. Refresh when a
+    // slash token begins at a word boundary so newly installed skills are
+    // available to the palette without requiring `/skills` first.
+    let at_word_boundary = app.cursor_pos == 0
+        || app.input[..app.cursor_pos.min(app.input.len())]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace);
+    if at_word_boundary && text.starts_with('/') {
+        app.refresh_skills_snapshot();
+    }
+
     let onboarding_suggestions = matches!(
         app.onboarding_phase(),
         Some(crate::tui::app::onboarding_flow::OnboardingPhase::Suggestions)
@@ -1426,6 +1438,41 @@ pub(super) fn retrieve_pending_message_for_edit(app: &mut App) -> bool {
     had_pending
 }
 
+/// Retrieve only the newest visible queued message for editing. This is the
+/// plain-Up behavior; modified Up keeps the existing all-pending recall path.
+pub(super) fn retrieve_latest_pending_message_for_edit(app: &mut App) -> bool {
+    if !app.input.is_empty() {
+        return false;
+    }
+
+    let message = if let Some(message) = app.queued_messages.pop() {
+        Some(message)
+    } else if let Some(message) = app.interleave_message.take() {
+        if !message.is_empty() {
+            app.pending_images.append(&mut app.interleave_images);
+            Some(message)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let Some(message) = message else {
+        return false;
+    };
+
+    if !app.has_queued_followups() {
+        app.pending_queued_dispatch = false;
+    }
+    app.input = message;
+    app.cursor_pos = app.input.len();
+    app.set_status_notice(
+        "Retrieved latest queued message for editing (Ctrl/Alt/Cmd+Up edits all)",
+    );
+    true
+}
+
 pub(super) fn send_action(app: &App, alternate_shortcut: bool) -> SendAction {
     if !app.is_processing {
         return SendAction::Submit;
@@ -1779,9 +1826,18 @@ impl App {
             // it stays armed so the next batch of work is covered too; only an
             // explicit /poke off (or a circuit breaker above) disarms it.
             self.auto_poke_incomplete_todos = self.auto_poke_default_on;
-            // A finished cycle re-arms the review for whatever work comes next;
-            // without this a session could only ever deliver one digest.
-            self.todo_gate_digest_delivered = false;
+            // A review turn may have recorded fresh weak-point observations
+            // while the digest latch was set. Consume those observations before
+            // rearming the next cycle, or the same review can replay forever.
+            // If cleanup fails, keep the latch set rather than rearming against
+            // stale observations on the next turn.
+            if crate::todo::clear_gate_observations(&todo_session_id).is_ok() {
+                self.todo_gate_digest_delivered = false;
+            } else {
+                crate::logging::warn(
+                    "TODO_GATE_DIGEST action=retain_latch reason=clear_observations_failed",
+                );
+            }
             self.todo_completion_gate_attempts = 0;
             if !self.todo_final_response_requested {
                 self.todo_final_response_requested = true;
@@ -3134,6 +3190,14 @@ impl App {
             return Ok(());
         }
 
+        if code == KeyCode::Up
+            && modifiers.is_empty()
+            && self.input.is_empty()
+            && retrieve_latest_pending_message_for_edit(self)
+        {
+            return Ok(());
+        }
+
         if code == KeyCode::Down && is_prompt_recall_modifier(modifiers) {
             handle_prompt_history_navigation(self, KeyCode::Down, KeyModifiers::CONTROL);
             return Ok(());
@@ -3437,6 +3501,10 @@ impl App {
     /// Returns true if pending soft interrupts were retrieved (caller should cancel on server).
     pub(super) fn retrieve_pending_message_for_edit(&mut self) -> bool {
         retrieve_pending_message_for_edit(self)
+    }
+
+    pub(super) fn retrieve_latest_pending_message_for_edit(&mut self) -> bool {
+        retrieve_latest_pending_message_for_edit(self)
     }
 
     pub(super) fn send_action(&self, shift: bool) -> SendAction {

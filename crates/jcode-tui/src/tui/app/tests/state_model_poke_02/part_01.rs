@@ -994,6 +994,150 @@ fn test_top_level_command_suggestions_include_project_local_skills() {
 }
 
 #[test]
+fn test_skill_autocomplete_adds_space_for_followup_prompt() {
+    let mut app = create_test_app();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let skill_dir = temp
+        .path()
+        .join(".jcode")
+        .join("skills")
+        .join("prompt-skill");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: prompt-skill\ndescription: Prompt skill\n---\n# Prompt skill\n",
+    )
+    .expect("write SKILL.md");
+    app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
+    app.refresh_skills_snapshot();
+    app.input = "/prompt-s".to_string();
+    app.cursor_pos = app.input.len();
+
+    assert!(app.autocomplete());
+    assert_eq!(app.input(), "/prompt-skill ");
+}
+
+#[test]
+fn test_skill_autocomplete_shows_skill_description() {
+    let mut app = create_test_app();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let skill_dir = temp
+        .path()
+        .join(".jcode")
+        .join("skills")
+        .join("prompt-skill");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: prompt-skill\ndescription: Gather focused project context\n---\n# Prompt skill\n",
+    )
+    .expect("write SKILL.md");
+    app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
+    app.refresh_skills_snapshot();
+
+    let suggestions = app.get_suggestions_for("/prompt-s");
+
+    assert_eq!(
+        suggestions
+            .iter()
+            .find(|(command, _)| command == "/prompt-skill")
+            .map(|(_, help)| *help),
+        Some("Gather focused project context")
+    );
+}
+
+#[test]
+fn test_remote_skill_autocomplete_adds_space_for_followup_prompt() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_skills = vec!["remote-skill".to_string()];
+    app.input = "/remote-sk".to_string();
+    app.cursor_pos = app.input.len();
+
+    assert!(app.autocomplete());
+    assert_eq!(app.input(), "/remote-skill ");
+}
+
+#[test]
+fn test_skill_autocomplete_works_mid_prompt_without_rewriting_surrounding_text() {
+    let mut app = create_test_app();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let skill_dir = temp
+        .path()
+        .join(".jcode")
+        .join("skills")
+        .join("prompt-skill");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: prompt-skill\ndescription: Prompt skill\n---\n# Prompt skill\n",
+    )
+    .expect("write SKILL.md");
+    app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
+    app.refresh_skills_snapshot();
+    app.input = "Use /prompt-s then continue".to_string();
+    app.cursor_pos = "Use /prompt-s".len();
+
+    let suggestions = app.command_suggestions();
+    assert!(suggestions.iter().any(|(cmd, _)| cmd == "/prompt-skill"));
+    assert!(!suggestions.iter().any(|(cmd, _)| cmd == "/support"));
+
+    assert!(app.autocomplete());
+    assert_eq!(app.input(), "Use /prompt-skill then continue");
+    assert_eq!(app.cursor_pos(), "Use /prompt-skill".len());
+}
+
+#[test]
+fn test_skill_autocomplete_at_prompt_start_preserves_suffix_text() {
+    let mut app = create_test_app();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let skill_dir = temp
+        .path()
+        .join(".jcode")
+        .join("skills")
+        .join("prompt-skill");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: prompt-skill\ndescription: Prompt skill\n---\n# Prompt skill\n",
+    )
+    .expect("write SKILL.md");
+    app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
+    app.refresh_skills_snapshot();
+    app.input = "/prompt-s then continue".to_string();
+    app.cursor_pos = "/prompt-s".len();
+
+    assert!(app.autocomplete());
+    assert_eq!(app.input(), "/prompt-skill then continue");
+    assert_eq!(app.cursor_pos(), "/prompt-skill".len());
+}
+
+#[test]
+fn test_inline_skill_autocomplete_cycles_on_repeated_tab() {
+    let mut app = create_test_app();
+    let temp = tempfile::tempdir().expect("tempdir");
+    for name in ["prompt-skill", "prompt-style"] {
+        let skill_dir = temp.path().join(".jcode").join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Test skill\n---\n# Test\n"),
+        )
+        .expect("write SKILL.md");
+    }
+    app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
+    app.refresh_skills_snapshot();
+    app.input = "Use /prompt-s".to_string();
+    app.cursor_pos = app.input.len();
+
+    assert!(app.autocomplete());
+    let first = app.input().to_string();
+    assert!(first == "Use /prompt-skill" || first == "Use /prompt-style");
+    assert!(app.autocomplete());
+    assert_ne!(app.input(), first);
+}
+
+#[test]
 fn test_top_level_command_suggestions_include_catchup_and_back() {
     let app = create_test_app();
 

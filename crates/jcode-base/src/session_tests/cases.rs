@@ -2593,8 +2593,8 @@ fn test_rewind_targets_match_rendered_transcript_numbering() {
         }],
     );
 
-    // The numbered /rewind list shows user/assistant transcript entries only:
-    // 1 prompt-1, 2 answer-1, 3 prompt-2, 4 answer-2.
+    // The numbered /rewind list shows user prompts only:
+    // 1 prompt-1, 2 prompt-2. Assistant replies and tool results do not count.
     let rendered_targets: Vec<String> = render_messages(&session)
         .into_iter()
         .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
@@ -2606,14 +2606,14 @@ fn test_rewind_targets_match_rendered_transcript_numbering() {
     );
 
     let targets = session.rewind_target_stored_indices();
-    assert_eq!(session.rewind_target_count(), 4);
-    assert_eq!(targets.len(), 4);
+    assert_eq!(session.rewind_target_count(), 2);
+    assert_eq!(targets.len(), 2);
 
-    // Rewinding to entry 3 ("prompt-2") must keep everything through the
+    // Rewinding to prompt 2 ("prompt-2") must keep everything through the
     // stored prompt-2 message (stored index 4 → len 5) and drop answer-2.
-    assert_eq!(targets[2], 4);
+    assert_eq!(targets[1], 4);
     let mut rewound = session.clone();
-    rewound.truncate_messages(targets[2] + 1);
+    rewound.truncate_messages(targets[1] + 1);
     let remaining: Vec<String> = render_messages(&rewound)
         .into_iter()
         .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
@@ -2621,8 +2621,8 @@ fn test_rewind_targets_match_rendered_transcript_numbering() {
         .collect();
     assert_eq!(remaining, ["prompt-1", "answer-1", "prompt-2"]);
 
-    // The old stored-message mapping counted the tool result as target 3,
-    // which would have chopped the transcript mid-turn (the #432 bug).
+    // The old mapping counted both assistant replies and the tool result,
+    // which would have chopped the transcript at the wrong prompt.
     assert_eq!(
         session.stored_len_for_visible_conversation_message(3),
         Some(3),
@@ -2674,11 +2674,13 @@ fn test_rewind_after_undo_uses_the_new_target_not_the_previous_one() {
     assert_eq!(full.len(), 12);
     let before_rewind = session.messages.clone();
 
-    // First rewind: to entry 4 ("answer-2").
+    // First rewind: to prompt 4 ("prompt-4"). Rewind keeps the selected
+    // prompt and removes everything after it, including its old answer.
     let targets = session.rewind_target_stored_indices();
+    assert_eq!(targets.len(), 6);
     session.truncate_messages(targets[4 - 1] + 1);
-    assert_eq!(numbered(&session).len(), 4);
-    assert_eq!(numbered(&session).last().unwrap(), "answer-2");
+    assert_eq!(numbered(&session).len(), 7);
+    assert_eq!(numbered(&session).last().unwrap(), "prompt-4");
 
     // Undo restores the full transcript, exactly as `Agent::undo_rewind` does.
     session.replace_messages(before_rewind);
@@ -2689,23 +2691,70 @@ fn test_rewind_after_undo_uses_the_new_target_not_the_previous_one() {
     );
 
     // Second rewind to a *different, larger* N. The bug report says this lands
-    // back on the first rewind's target; it must honour 11.
+    // back on the first rewind's target; it must honour 6.
     let targets = session.rewind_target_stored_indices();
     assert_eq!(
         targets.len(),
-        12,
+        6,
         "targets must be recomputed against the restored transcript"
     );
-    session.truncate_messages(targets[11 - 1] + 1);
+    session.truncate_messages(targets[6 - 1] + 1);
 
     let after = numbered(&session);
     assert_eq!(
         after.len(),
         11,
-        "rewind 11 must keep 11 entries, not fall back to the earlier target of 4"
+        "rewind 6 must keep the sixth prompt and remove everything after it"
     );
     assert_eq!(after.last().unwrap(), "prompt-6");
-    assert_eq!(session.rewind_target_count(), 11);
+    assert_eq!(session.rewind_target_count(), 6);
+}
+
+#[test]
+fn test_rewind_targets_include_prompts_hidden_by_compaction() {
+    let mut session = Session::create_with_id(
+        "session_rewind_compaction_test".to_string(),
+        None,
+        Some("rewind compaction".to_string()),
+    );
+    for turn in 1..=50 {
+        session.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("prompt-{turn}"),
+                cache_control: None,
+            }],
+        );
+        session.add_message(
+            Role::Assistant,
+            vec![ContentBlock::Text {
+                text: format!("answer-{turn}"),
+                cache_control: None,
+            }],
+        );
+    }
+    session.compaction = Some(StoredCompactionState {
+        summary_text: "summary".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 48,
+        original_turn_count: 50,
+        compacted_count: 80,
+    });
+
+    let (_, _, info) = render_messages_and_images_with_compacted_history(&session, 2);
+    assert!(info.is_some_and(|info| info.remaining_messages > 0));
+
+    // The lazy transcript only renders a suffix, but rewind still addresses the
+    // complete stored prompt history and does not count assistant replies.
+    let targets = session.rewind_target_stored_indices();
+    assert_eq!(targets.len(), 50);
+    assert_eq!(targets[1], 2);
+    assert_eq!(targets[8], 16);
+
+    let mut rewound = session.clone();
+    rewound.truncate_messages(targets[8] + 1);
+    assert_eq!(rewound.rewind_target_count(), 9);
+    assert_eq!(rewound.messages.len(), 17);
 }
 
 #[test]

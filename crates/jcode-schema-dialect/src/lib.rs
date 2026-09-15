@@ -33,6 +33,7 @@ pub mod conformance;
 pub mod dialect;
 pub mod keyword;
 pub mod quirks;
+pub mod regex_dialect;
 pub mod registry;
 pub mod rejection;
 
@@ -42,6 +43,7 @@ pub use conformance::{
 };
 pub use dialect::{DialectSpec, DialectTransforms, LearnedQuirks};
 pub use keyword::{KeywordRole, keyword_role};
+pub use regex_dialect::{UnsupportedRegex, unsupported_construct};
 pub use rejection::{SchemaRejection, classify, is_schema_error};
 
 use serde_json::Value;
@@ -97,6 +99,17 @@ pub fn recover_from_error(message: &str, spec: &DialectSpec) -> RecoveryAction {
 
     let mut learned_something = false;
     let mut described = Vec::new();
+
+    // A `pattern` the provider's regex engine could not compile. Prevention
+    // (`re2_patterns_only`) already drops the constructs jcode knows about, so
+    // reaching here means the engine rejected one it does not. Falling back to
+    // dropping `pattern` wholesale for this dialect is safe -- it is advisory,
+    // and the tool still validates the real argument -- and it is the only
+    // response that reliably unbricks the provider without a release.
+    if rejection.unsupported_regex && quirks::record_keyword(spec.id, "pattern") {
+        learned_something = true;
+        described.push("a `pattern` regex its engine cannot compile".to_string());
+    }
 
     // Learn every keyword the response named, not just the first. A Gemini 400
     // reports one `fieldViolations` entry per bad keyword, so learning them one
@@ -490,6 +503,85 @@ mod tests {
             RecoveryAction::Unrecoverable { hint } => assert!(hint.contains("required"), "{hint}"),
             other => panic!("required must never be silently dropped, got {other:?}"),
         }
+    }
+
+    /// The Dokploy report: a zod `.email()` pattern took the whole OpenAI
+    /// provider offline, because OpenAI compiles `pattern` with RE2 and RE2 has
+    /// no lookaround. The keyword allow-list could not prevent it (OpenAI
+    /// *does* accept `pattern`) and the classifier could not recover from it,
+    /// so every request 400d until the MCP server was disconnected.
+    #[test]
+    fn issue_dokploy_lookaround_pattern_is_stripped_for_openai() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "bitbucketEmail": {
+                    "type": "string",
+                    "format": "email",
+                    "description": "Bitbucket account email",
+                    "pattern": r#"^(?!\.)(?!.*\.\.)([A-Za-z0-9_'+\-\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$"#
+                },
+                "name": { "type": "string", "pattern": "^[a-zA-Z0-9._-]+$" }
+            },
+            "required": ["bitbucketEmail"]
+        });
+
+        let out = dialect::apply(&schema, &registry::OPENAI);
+
+        // The uncompilable pattern is gone...
+        assert!(
+            out["properties"]["bitbucketEmail"].get("pattern").is_none(),
+            "the lookaround pattern must not be sent: {out}"
+        );
+        // ...but the property, its type, its format and its description are
+        // not collateral damage.
+        assert_eq!(out["properties"]["bitbucketEmail"]["type"], "string");
+        assert_eq!(out["properties"]["bitbucketEmail"]["format"], "email");
+        assert_eq!(
+            out["properties"]["bitbucketEmail"]["description"],
+            "Bitbucket account email"
+        );
+        assert_eq!(out["required"], json!(["bitbucketEmail"]));
+        // A pattern RE2 *can* compile is untouched, so the fix does not just
+        // delete every constraint.
+        assert_eq!(out["properties"]["name"]["pattern"], "^[a-zA-Z0-9._-]+$");
+
+        // And the result is actually sendable.
+        assert!(
+            conformance::must_not_contain_unsupported_constructs(&out, &registry::OPENAI)
+                .is_empty()
+        );
+    }
+
+    /// Recovery half: if the detector ever misses a construct, the live
+    /// rejection must still be understood, or the provider stays bricked until
+    /// a release.
+    #[test]
+    fn a_live_lookaround_rejection_is_learned() {
+        let _dir = isolate_quirks("regex-recovery");
+        let message = "invalid_request_error (invalid_json_schema): Invalid JSON schema: regex lookaround is not supported. Found at $.properties.bitbucketEmail.pattern.";
+
+        let rejection = rejection::classify(message).expect("must be recognized as a schema error");
+        assert!(rejection.unsupported_regex);
+        assert!(rejection.is_actionable());
+
+        match recover_from_error(message, &registry::OPENAI) {
+            RecoveryAction::RetryWithoutConstruct { description } => {
+                assert!(description.contains("pattern"), "{description}");
+            }
+            other => panic!("a lookaround rejection must be recoverable, got {other:?}"),
+        }
+
+        // Having learned it, `pattern` is dropped wholesale for this dialect,
+        // so the next request cannot repeat the failure.
+        let schema = json!({
+            "type": "object",
+            "properties": { "name": { "type": "string", "pattern": "^[a-z]+$" } }
+        });
+        assert!(!rejection::schema_contains_keyword(
+            &normalize(&schema, &registry::OPENAI),
+            "pattern"
+        ));
     }
 
     #[test]

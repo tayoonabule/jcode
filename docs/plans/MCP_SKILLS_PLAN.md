@@ -80,7 +80,7 @@ impl Registry {
 - `mcp_reload` - Reload all MCP servers
 
 **Flow:**
-1. Agent calls `mcp_connect {"name": "playwright", "command": "npx", "args": ["-y", "@anthropic/mcp-server-playwright"]}`
+1. Agent calls `mcp_connect` for a configured non-browser MCP server
 2. jcode spawns the process, does MCP handshake
 3. Tools from server are added to registry
 4. Agent can immediately use the new tools

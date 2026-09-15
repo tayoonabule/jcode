@@ -333,6 +333,9 @@ impl App {
         let compaction = self.registry.compaction();
         match compaction.try_write() {
             Ok(mut manager) => {
+                manager.set_durable_state_context(Some(
+                    jcode_app_core::agent::durable_state_context_builder(self.session.id.clone()),
+                ));
                 let discarded_oversized_native =
                     manager.discard_oversized_openai_native_compaction();
                 if self.provider.uses_jcode_compaction() {

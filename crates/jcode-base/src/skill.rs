@@ -744,6 +744,13 @@ pub struct EndorsedSkill {
 /// `npx skills add nvidia/skills --skill <name> --yes`.
 pub const ENDORSED_SKILLS: &[EndorsedSkill] = &[
     EndorsedSkill {
+        name: "aside",
+        description: "Drive a real Chrome browser for any web task: reading pages, signing into dashboards, clicking through UI, filling forms, scraping data, or checking a live site. This fork has no built-in browser tool, so browser work goes through Aside.",
+        category: "jcode",
+        source: "bundled in jcode repo (.jcode/skills/aside); needs the Aside app and CLI",
+        install: Some("install Aside from https://aside.com and ensure the `aside` CLI is on PATH"),
+    },
+    EndorsedSkill {
         name: "optimization",
         description: "Improve performance, latency, throughput, memory usage, or general efficiency by defining metrics, measuring, attributing bottlenecks, and prioritizing macro-optimizations.",
         category: "jcode",
@@ -753,13 +760,6 @@ pub const ENDORSED_SKILLS: &[EndorsedSkill] = &[
     EndorsedSkill {
         name: "todo-planning-skill",
         description: "Create thorough, well-structured todo lists for long tasks, including reflection, static analysis, verification, and next-step updates.",
-        category: "jcode",
-        source: "bundled with jcode / Claude Code skills",
-        install: None,
-    },
-    EndorsedSkill {
-        name: "firefox-browser",
-        description: "Control the user's Firefox browser with their logins and cookies intact to browse, fill forms, click, screenshot, and read authenticated pages.",
         category: "jcode",
         source: "bundled with jcode / Claude Code skills",
         install: None,
@@ -1181,20 +1181,20 @@ mod tests {
     #[test]
     fn skill_as_memory_entry_formats_invocation_and_prompt() {
         let skill = test_skill(
-            "firefox-browser",
-            "Control Firefox browser sessions and logged-in pages",
-            "Use this skill when you need to open websites, click buttons, or interact with browser pages.",
+            "aside",
+            "Use Aside for authenticated browser tasks",
+            "Use this skill when you need to give Aside a complete browser task.",
         );
 
         let entry = skill.as_memory_entry();
 
-        assert_eq!(entry.id, "skill:firefox-browser");
+        assert_eq!(entry.id, "skill:aside");
         assert!(matches!(
             entry.category,
             crate::memory::MemoryCategory::Custom(ref name) if name == "Skills"
         ));
-        assert!(entry.content.contains("/firefox-browser"));
-        assert!(entry.content.contains("# Skill: firefox-browser"));
+        assert!(entry.content.contains("/aside"));
+        assert!(entry.content.contains("# Skill: aside"));
         assert_eq!(entry.source.as_deref(), Some("skill_registry"));
     }
 

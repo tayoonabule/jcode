@@ -313,6 +313,81 @@ pub(super) async fn handle_clear_session(
     );
 }
 
+#[cfg(test)]
+thread_local! {
+    static SUBSCRIBE_METADATA_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn load_subscribe_metadata(session_id: &str) -> Result<crate::session::Session> {
+    #[cfg(test)]
+    SUBSCRIBE_METADATA_LOADS.with(|loads| loads.set(loads.get() + 1));
+    crate::session::Session::load_startup_stub(session_id)
+}
+
+/// Register this connection on the session's swarm member, creating it when
+/// absent. Returns whether a new member was inserted.
+///
+/// Callers release the member-map lock while they read identity metadata, so a
+/// concurrent subscribe for the same session may have created the member in
+/// that window. Merging into an occupied slot rather than replacing it keeps
+/// the other connection's event sender alive.
+#[allow(clippy::too_many_arguments)]
+fn attach_or_insert_member(
+    members: &mut HashMap<String, SwarmMember>,
+    client_session_id: &str,
+    client_connection_id: &str,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    swarm_enabled: bool,
+    member_name: &Option<String>,
+    working_dir: &Option<PathBuf>,
+    derived_swarm_id: &Option<String>,
+) -> bool {
+    match members.entry(client_session_id.to_string()) {
+        std::collections::hash_map::Entry::Occupied(mut existing) => {
+            let member = existing.get_mut();
+            member.event_tx = client_event_tx.clone();
+            member
+                .event_txs
+                .insert(client_connection_id.to_string(), client_event_tx.clone());
+            member.swarm_enabled = swarm_enabled;
+            member.is_headless = false;
+            if member_name.is_some() {
+                member.friendly_name = member_name.clone();
+            }
+            false
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            let now = Instant::now();
+            slot.insert(SwarmMember {
+                session_id: client_session_id.to_string(),
+                event_tx: client_event_tx.clone(),
+                event_txs: HashMap::from([(
+                    client_connection_id.to_string(),
+                    client_event_tx.clone(),
+                )]),
+                working_dir: working_dir.clone(),
+                swarm_id: derived_swarm_id.clone(),
+                swarm_enabled,
+                status: "ready".to_string(),
+                detail: None,
+                task_label: None,
+                friendly_name: member_name.clone(),
+                report_back_to_session_id: None,
+                latest_completion_report: None,
+                role: "agent".to_string(),
+                joined_at: now,
+                last_status_change: now,
+                is_headless: false,
+                output_tail: None,
+                todo_progress: None,
+                todo_items: Vec::new(),
+                runtime: crate::protocol::SwarmMemberRuntime::default(),
+            });
+            true
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ensure_client_swarm_member(
     client_session_id: &str,
@@ -327,6 +402,46 @@ async fn ensure_client_swarm_member(
     event_counter: &Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
 ) -> bool {
+    {
+        let mut members = swarm_members.write().await;
+        if let Some(member) = members.get_mut(client_session_id) {
+            // Existing members already carry restored identity metadata. Refresh
+            // from the live agent only when available, never scan the persisted
+            // transcript just to attach another connection to a busy member.
+            let live_name = agent
+                .try_lock()
+                .ok()
+                .and_then(|agent| agent.session_short_name().map(str::to_string));
+            member.friendly_name = live_name
+                .or_else(|| member.friendly_name.clone())
+                .or_else(|| friendly_name.clone());
+            member.event_tx = client_event_tx.clone();
+            member
+                .event_txs
+                .insert(client_connection_id.to_string(), client_event_tx.clone());
+            member.swarm_enabled = swarm_enabled;
+            member.is_headless = false;
+            crate::logging::event_info(
+                "SESSION_LIFECYCLE",
+                vec![
+                    ("phase", "swarm_member_registered".to_string()),
+                    ("session_id", client_session_id.to_string()),
+                    ("client_connection_id", client_connection_id.to_string()),
+                    ("inserted", "false".to_string()),
+                    ("swarm_enabled", swarm_enabled.to_string()),
+                    (
+                        "swarm_id",
+                        member
+                            .swarm_id
+                            .clone()
+                            .unwrap_or_else(|| "none".to_string()),
+                    ),
+                ],
+            );
+            return false;
+        }
+    }
+
     let (working_dir, derived_swarm_id, fallback_name) = {
         // A target-aware subscribe can attach to an agent that is in the middle
         // of a turn. Never wait for that turn's agent lock just to populate
@@ -346,7 +461,7 @@ async fn ensure_client_swarm_member(
                     "Subscribe metadata for busy session {} is using the persisted startup stub",
                     client_session_id
                 ));
-                crate::session::Session::load_startup_stub(client_session_id)
+                load_subscribe_metadata(client_session_id)
                     .map(|session| (session.working_dir.map(PathBuf::from), session.short_name))
                     .unwrap_or((None, None))
             }
@@ -364,52 +479,19 @@ async fn ensure_client_swarm_member(
     // the temporary pre-resume session name can otherwise leak onto the real
     // resumed session and corrupt swarm metadata.
     let member_name = fallback_name.or_else(|| friendly_name.clone());
-    let mut inserted = false;
-    {
+    let inserted = {
         let mut members = swarm_members.write().await;
-        if let Some(member) = members.get_mut(client_session_id) {
-            member.event_tx = client_event_tx.clone();
-            member
-                .event_txs
-                .insert(client_connection_id.to_string(), client_event_tx.clone());
-            member.swarm_enabled = swarm_enabled;
-            member.is_headless = false;
-            if member_name.is_some() {
-                member.friendly_name = member_name.clone();
-            }
-        } else {
-            let now = Instant::now();
-            members.insert(
-                client_session_id.to_string(),
-                SwarmMember {
-                    session_id: client_session_id.to_string(),
-                    event_tx: client_event_tx.clone(),
-                    event_txs: HashMap::from([(
-                        client_connection_id.to_string(),
-                        client_event_tx.clone(),
-                    )]),
-                    working_dir: working_dir.clone(),
-                    swarm_id: derived_swarm_id.clone(),
-                    swarm_enabled,
-                    status: "ready".to_string(),
-                    detail: None,
-                    task_label: None,
-                    friendly_name: member_name.clone(),
-                    report_back_to_session_id: None,
-                    latest_completion_report: None,
-                    role: "agent".to_string(),
-                    joined_at: now,
-                    last_status_change: now,
-                    is_headless: false,
-                    output_tail: None,
-                    todo_progress: None,
-                    todo_items: Vec::new(),
-                    runtime: crate::protocol::SwarmMemberRuntime::default(),
-                },
-            );
-            inserted = true;
-        }
-    }
+        attach_or_insert_member(
+            &mut members,
+            client_session_id,
+            client_connection_id,
+            client_event_tx,
+            swarm_enabled,
+            &member_name,
+            &working_dir,
+            &derived_swarm_id,
+        )
+    };
 
     if inserted && let Some(ref swarm_id_ref) = derived_swarm_id {
         let mut swarms = swarms_by_id.write().await;

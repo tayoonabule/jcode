@@ -264,13 +264,13 @@ impl Agent {
         self.persist_session_best_effort("provider session reset");
     }
 
-    /// Rewind the conversation to a 1-based visible transcript message index.
+    /// Rewind the conversation to a 1-based user-prompt index.
     ///
-    /// The index is interpreted against the same rendered transcript the TUI
-    /// numbers in `/rewind` (user/assistant entries only, tool cards and
-    /// system notices excluded). Mapping through raw stored messages instead
-    /// would count tool-result messages the UI never numbers, sending
-    /// `/rewind N` far earlier than the on-screen message N (issue #432).
+    /// The index is interpreted against the same stored prompt list the TUI
+    /// numbers in `/rewind`. Assistant replies, tool cards, synthetic
+    /// continuations, and system notices are excluded. The list is based on the
+    /// authoritative transcript rather than the lazy compacted render window,
+    /// so prompts hidden by compaction remain rewindable.
     ///
     /// Provider-side resumable sessions are reset so the next request sends the
     /// truncated context from scratch instead of continuing from a stale upstream

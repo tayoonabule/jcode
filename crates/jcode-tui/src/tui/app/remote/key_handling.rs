@@ -664,6 +664,14 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    if code == KeyCode::Up
+        && modifiers.is_empty()
+        && app.input.is_empty()
+        && app.retrieve_latest_pending_message_for_edit()
+    {
+        return Ok(());
+    }
+
     if handle_ctrl_kill_to_end(app, code, modifiers) {
         return Ok(());
     }

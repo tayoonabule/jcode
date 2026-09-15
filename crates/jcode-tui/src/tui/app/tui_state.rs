@@ -1330,7 +1330,9 @@ impl crate::tui::TuiState for App {
             Some(self.session.id.as_str())
         };
 
-        let todos_are_swarm_plan = self.swarm_enabled && !self.swarm_plan_items.is_empty();
+        let current_swarm_plan_items =
+            crate::tui::info_widget::current_swarm_plan_items(&self.swarm_plan_items);
+        let todos_are_swarm_plan = self.swarm_enabled && !current_swarm_plan_items.is_empty();
         let (todos, todo_goals) =
             if crate::config::config().display.pin_todos && !todos_are_swarm_plan {
                 // The pinned band is the single source of truth while enabled. Do
@@ -1339,7 +1341,7 @@ impl crate::tui::TuiState for App {
                 (Vec::new(), Vec::new())
             } else if todos_are_swarm_plan {
                 (
-                    crate::tui::info_widget::swarm_plan_todos(&self.swarm_plan_items),
+                    crate::tui::info_widget::swarm_plan_todos(&current_swarm_plan_items),
                     Vec::new(),
                 )
             } else {
@@ -1482,17 +1484,15 @@ impl crate::tui::TuiState for App {
                 || client_count.is_some()
                 || !managed_members.is_empty()
             {
-                let plan_progress = if self.swarm_plan_items.is_empty() {
+                let plan_progress = if current_swarm_plan_items.is_empty() {
                     None
                 } else {
-                    let total = self.swarm_plan_items.len() as u32;
-                    let done = self
-                        .swarm_plan_items
+                    let total = current_swarm_plan_items.len() as u32;
+                    let done = current_swarm_plan_items
                         .iter()
                         .filter(|item| matches!(item.status.as_str(), "completed" | "done"))
                         .count() as u32;
-                    let running = self
-                        .swarm_plan_items
+                    let running = current_swarm_plan_items
                         .iter()
                         .filter(|item| matches!(item.status.as_str(), "running" | "running_stale"))
                         .count() as u32;

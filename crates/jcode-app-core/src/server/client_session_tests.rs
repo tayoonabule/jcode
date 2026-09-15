@@ -515,3 +515,179 @@ mod clear_tests;
 mod reload_tests;
 #[path = "client_session_tests/resume.rs"]
 mod resume_tests;
+
+#[tokio::test]
+async fn attach_existing_member_skips_metadata_load_and_preserves_registration() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new().unwrap();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    for busy in [true, false] {
+        let session_id = "session_attach_existing_member";
+        let mut session = crate::session::Session::create_with_id(session_id.into(), None, None);
+        session.short_name = Some("restored-agent-name".into());
+        let agent = Arc::new(Mutex::new(Agent::new_with_session(
+            Arc::new(MockProvider),
+            Registry::empty(),
+            session,
+            None,
+        )));
+        let busy_guard = if busy { Some(agent.lock().await) } else { None };
+        let mut member = test_swarm_member(session_id, "running");
+        member.friendly_name = Some("restored-member-name".into());
+        member.working_dir = Some(std::path::PathBuf::from("/restored/workspace"));
+        member.is_headless = true;
+        let (old_tx, _old_rx) = mpsc::unbounded_channel();
+        member.event_txs.insert("old-connection".into(), old_tx);
+        let members = Arc::new(RwLock::new(HashMap::from([(session_id.into(), member)])));
+        let swarms = Arc::new(RwLock::new(HashMap::new()));
+        let history = Arc::new(RwLock::new(VecDeque::new()));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (swarm_tx, _) = broadcast::channel(8);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        super::SUBSCRIBE_METADATA_LOADS.with(|loads| loads.set(0));
+        assert!(
+            !super::ensure_client_swarm_member(
+                session_id,
+                "new-connection",
+                &Some("temporary-socket-name".into()),
+                &event_tx,
+                &agent,
+                false,
+                &members,
+                &swarms,
+                &history,
+                &counter,
+                &swarm_tx,
+            )
+            .await
+        );
+        super::SUBSCRIBE_METADATA_LOADS.with(|loads| assert_eq!(loads.get(), 0));
+        let members = members.read().await;
+        let member = &members[session_id];
+        assert_eq!(
+            member.friendly_name.as_deref(),
+            Some(if busy {
+                "restored-member-name"
+            } else {
+                "restored-agent-name"
+            })
+        );
+        assert_eq!(member.status, "running");
+        assert_eq!(member.swarm_id.as_deref(), Some("swarm-test"));
+        assert_eq!(
+            member.working_dir.as_deref(),
+            Some(std::path::Path::new("/restored/workspace"))
+        );
+        assert_eq!(member.report_back_to_session_id.as_deref(), Some("coord"));
+        assert!(!member.swarm_enabled);
+        assert!(!member.is_headless);
+        assert_eq!(member.event_txs.len(), 2);
+        member.event_tx.send(ServerEvent::Done { id: 1 }).unwrap();
+        member.event_txs["new-connection"]
+            .send(ServerEvent::Done { id: 2 })
+            .unwrap();
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(ServerEvent::Done { id: 1 })
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(ServerEvent::Done { id: 2 })
+        ));
+        assert!(history.read().await.is_empty());
+        assert!(swarms.read().await.is_empty());
+        drop(busy_guard);
+    }
+    if let Some(home) = previous_home {
+        crate::env::set_var("JCODE_HOME", home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+/// Registration releases the member-map lock while it reads identity metadata,
+/// so a competing subscribe can create the member in that window. The losing
+/// registration must merge into that member instead of replacing it, which
+/// would drop the winner's event sender and silence that connection.
+#[tokio::test]
+async fn attaching_over_a_concurrently_created_member_keeps_both_connections() {
+    let session_id = "session_concurrent_attach";
+    let mut members = HashMap::new();
+
+    // The competing subscribe got there first.
+    let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+    let mut existing = test_swarm_member(session_id, "running");
+    existing.event_txs.clear();
+    existing
+        .event_txs
+        .insert("first-connection".into(), first_tx);
+    members.insert(session_id.to_string(), existing);
+
+    // This registration observed no member earlier and now reaches the insert.
+    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+    let inserted = super::attach_or_insert_member(
+        &mut members,
+        session_id,
+        "second-connection",
+        &second_tx,
+        false,
+        &Some("second-name".into()),
+        &None,
+        &None,
+    );
+
+    assert!(
+        !inserted,
+        "the member already existed, so nothing was added"
+    );
+    let member = &members[session_id];
+    assert_eq!(
+        member.event_txs.len(),
+        2,
+        "both connections must remain registered"
+    );
+    member.event_txs["first-connection"]
+        .send(ServerEvent::Done { id: 1 })
+        .expect("the earlier connection must survive the attach");
+    member.event_txs["second-connection"]
+        .send(ServerEvent::Done { id: 2 })
+        .expect("the later connection must be registered");
+    assert!(matches!(
+        first_rx.try_recv(),
+        Ok(ServerEvent::Done { id: 1 })
+    ));
+    assert!(matches!(
+        second_rx.try_recv(),
+        Ok(ServerEvent::Done { id: 2 })
+    ));
+
+    // Identity the winner restored must not be discarded by the merge.
+    assert_eq!(member.swarm_id.as_deref(), Some("swarm-test"));
+    assert_eq!(member.report_back_to_session_id.as_deref(), Some("coord"));
+    assert_eq!(member.status, "running");
+}
+
+#[tokio::test]
+async fn attaching_to_an_absent_member_inserts_it() {
+    let session_id = "session_fresh_attach";
+    let mut members = HashMap::new();
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let inserted = super::attach_or_insert_member(
+        &mut members,
+        session_id,
+        "only-connection",
+        &tx,
+        true,
+        &Some("name".into()),
+        &None,
+        &Some("swarm-1".into()),
+    );
+
+    assert!(inserted, "a missing member must be created");
+    let member = &members[session_id];
+    assert_eq!(member.event_txs.len(), 1);
+    assert_eq!(member.swarm_id.as_deref(), Some("swarm-1"));
+}

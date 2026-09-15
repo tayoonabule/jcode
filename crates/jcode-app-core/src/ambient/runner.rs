@@ -80,6 +80,28 @@ impl AmbientRunnerHandle {
         }
     }
 
+    /// Return a fresh provider configured with Ambient's explicit route.
+    fn configured_cycle_provider(&self, provider: &Arc<dyn Provider>) -> Arc<dyn Provider> {
+        let cycle_provider = provider.fork_for_new_session();
+        if let Some(provider_name) = config().ambient.provider.as_deref()
+            && let Err(error) = cycle_provider.switch_active_provider_to(provider_name)
+        {
+            logging::warn(&format!(
+                "Ambient cycle could not apply configured provider '{}': {}",
+                provider_name, error
+            ));
+        }
+        if let Some(model) = config().ambient.model.as_deref()
+            && let Err(error) = cycle_provider.set_model(model)
+        {
+            logging::warn(&format!(
+                "Ambient cycle could not apply configured model '{}': {}",
+                model, error
+            ));
+        }
+        cycle_provider
+    }
+
     /// Nudge the ambient loop to check sooner (e.g., after session close/crash).
     pub fn nudge(&self) {
         self.inner.wake_notify.notify_one();
@@ -904,8 +926,14 @@ impl AmbientRunnerHandle {
     {
         let started_at = Utc::now();
 
+        let cycle_provider = self.configured_cycle_provider(provider);
+        let route = crate::ambient::CycleRoute {
+            provider: cycle_provider.name().to_string(),
+            model: cycle_provider.model(),
+        };
+
         self.set_running_detail("gathering context").await;
-        let (system_prompt, initial_message) = self.build_cycle_context(provider).await?;
+        let (system_prompt, initial_message) = self.build_cycle_context(&cycle_provider).await?;
 
         // Visible mode: spawn a full TUI instead of running headlessly
         if visible {
@@ -918,7 +946,12 @@ impl AmbientRunnerHandle {
                 )
                 .await?
             {
-                VisibleCycleOutcome::Completed(result) => return Ok(*result),
+                VisibleCycleOutcome::Completed(result) => {
+                    return Ok(AmbientCycleResult {
+                        route: Some(route),
+                        ..*result
+                    });
+                }
                 VisibleCycleOutcome::FallBackHeadless => {}
             }
         }
@@ -926,7 +959,6 @@ impl AmbientRunnerHandle {
         // Headless mode: run agent directly
         self.set_running_detail("setting up tools").await;
 
-        let cycle_provider = provider.fork();
         let registry = tool::Registry::new(cycle_provider.clone()).await;
         registry.register_ambient_tools().await;
 
@@ -1003,6 +1035,7 @@ impl AmbientRunnerHandle {
             ended_at: Utc::now(),
             status: CycleStatus::Incomplete,
             conversation: Some(agent.export_conversation_markdown()),
+            route: Some(route),
         };
         agent.mark_closed();
         Ok(forced)
@@ -1078,6 +1111,7 @@ impl AmbientRunnerHandle {
                         ended_at: Utc::now(),
                         status: CycleStatus::Incomplete,
                         conversation: None,
+                        route: None,
                     },
                 )))
             }

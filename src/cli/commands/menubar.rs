@@ -39,10 +39,34 @@ fn load_user_root_session(session_id: &str) -> Option<bool> {
 fn user_root_session_presence() -> Vec<SessionPresence> {
     session::user_session_presence()
         .into_iter()
-        // A marker can briefly precede its first persisted snapshot. Keep an
-        // unknown session visible for this read rather than hiding a new window.
-        .filter(|presence| load_user_root_session(&presence.session_id).unwrap_or(true))
+        .filter(
+            |presence| match load_user_root_session(&presence.session_id) {
+                Some(is_user_root) => is_user_root,
+                // No persisted session yet. A marker can briefly precede its first
+                // snapshot, so keep a very new session visible rather than hiding a
+                // window that is still starting up. Past that grace period the
+                // session was registered but never persisted (a child that died
+                // before its first save), and showing it forever is what fills the
+                // menu with unnamed entries that open nothing.
+                None => marker_is_within_startup_grace(&presence.session_id),
+            },
+        )
         .collect()
+}
+
+/// How long an active-PID marker may exist without a persisted session before
+/// presence UIs stop trusting it.
+const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn marker_is_within_startup_grace(session_id: &str) -> bool {
+    let Some(path) = crate::storage::active_pids_dir().map(|dir| dir.join(session_id)) else {
+        return false;
+    };
+    std::fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < STARTUP_GRACE)
 }
 
 fn counts_for_presence(sessions: &[SessionPresence]) -> SessionCounts {
@@ -983,5 +1007,80 @@ mod tests {
             Some(OsStr::new("/private/tmp/jcode-e2e-home-xyz")),
             None,
         ));
+    }
+
+    /// Backdate a file's mtime by `age`, so grace-period logic can be tested
+    /// without sleeping.
+    fn age_file(path: &std::path::Path, age: std::time::Duration) {
+        let when = std::time::SystemTime::now() - age;
+        let spec = |t: std::time::SystemTime| -> libc::timespec {
+            let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            libc::timespec {
+                tv_sec: d.as_secs() as libc::time_t,
+                tv_nsec: d.subsec_nanos() as libc::c_long,
+            }
+        };
+        let times = [spec(when), spec(when)];
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .expect("path has no interior NUL");
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "failed to backdate {}", path.display());
+    }
+
+    /// A session that registered an active PID but was never persisted must
+    /// stop appearing once its startup grace period has passed. These are the
+    /// unnamed rows that open nothing when clicked.
+    #[test]
+    fn never_persisted_sessions_drop_out_after_the_startup_grace() {
+        let _guard = crate::storage::lock_test_env();
+        let previous_home = std::env::var_os("JCODE_HOME");
+        let temp = tempfile::tempdir().expect("create temporary JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        // A real session the user opened: persisted, no parent.
+        let real_id = "session_otter_1781229104969_aaaaaaaaaaaaaaaa";
+        let mut real = crate::session::Session::create_with_id(real_id.to_string(), None, None);
+        real.save().expect("persist the real session");
+        crate::storage::register_active_pid(real_id, std::process::id());
+
+        // A ghost: marker only, no session file will ever exist. It shares the
+        // live PID exactly as a server-hosted child would.
+        let ghost_id = "session_ghost_1781229104969_bbbbbbbbbbbbbbbb";
+        crate::storage::register_active_pid(ghost_id, std::process::id());
+
+        let visible: Vec<String> = user_root_session_presence()
+            .into_iter()
+            .map(|presence| presence.session_id)
+            .collect();
+        assert!(
+            visible.contains(&real_id.to_string()),
+            "the real session must stay visible: {visible:?}"
+        );
+        assert!(
+            visible.contains(&ghost_id.to_string()),
+            "a brand-new marker is still inside its grace period: {visible:?}"
+        );
+
+        // Age the ghost's marker past the grace period.
+        let marker = crate::storage::active_pids_dir()
+            .expect("active pids dir")
+            .join(ghost_id);
+        age_file(&marker, STARTUP_GRACE * 2);
+
+        let visible: Vec<String> = user_root_session_presence()
+            .into_iter()
+            .map(|presence| presence.session_id)
+            .collect();
+        assert_eq!(
+            visible,
+            vec![real_id.to_string()],
+            "the settled ghost must be hidden, the real session kept: {visible:?}"
+        );
+
+        if let Some(home) = previous_home {
+            crate::env::set_var("JCODE_HOME", home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
     }
 }

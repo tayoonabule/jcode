@@ -626,7 +626,7 @@ That imported file is then jcode-owned; later Codex changes are not synced
 automatically. Imported environment values are copied too and may contain
 secrets.
 
-Both the canonical `mcpServers` key and jcode's historical `servers` key are accepted. jcode currently supports stdio (command-based) servers only; HTTP/SSE entries (`"type": "http"`/`"sse"`) are recognized and skipped with a log line.
+Both the canonical `mcpServers` key and jcode's historical `servers` key are accepted. jcode supports stdio (command-based) servers and remote Streamable HTTP entries (`"type": "http"`). HTTP entries use the shared low-memory client and browser OAuth when the endpoint requires it.
 
 Example MCP config:
 
@@ -708,7 +708,7 @@ The devil is in the details. There are many undocumented optimizations and nicet
 
 Anthropic's Claude cache goes cold after 5 minutes. If you initiate Claude after these 5 minutes, you have a cache miss, potentially costing you lots of tokens. The ui warns you when the cache went cold, and notfies you if there was an unexpected cache miss. 
 
-jcode comes with instructions on how to set up Firefox Agent Bridge. Ask you agent to set it up, and then you will have browser automation in jcode as well. 
+For browser work, use the `/aside` skill. Give Aside the complete browser task in one prompt and let it operate through `/Applications/Aside.app` and its authenticated session.
 
 Agent grep is a grep tool I made for the jcode agent. It adds file structure information (ie the list of functions, their displacement, etc) to the grep return, so that the agent can infer more of what the file doesn without actually reading the file. It also implements a harness-level integration that adaptively truncates returns based on what the agent has already seen. This saves on context a lot.
 
@@ -779,44 +779,11 @@ and hotkey-friendly dictation without requiring a bundled speech-to-text stack.
 
 ---
 
-## Browser Automation
+## Browser Work
 
-jcode includes a first-class built-in `browser` tool for browser control inside agent sessions.
+Jcode does not provide a built-in browser automation tool. For connected services, first use the service's suitable native MCP, CLI, or API integration. Use `/aside` and `/Applications/Aside.app` only for genuinely browser-only or visual work, when no suitable native route exists, or after a native route was attempted and is blocked.
 
-Current built-in backend:
-- Firefox via Firefox Agent Bridge
-
-Current built-in tool actions include:
-- `status`
-- `setup`
-- `open`
-- `snapshot`
-- `get_content`
-- `interactables`
-- `click`
-- `type`
-- `fill_form`
-- `select`
-- `wait`
-- `screenshot`
-- `eval`
-- `scroll`
-- `upload`
-- `press`
-
-Quick setup:
-
-```bash
-jcode browser status
-jcode browser setup
-```
-
-Once setup is complete, the model can use the built-in `browser` tool directly. The UI also summarizes browser tool calls compactly, for example opening a URL, clicking a selector, or typing into a field without echoing sensitive typed text.
-
-Notes:
-- the provider/tool architecture is in place for additional backends
-- Firefox is the wired built-in backend today
-- Chrome bridge / remote debugging style providers can be added on top of the same browser tool later
+When browser use is appropriate, give Aside one complete, high-level task prompt. Aside navigates and acts through its authenticated session, including screenshots, interaction, research, and live-site verification.
 
 ---
 
@@ -827,7 +794,6 @@ Notes:
 - [jcode.sh/sdk](https://jcode.sh/sdk) — TypeScript SDK: drive jcode sessions from your own program
 - [jcode.sh/bench](https://jcode.sh/bench) — benchmark methodology and results
 - [Ambient Mode / OpenClaw](docs/AMBIENT_MODE.md)
-- [Browser Provider Protocol](docs/BROWSER_PROVIDER_PROTOCOL.md)
 - [Memory Architecture](docs/MEMORY_ARCHITECTURE.md)
 - [Swarm Architecture](docs/SWARM_ARCHITECTURE.md)
 - [Server Architecture](docs/SERVER_ARCHITECTURE.md)
@@ -899,7 +865,7 @@ Set up jcode on this machine for me.
    - OpenRouter: help me set `OPENROUTER_API_KEY`
    - Anthropic direct API: help me set `ANTHROPIC_API_KEY`
 7. After setup, run a simple smoke test with `jcode run "say hello"` and confirm it works.
-8. If I want browser automation, also check `jcode browser status`. If browser automation is not ready, run `jcode browser setup`, verify the built-in `browser` tool works, and explain any remaining manual step.
+8. If I want browser automation, use the `/aside` skill and give Aside the complete task through `/Applications/Aside.app`.
 9. Explain any manual step that still needs me, especially browser OAuth, device login, API key entry, or browser extension approval.
 ```
 

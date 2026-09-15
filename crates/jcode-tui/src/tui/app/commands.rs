@@ -2036,12 +2036,23 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/rewind" {
-        // Number the same rendered transcript entries `/rewind N` targets so
-        // the printed numbers always match what a rewind actually does
-        // (issue #432).
-        let rendered_targets: Vec<_> = crate::session::render_messages(&app.session)
+        // Rewind numbers are user prompts, not assistant replies or tool cards.
+        // Render the complete stored history here rather than the normal lazy
+        // compacted window, so every prompt that can be rewound is listed.
+        let target_indices = app.session.rewind_target_stored_indices();
+        let rendered_targets: Vec<_> =
+            crate::session::render_messages_and_images_with_compacted_history(
+                &app.session,
+                usize::MAX,
+            )
+            .0
             .into_iter()
-            .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+            .filter(|message| {
+                message.role == "user"
+                    && message
+                        .stored_index
+                        .is_some_and(|index| target_indices.contains(&index))
+            })
             .collect();
         if rendered_targets.is_empty() {
             app.push_display_message(DisplayMessage::system(
@@ -2061,7 +2072,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             let preview = crate::util::truncate_str(content.trim(), 80);
             history.push_str(&format!("  {} {} - {}\n", i + 1, role_str, preview));
         }
-        history.push_str("\nUse /rewind N to rewind to message N (removes all messages after). After rewinding, use /rewind undo to restore the removed messages.");
+        history.push_str("\nOnly user prompts are numbered. Use /rewind N to rewind to prompt N (removes all messages after). Compacted prompts remain available here. After rewinding, use /rewind undo to restore the removed messages.");
 
         app.push_display_message(DisplayMessage::system(history));
         return true;
@@ -2112,7 +2123,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
                 let _ = app.session.save();
 
                 app.push_display_message(DisplayMessage::system(format!(
-                    "✓ Rewound to message {}. Removed {} message{}. Undo anytime with /rewind undo.",
+                    "✓ Rewound to prompt {}. Removed {} prompt{}. Undo anytime with /rewind undo.",
                     n,
                     removed,
                     if removed == 1 { "" } else { "s" }
@@ -2120,13 +2131,13 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             }
             Ok(n) => {
                 app.push_display_message(DisplayMessage::error(format!(
-                    "Invalid message number: {}. Valid range: 1-{}",
+                    "Invalid prompt number: {}. Valid range: 1-{}",
                     n, visible_count
                 )));
             }
             Err(_) => {
                 app.push_display_message(DisplayMessage::error(format!(
-                    "Usage: /rewind N where N is a message number (1-{})",
+                    "Usage: /rewind N where N is a prompt number (1-{})",
                     visible_count
                 )));
             }
