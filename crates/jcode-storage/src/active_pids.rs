@@ -238,6 +238,83 @@ pub fn session_presence() -> Vec<SessionPresence> {
     sessions
 }
 
+/// Remove active-PID markers that can never correspond to a live session.
+///
+/// Two kinds of debris accumulate:
+///
+/// - markers whose recorded process is gone (a crashed or killed session), and
+/// - markers for sessions that were registered but never persisted, which
+///   happens when a short-lived child such as a swarm worker dies before its
+///   first save. Those are only reaped once they are older than `min_age`, so a
+///   session that is mid-startup is never pruned out from under itself.
+///
+/// `has_session_record` decides whether a session exists on disk; the storage
+/// crate deliberately does not know how sessions are stored. Returns how many
+/// markers were removed.
+pub fn prune_orphan_active_pids(
+    min_age: std::time::Duration,
+    has_session_record: impl Fn(&str) -> bool,
+) -> usize {
+    let Some(dir) = active_pids_dir() else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        let session_id = entry.file_name().to_string_lossy().to_string();
+        let pid = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok());
+
+        let orphan = match pid {
+            // The owning process is gone, so this marker is debris whatever
+            // else is true.
+            Some(pid) if !process_is_running(pid) => true,
+            // The process is alive (often the long-lived shared server), so
+            // liveness proves nothing. Treat it as debris only when no session
+            // was ever recorded and the marker has had time to settle.
+            Some(_) | None => {
+                let settled = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age >= min_age);
+                settled && !has_session_record(&session_id)
+            }
+        };
+
+        if orphan {
+            let _ = std::fs::remove_file(&path);
+            unmark_streaming(&session_id);
+            set_session_internal(&session_id, false);
+            removed += 1;
+        }
+    }
+
+    // Streaming markers record the writing process, which for server-hosted
+    // sessions is the long-lived server, so a marker left behind by a worker
+    // that never cleared it keeps claiming a live PID. Drop any whose session
+    // is no longer tracked at all.
+    if let Some(streaming_dir) = streaming_pids_dir()
+        && let Ok(streaming_entries) = std::fs::read_dir(&streaming_dir)
+    {
+        for entry in streaming_entries.filter_map(|entry| entry.ok()) {
+            let session_id = entry.file_name().to_string_lossy().to_string();
+            if !dir.join(&session_id).exists() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    removed
+}
+
 /// Compute the current session counts from [`session_presence`].
 pub fn session_counts() -> SessionCounts {
     let sessions = session_presence();
@@ -389,5 +466,88 @@ mod tests {
         assert!(!session_is_internal("session_worker"));
 
         jcode_core::env::remove_var("JCODE_HOME");
+    }
+
+    /// The failure behind the menu bar filling with unnamed entries: a child
+    /// session registers an active PID, dies before its first save, and its
+    /// marker names the long-lived shared server, so a liveness check alone
+    /// never retires it.
+    #[test]
+    fn prunes_markers_for_sessions_that_were_never_persisted() {
+        let _guard = lock_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        jcode_core::env::set_var("JCODE_HOME", temp.path());
+
+        let live = std::process::id();
+        register_active_pid("session_ghost", live);
+        register_active_pid("session_real", live);
+        mark_streaming("session_ghost");
+        set_session_internal("session_ghost", true);
+
+        // Nothing is pruned while the markers are still within their grace
+        // period, so a session that is mid-startup is never pulled out.
+        let removed = prune_orphan_active_pids(std::time::Duration::from_secs(300), |id| {
+            id == "session_real"
+        });
+        assert_eq!(removed, 0, "new markers must survive their grace period");
+        assert_eq!(active_session_ids().len(), 2);
+
+        // Once settled, the marker with no persisted session is debris.
+        let removed =
+            prune_orphan_active_pids(std::time::Duration::ZERO, |id| id == "session_real");
+        assert_eq!(removed, 1, "only the never-persisted session is pruned");
+
+        let remaining = active_session_ids();
+        assert_eq!(remaining, vec!["session_real".to_string()]);
+        // Its side markers go too, so no orphaned streaming/internal state.
+        assert!(!session_is_internal("session_ghost"));
+        assert!(
+            streaming_pids_dir()
+                .map(|dir| !dir.join("session_ghost").exists())
+                .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn prunes_markers_whose_process_is_gone_regardless_of_age() {
+        let _guard = lock_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        jcode_core::env::set_var("JCODE_HOME", temp.path());
+
+        register_active_pid("session_crashed", 999_999);
+        register_active_pid("session_live", std::process::id());
+
+        // A dead process is debris even inside the grace period, and even if a
+        // session record exists: the process can never come back.
+        let removed = prune_orphan_active_pids(std::time::Duration::from_secs(300), |_| true);
+        assert_eq!(removed, 1);
+        assert_eq!(active_session_ids(), vec!["session_live".to_string()]);
+    }
+
+    /// A streaming marker left by a worker whose session is gone keeps claiming
+    /// the long-lived server PID, so the menu bar would show phantom "streaming"
+    /// work forever.
+    #[test]
+    fn prunes_streaming_markers_whose_session_is_no_longer_tracked() {
+        let _guard = lock_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        jcode_core::env::set_var("JCODE_HOME", temp.path());
+
+        register_active_pid("session_live", std::process::id());
+        mark_streaming("session_live");
+        // Marker with no active-pid entry at all: its session is long gone.
+        mark_streaming("session_vanished");
+
+        prune_orphan_active_pids(std::time::Duration::ZERO, |id| id == "session_live");
+
+        let dir = streaming_pids_dir().expect("streaming dir");
+        assert!(
+            dir.join("session_live").exists(),
+            "a tracked streaming session must keep its marker"
+        );
+        assert!(
+            !dir.join("session_vanished").exists(),
+            "an untracked streaming marker must be pruned"
+        );
     }
 }

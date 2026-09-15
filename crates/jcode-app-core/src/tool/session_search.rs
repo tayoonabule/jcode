@@ -1457,7 +1457,7 @@ fn external_metadata_text(session: &ExternalSessionRecord) -> String {
         format!("Session ID: {}:{}", session.source, session.session_id),
         format!("Created: {}", format_datetime(session.created_at)),
         format!("Updated: {}", format_datetime(session.updated_at)),
-        format!("Path: {}", session.path.display()),
+        format!("Path: {}", crate::tool::file_url(&session.path)),
     ];
     if let Some(title) = &session.title {
         fields.push(format!("Title: {title}"));

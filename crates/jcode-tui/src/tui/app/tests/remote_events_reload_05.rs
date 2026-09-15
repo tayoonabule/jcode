@@ -821,16 +821,55 @@ fn test_gate_digest_is_delivered_at_turn_end_and_rearms_next_cycle() {
                 .is_empty()
         );
 
-        // Simulate the turn running, then the cycle completing.
+        // The review turn can record a fresh weak-point observation while the
+        // digest latch is set. Completing the cycle must consume it rather than
+        // replaying it after the final-response handoff.
+        crate::todo::append_gate_observations(
+            &app.session.id,
+            &[crate::todo::GateObservation {
+                kind: crate::todo::GateObservationKind::IntentUnderstanding,
+                group: None,
+                state: Some(
+                    crate::todo::IntentUnderstanding::from_legacy_score(70)
+                        .as_str()
+                        .to_string(),
+                ),
+            }],
+        )
+        .expect("record review-turn observation");
+
+        // Simulate the review turn running, then queue the synthetic final
+        // response handoff.
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+        assert!(
+            app.schedule_auto_poke_followup_if_needed(),
+            "with nothing left outstanding the final handoff should queue"
+        );
+        assert!(
+            app.queued_messages
+                .iter()
+                .any(|message| message == crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE),
+            "final response handoff should be queued"
+        );
+
+        // Simulate that handoff completing. The stale review observation must
+        // be consumed here, before the next cycle is re-armed.
         app.queued_messages.clear();
         app.pending_queued_dispatch = false;
         assert!(
             !app.schedule_auto_poke_followup_if_needed(),
-            "with nothing left outstanding the cycle should finish"
+            "the completed final handoff should not schedule another follow-up"
         );
         assert!(
             !app.todo_gate_digest_delivered,
             "a finished cycle must re-arm the review for later work"
+        );
+        assert!(
+            crate::todo::load_gate_observations(&app.session.id)
+                .expect("reload after completion")
+                .is_empty(),
+            "completed cycle must clear observations recorded during review"
         );
     });
 }

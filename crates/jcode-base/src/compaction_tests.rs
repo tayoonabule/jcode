@@ -1105,3 +1105,41 @@ fn test_recover_within_budget_summary_line_variants() {
     assert!(line.contains("shortened 5 large tool result(s)"));
     assert!(!line.contains("dropped"));
 }
+
+/// The durable-state snapshot is refreshed every turn but only consumed when a
+/// compaction task starts, so it must not touch the filesystem until then.
+#[test]
+fn durable_state_context_is_not_built_until_compaction_needs_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&builds);
+
+    let mut manager = CompactionManager::new();
+    manager.set_durable_state_context(Some(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Some("todos: []".to_string())
+    })));
+
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        0,
+        "setting the snapshot source must not read any session state"
+    );
+
+    // Re-registering each turn, as the session owner does, stays free.
+    for _ in 0..10 {
+        let counter = Arc::clone(&builds);
+        manager.set_durable_state_context(Some(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Some("todos: []".to_string())
+        })));
+    }
+
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        0,
+        "turns that never compact must not pay for the snapshot"
+    );
+}

@@ -171,8 +171,12 @@ impl PlanFixture {
     }
 
     async fn approve(&self, proposer: &str) {
+        self.approve_with_id(2, proposer).await;
+    }
+
+    async fn approve_with_id(&self, id: u64, proposer: &str) {
         handle_comm_approve_plan(
-            2,
+            id,
             self.coord.clone(),
             proposer.to_string(),
             &self.client_tx,
@@ -564,6 +568,21 @@ async fn approve_plan_accepts_valid_dag_proposal() {
 
     let events = fx.drain_events();
     assert!(saw_done(&events), "approval must ack");
+}
+
+#[test]
+fn approve_plan_does_not_duplicate_retried_proposal_items() {
+    let existing = vec![plan_item("retried", &[])];
+    let incoming = vec![plan_item("retried", &[]), plan_item("new", &[])];
+    let merged = super::merge_unique_plan_items(&existing, &incoming);
+
+    assert_eq!(
+        merged
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["retried", "new"]
+    );
 }
 
 /// Pins the delivery gap for the coordinator direct-update path

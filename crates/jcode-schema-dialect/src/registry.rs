@@ -55,6 +55,12 @@ pub const OPENAI: DialectSpec = DialectSpec {
     ],
     transforms: DialectTransforms {
         one_of_as_any_of: true,
+        // OpenAI compiles `pattern` with RE2, which cannot express lookaround.
+        // A zod `.email()` regex (Dokploy's MCP server emits one) is otherwise
+        // fatal to the entire tool catalog:
+        //   invalid_request_error (invalid_json_schema): regex lookaround is
+        //   not supported. Found at $.properties.bitbucketEmail.pattern.
+        re2_patterns_only: true,
         // OpenAI accepts `allOf` but does not intersect its branches the way
         // the spec requires, so a schema whose properties live only in `allOf`
         // branches ends up advertising none of them. The sanitizer this
@@ -93,6 +99,9 @@ pub const GEMINI: DialectSpec = DialectSpec {
         prune_dangling_required: true,
         const_as_enum: true,
         one_of_as_any_of: true,
+        // RE2 is Google's own engine, so the same backtracking constructs are
+        // uncompilable here as on OpenAI.
+        re2_patterns_only: true,
         ..DEFAULT_TRANSFORMS
     },
 };
@@ -164,6 +173,9 @@ pub const OPENROUTER: DialectSpec = DialectSpec {
     transforms: DialectTransforms {
         flatten_top_level_combiners: true,
         require_properties_on_objects: true,
+        // Whichever upstream serves the model may be RE2-backed, and this
+        // dialect has to satisfy the strictest of them.
+        re2_patterns_only: true,
         ..DEFAULT_TRANSFORMS
     },
 };
@@ -186,6 +198,9 @@ pub const ANTIGRAVITY_CLAUDE: DialectSpec = DialectSpec {
         prune_dangling_required: true,
         const_as_enum: true,
         one_of_as_any_of: true,
+        // Every Antigravity request is a Gemini `generateContent` payload, so
+        // the RE2 constraint applies whatever model it names.
+        re2_patterns_only: true,
         ..DEFAULT_TRANSFORMS
     },
 };
@@ -216,6 +231,9 @@ pub const ANTIGRAVITY_BRIDGE: DialectSpec = DialectSpec {
         prune_dangling_required: true,
         const_as_enum: true,
         one_of_as_any_of: true,
+        // Every Antigravity request is a Gemini `generateContent` payload, so
+        // the RE2 constraint applies whatever model it names.
+        re2_patterns_only: true,
         ..DEFAULT_TRANSFORMS
     },
 };
@@ -227,6 +245,7 @@ const DEFAULT_TRANSFORMS: DialectTransforms = DialectTransforms {
     prune_dangling_required: false,
     const_as_enum: false,
     one_of_as_any_of: false,
+    re2_patterns_only: false,
     merge_all_of_branches: false,
 };
 

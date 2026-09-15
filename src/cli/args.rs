@@ -403,13 +403,6 @@ pub(crate) enum Command {
     /// Install a launcher so jcode appears in your app launcher
     SetupLauncher,
 
-    /// Browser automation setup and status
-    Browser {
-        /// Action (setup, status)
-        #[arg(default_value = "setup")]
-        action: String,
-    },
-
     /// Replay a saved session in the TUI
     Replay {
         /// Session ID, name, or path to session JSON file

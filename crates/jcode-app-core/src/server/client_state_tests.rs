@@ -122,8 +122,8 @@ async fn handle_get_history_falls_back_to_persisted_snapshot_when_agent_is_busy(
 async fn assert_busy_history_service_tier(tier: Option<&'static str>) {
     let _guard = crate::storage::lock_test_env();
     let temp_home = tempfile::TempDir::new().expect("create temp home");
-    let prev_home = std::env::var_os("JCODE_HOME");
-    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let runtime = tempfile::TempDir::new().expect("create runtime");
+    let _env = ReloadHistoryEnvGuard::new(temp_home.path(), runtime.path());
 
     let session_id = "session_busy_history_fallback";
     let mut session = crate::session::Session::create_with_id(
@@ -156,6 +156,14 @@ async fn assert_busy_history_service_tier(tier: Option<&'static str>) {
         live_session,
         None,
     )));
+    // Agent startup persists an Active environment snapshot. Establish the
+    // interrupted disk fixture afterwards so history actually loads a crash.
+    let mut persisted = crate::session::Session::load_for_remote_startup(session_id)
+        .expect("load startup snapshot");
+    persisted.status = crate::session::SessionStatus::Crashed {
+        message: Some("test interruption".into()),
+    };
+    persisted.save().expect("save interrupted snapshot");
     let busy_guard = agent.lock().await;
 
     let sessions = Arc::new(RwLock::new(HashMap::from([(
@@ -169,6 +177,7 @@ async fn assert_busy_history_service_tier(tier: Option<&'static str>) {
     let (_reader_a, writer_a) = stream_a.into_split();
     let writer = Arc::new(Mutex::new(writer_a));
 
+    super::HISTORY_SESSION_LOADS.with(|loads| loads.set(0));
     handle_get_history(
         42,
         session_id,
@@ -186,6 +195,13 @@ async fn assert_busy_history_service_tier(tier: Option<&'static str>) {
     .await
     .expect("history should be written from persisted fallback");
 
+    super::HISTORY_SESSION_LOADS.with(|loads| {
+        assert_eq!(
+            loads.get(),
+            1,
+            "history and recovery must share one persisted snapshot"
+        )
+    });
     drop(busy_guard);
     drop(writer);
 
@@ -207,8 +223,13 @@ async fn assert_busy_history_service_tier(tier: Option<&'static str>) {
             messages,
             activity,
             service_tier,
+            reload_recovery,
             ..
         } => {
+            assert!(
+                reload_recovery.is_some(),
+                "crashed snapshot must infer recovery"
+            );
             assert_eq!(id, 42);
             assert_eq!(returned_session_id, session_id);
             assert_eq!(messages.len(), 1);
@@ -218,12 +239,6 @@ async fn assert_busy_history_service_tier(tier: Option<&'static str>) {
             assert!(activity.is_processing);
         }
         other => panic!("expected history event, got {:?}", other),
-    }
-
-    if let Some(prev_home) = prev_home {
-        crate::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        crate::env::remove_var("JCODE_HOME");
     }
 }
 
@@ -394,7 +409,7 @@ fn history_reload_recovery_infers_pending_active_user_turn_during_reload() -> Re
         Some(session_id.to_string()),
     );
 
-    let snapshot = super::history_reload_recovery_snapshot(session_id, None);
+    let snapshot = super::history_reload_recovery_snapshot(session_id, None, None);
     assert!(
         snapshot.is_some(),
         "pending user turn during reload should get recovery directive"
@@ -420,7 +435,7 @@ fn history_reload_recovery_does_not_infer_pending_user_turn_without_reload_marke
     let session_id = "session_history_no_reload_fallback";
     write_pending_user_session(session_id, crate::session::SessionStatus::Active)?;
 
-    assert!(super::history_reload_recovery_snapshot(session_id, None).is_none());
+    assert!(super::history_reload_recovery_snapshot(session_id, None, None).is_none());
     Ok(())
 }
 
@@ -442,7 +457,7 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
         "test store intent",
     )?;
 
-    let Some(snapshot) = super::history_reload_recovery_snapshot(session_id, None) else {
+    let Some(snapshot) = super::history_reload_recovery_snapshot(session_id, None, None) else {
         anyhow::bail!("server-owned recovery intent should be used");
     };
     assert_eq!(snapshot.continuation_message, "stored continuation");
@@ -451,7 +466,8 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
         "building a History payload must not consume the intent; the client may disconnect before queuing it"
     );
 
-    let Some(snapshot_again) = super::history_reload_recovery_snapshot(session_id, None) else {
+    let Some(snapshot_again) = super::history_reload_recovery_snapshot(session_id, None, None)
+    else {
         anyhow::bail!("pending server-owned recovery intent should be re-emitted until accepted");
     };
     assert_eq!(snapshot_again.continuation_message, "stored continuation");
@@ -481,8 +497,50 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
         "accepted continuation should consume the durable pending intent"
     );
     assert!(
-        super::history_reload_recovery_snapshot(session_id, None).is_none(),
+        super::history_reload_recovery_snapshot(session_id, None, None).is_none(),
         "delivered server-owned recovery intent should no longer be emitted"
     );
+    Ok(())
+}
+
+#[test]
+fn attach_recovery_uses_supplied_snapshot_and_preserves_explicit_precedence() -> Result<()> {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new()?;
+    let runtime = tempfile::TempDir::new()?;
+    let _guard = ReloadHistoryEnvGuard::new(home.path(), runtime.path());
+    let session_id = "session_attach_snapshot_precedence";
+    // Deliberately do not persist this snapshot. Reloading from disk would lose
+    // the crashed state, so this also checks that inference uses this instance.
+    let mut session = crate::session::Session::create_with_id(session_id.into(), None, None);
+    session.status = crate::session::SessionStatus::Crashed {
+        message: Some("test".into()),
+    };
+    super::HISTORY_SESSION_LOADS.with(|loads| loads.set(0));
+    assert!(super::history_reload_recovery_snapshot(session_id, None, Some(&session)).is_some());
+    assert!(
+        super::history_reload_recovery_snapshot(session_id, Some(false), Some(&session)).is_none()
+    );
+    session.status = crate::session::SessionStatus::Active;
+    assert!(
+        super::history_reload_recovery_snapshot(session_id, Some(true), Some(&session)).is_some()
+    );
+    super::super::reload_recovery::persist_intent(
+        "reload-attach-precedence",
+        session_id,
+        super::super::reload_recovery::ReloadRecoveryRole::InterruptedPeer,
+        crate::tool::selfdev::ReloadRecoveryDirective {
+            reconnect_notice: None,
+            continuation_message: "server-owned continuation".into(),
+        },
+        "test precedence",
+    )?;
+    let directive =
+        super::history_reload_recovery_snapshot(session_id, Some(false), Some(&session)).unwrap();
+    assert_eq!(directive.continuation_message, "server-owned continuation");
+    assert!(super::super::reload_recovery::has_pending_for_session(
+        session_id
+    ));
+    super::HISTORY_SESSION_LOADS.with(|loads| assert_eq!(loads.get(), 0));
     Ok(())
 }

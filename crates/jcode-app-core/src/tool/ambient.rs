@@ -228,6 +228,7 @@ impl Tool for EndAmbientCycleTool {
             ended_at: now,
             status: CycleStatus::Complete,
             conversation: None, // populated by the runner after cycle completes
+            route: None,        // stamped by the runner, which owns the provider
         };
 
         // Store for the ambient runner to pick up

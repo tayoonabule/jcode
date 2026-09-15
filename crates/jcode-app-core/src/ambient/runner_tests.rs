@@ -1,5 +1,5 @@
 use super::AmbientRunnerHandle;
-use crate::ambient::{Priority, ScheduleTarget, ScheduledItem};
+use crate::ambient::{AmbientState, AmbientStatus, Priority, ScheduleTarget, ScheduledItem};
 use crate::message::{Message, Role, StreamEvent, ToolDefinition};
 use crate::provider::{EventStream, Provider};
 use crate::session::Session;
@@ -159,6 +159,54 @@ async fn unsupported_visible_launch_falls_back_to_headless() {
 #[tokio::test]
 async fn missing_visible_launcher_falls_back_to_headless() {
     assert_visible_launch_error_falls_back(std::io::ErrorKind::NotFound).await;
+}
+
+#[tokio::test]
+async fn runner_recovers_stale_running_state_after_restart() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+
+    let state = AmbientState {
+        status: AmbientStatus::Running {
+            detail: "running agent".to_string(),
+        },
+        ..Default::default()
+    };
+    state.save().expect("save stale ambient state");
+
+    let provider: Arc<dyn Provider> = Arc::new(TestProvider);
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+    let task = tokio::spawn(runner.run_loop(provider));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let recovered = AmbientState::load().expect("load recovered ambient state");
+    assert_eq!(recovered.status, AmbientStatus::Idle);
+
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn manual_trigger_persists_idle_state_for_scheduler() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+
+    let state = AmbientState {
+        status: AmbientStatus::Scheduled {
+            next_wake: chrono::Utc::now() + chrono::Duration::hours(1),
+        },
+        ..Default::default()
+    };
+    state.save().expect("save scheduled ambient state");
+
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+    runner.trigger().await;
+
+    let triggered = AmbientState::load().expect("load triggered ambient state");
+    assert_eq!(triggered.status, AmbientStatus::Idle);
 }
 
 #[tokio::test]

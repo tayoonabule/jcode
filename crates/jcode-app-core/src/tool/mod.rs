@@ -4,7 +4,6 @@ mod apply_patch;
 mod bash;
 mod batch;
 mod bg;
-mod browser;
 mod communicate;
 #[cfg(target_os = "macos")]
 mod computer;
@@ -55,7 +54,11 @@ pub(crate) fn tool_name_is_allowed(allowed: &HashSet<String>, name: &str) -> boo
 }
 
 pub(crate) fn tool_name_is_disabled(disabled: &HashSet<String>, name: &str) -> bool {
-    disabled.contains(name) || (disabled.contains("mcp") && is_mcp_tool_name(name))
+    disabled.contains(name)
+        || (disabled.contains("mcp") && is_mcp_tool_name(name))
+        || disabled
+            .iter()
+            .any(|prefix| prefix.ends_with("__") && name.starts_with(prefix))
 }
 
 fn is_fixed_mcp_tool(name: &str) -> bool {
@@ -67,6 +70,23 @@ fn is_mcp_tool_name(name: &str) -> bool {
 }
 use std::sync::{LazyLock, RwLock as StdRwLock};
 use tokio::sync::RwLock;
+
+/// Render a path as a complete local `file://` URL for model- and user-facing
+/// output. Relative paths are resolved against the current directory and
+/// existing paths are canonicalized when possible.
+pub(crate) fn file_url(path: &std::path::Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let absolute = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+    url::Url::from_file_path(&absolute)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| absolute.to_string_lossy().into_owned())
+}
 
 pub(crate) use jcode_tool_core::intent_schema_property;
 pub use jcode_tool_core::{StdinInputRequest, Tool, ToolContext, ToolExecutionMode};
@@ -346,7 +366,6 @@ impl Registry {
             );
             Self::insert_tool_timed(&mut m, &mut timings, "ls", ls::LsTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bash", bash::BashTool::new);
-            Self::insert_tool_timed(&mut m, &mut timings, "browser", browser::BrowserTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "open", open::OpenTool::new);
             #[cfg(target_os = "macos")]
             Self::insert_tool_timed(
@@ -1178,7 +1197,11 @@ impl Registry {
             let registry = self.clone();
             tokio::spawn(async move {
                 let (successes, failures) = {
-                    let manager = mcp_manager.write().await;
+                    // `connect_all` only needs shared access. Holding a write
+                    // lock here blocks every MCP tool call while an HTTP
+                    // server waits for browser OAuth, including unrelated
+                    // local or already-connected servers.
+                    let manager = mcp_manager.read().await;
                     manager.connect_all().await.unwrap_or((0, Vec::new()))
                 };
 
@@ -1405,6 +1428,14 @@ mod mcp_allow_list_tests {
         ));
         assert!(!tool_name_is_disabled(&disabled, "mcpish"));
         assert!(!tool_name_is_disabled(&disabled, "bash"));
+    }
+
+    #[test]
+    fn disabling_an_mcp_server_prefix_hides_only_that_server() {
+        let disabled = HashSet::from(["mcp__dokploy__".to_string()]);
+
+        assert!(tool_name_is_disabled(&disabled, "mcp__dokploy__deploy"));
+        assert!(!tool_name_is_disabled(&disabled, "mcp__gmail__send"));
     }
 }
 

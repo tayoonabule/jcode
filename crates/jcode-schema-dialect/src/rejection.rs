@@ -24,6 +24,12 @@ pub struct SchemaRejection {
     pub keywords: Vec<String>,
     /// The offending `format` value, when the provider names one.
     pub format: Option<String>,
+    /// Set when the provider rejected a `pattern`'s *regex* rather than a
+    /// keyword. Distinct from `keywords` because the fix is not "stop sending
+    /// `pattern`" (which would strip every tool's valid patterns) but "stop
+    /// sending patterns this engine cannot compile", which the dialect's
+    /// `re2_patterns_only` transform already expresses.
+    pub unsupported_regex: bool,
     /// The tool whose schema was rejected, when the provider names one.
     pub tool: Option<String>,
 }
@@ -38,7 +44,7 @@ impl SchemaRejection {
     /// rejection we cannot attribute is not worth retrying: the retry would
     /// send a byte-identical request.
     pub fn is_actionable(&self) -> bool {
-        !self.keywords.is_empty() || self.format.is_some()
+        !self.keywords.is_empty() || self.format.is_some() || self.unsupported_regex
     }
 }
 
@@ -59,6 +65,7 @@ pub fn classify(message: &str) -> Option<SchemaRejection> {
             return Some(SchemaRejection {
                 keywords: names,
                 format: None,
+                unsupported_regex: false,
                 tool,
             });
         }
@@ -69,6 +76,7 @@ pub fn classify(message: &str) -> Option<SchemaRejection> {
         return Some(SchemaRejection {
             keywords: Vec::new(),
             format: Some(format),
+            unsupported_regex: false,
             tool,
         });
     }
@@ -78,6 +86,7 @@ pub fn classify(message: &str) -> Option<SchemaRejection> {
         return Some(SchemaRejection {
             keywords: vec![keyword],
             format: None,
+            unsupported_regex: false,
             tool,
         });
     }
@@ -89,6 +98,23 @@ pub fn classify(message: &str) -> Option<SchemaRejection> {
         return Some(SchemaRejection {
             keywords: vec!["required".to_string()],
             format: None,
+            unsupported_regex: false,
+            tool,
+        });
+    }
+
+    // OpenAI: a `pattern` whose regex the provider's engine cannot compile.
+    //   invalid_request_error (invalid_json_schema): Invalid JSON schema: regex
+    //   lookaround is not supported. Found at $.properties.bitbucketEmail.pattern.
+    // This must be matched before the structural catch-all below, which would
+    // otherwise swallow it as unactionable and leave the provider bricked.
+    if message.contains("regex lookaround is not supported")
+        || (message.contains("invalid_json_schema") && message.contains("regex"))
+    {
+        return Some(SchemaRejection {
+            keywords: Vec::new(),
+            format: None,
+            unsupported_regex: true,
             tool,
         });
     }
@@ -103,6 +129,7 @@ pub fn classify(message: &str) -> Option<SchemaRejection> {
         return Some(SchemaRejection {
             keywords: Vec::new(),
             format: None,
+            unsupported_regex: false,
             tool,
         });
     }
@@ -114,6 +141,7 @@ pub fn classify(message: &str) -> Option<SchemaRejection> {
         return Some(SchemaRejection {
             keywords: vec!["anyOf".to_string()],
             format: None,
+            unsupported_regex: false,
             tool,
         });
     }

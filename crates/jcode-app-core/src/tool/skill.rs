@@ -147,7 +147,7 @@ impl SkillTool {
         let base_dir = skill
             .path
             .parent()
-            .map(|p| p.display().to_string())
+            .map(|p| crate::tool::file_url(p))
             .unwrap_or_else(|| ".".to_string());
 
         Ok(ToolOutput::new(format!(
@@ -186,7 +186,7 @@ impl SkillTool {
             for skill in &skills {
                 output.push_str(&format!("## /{}\n", skill.name));
                 output.push_str(&format!("  {}\n", skill.description));
-                output.push_str(&format!("  Path: {}\n", skill.path.display()));
+                output.push_str(&format!("  Path: {}\n", crate::tool::file_url(&skill.path)));
                 if let Some(ref tools) = skill.allowed_tools {
                     output.push_str(&format!("  Tools: {}\n", tools.join(", ")));
                 }
@@ -213,7 +213,7 @@ impl SkillTool {
                         "Reloaded skill '{}'\n\nDescription: {}\nPath: {}",
                         name,
                         skill.description,
-                        skill.path.display()
+                        crate::tool::file_url(&skill.path)
                     ))
                     .with_title(format!("Skills: Reloaded {}", name)))
                 } else {
@@ -291,7 +291,10 @@ impl SkillTool {
         if let Some(skill) = registry.get(&name) {
             let mut output = format!("# Skill: {}\n\n", skill.name);
             output.push_str(&format!("**Description:** {}\n", skill.description));
-            output.push_str(&format!("**Path:** {}\n", skill.path.display()));
+            output.push_str(&format!(
+                "**Path:** {}\n",
+                crate::tool::file_url(&skill.path)
+            ));
             if let Some(ref tools) = skill.allowed_tools {
                 output.push_str(&format!("**Allowed tools:** {}\n", tools.join(", ")));
             }

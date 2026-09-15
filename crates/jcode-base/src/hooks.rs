@@ -22,6 +22,7 @@
 //! hook that itself invokes jcode does not recursively trigger hooks.
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 tokio::task_local! {
     /// Terminal identity for the client whose request is currently executing.
@@ -126,6 +127,93 @@ pub fn hook_command(event: &str) -> Option<String> {
 /// skip payload construction entirely when no hook is set.
 pub fn hook_configured(event: &str) -> bool {
     !hook_commands(event).is_empty()
+}
+
+/// Report Jcode's resumable session identity to Herdr when running in a Herdr
+/// pane. This intentionally reports identity only, not lifecycle state: Jcode's
+/// turn hooks do not cover every blocked/approval/interrupt transition, so
+/// taking over Herdr's screen-manifest authority would make detection less
+/// accurate. The command is detached and best-effort, just like observer hooks.
+pub fn dispatch_herdr_session_identity(session_id: &str, source: &str) {
+    // A nested jcode running inside a hook process shares the pane's Herdr env
+    // but is not the pane's agent. Reporting from there would overwrite the
+    // real session identity with a throwaway one, so honor the same recursion
+    // guard every other hook dispatch uses.
+    if hooks_suppressed() {
+        return;
+    }
+    let client_env = CLIENT_TERMINAL_ENV
+        .try_with(|env| env.clone())
+        .unwrap_or_default();
+    let env_value = |key: &str| {
+        client_env
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var_os(key).map(|value| value.to_string_lossy().into_owned()))
+    };
+    // An empty pane id identifies no pane, so treat it as "not in Herdr"
+    // rather than reporting against a blank target.
+    let pane = env_value("HERDR_PANE_ID").filter(|value| !value.is_empty());
+    let Some(pane) = pane.filter(|_| env_value("HERDR_ENV").is_some()) else {
+        return;
+    };
+    if session_id.trim().is_empty() {
+        return;
+    }
+
+    let herdr = env_value("HERDR_BIN_PATH")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "herdr".to_string());
+    let seq = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| "1".to_string());
+
+    let mut command = std::process::Command::new(herdr);
+    command.args([
+        "pane",
+        "report-agent-session",
+        &pane,
+        "--source",
+        "herdr:jcode",
+        "--agent",
+        "jcode",
+        "--seq",
+        &seq,
+        "--agent-session-id",
+        session_id,
+        "--session-start-source",
+        match source {
+            "resume" => "resume",
+            _ => "startup",
+        },
+    ]);
+    for key in [
+        "HERDR_ENV",
+        "HERDR_SOCKET_PATH",
+        "HERDR_PANE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_WORKSPACE_ID",
+        "HERDR_BIN_PATH",
+        "HERDR_SESSION",
+        "HERDR_AGENT",
+    ] {
+        if let Some(value) = env_value(key) {
+            command.env(key, value);
+        }
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    match crate::platform::spawn_detached(&mut command) {
+        Ok(child) => crate::platform::reap_detached(child),
+        Err(error) => crate::logging::debug(&format!(
+            "Herdr session identity report failed to start: {error}"
+        )),
+    }
 }
 
 /// True when running inside a hook process (recursion guard).

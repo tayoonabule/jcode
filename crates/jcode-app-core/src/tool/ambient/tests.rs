@@ -21,6 +21,7 @@ fn test_cycle_result_store_and_take() {
         ended_at: Utc::now(),
         status: CycleStatus::Complete,
         conversation: None,
+        route: None,
     };
 
     store_cycle_result(result);

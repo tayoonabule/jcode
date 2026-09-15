@@ -484,9 +484,6 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         Some(Command::SetupLauncher) => {
             setup_hints::run_setup_launcher()?;
         }
-        Some(Command::Browser { action }) => {
-            commands::run_browser(&action).await?;
-        }
         Some(Command::Replay {
             session,
             swarm,

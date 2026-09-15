@@ -5,10 +5,15 @@
 //! MCP server processes instead of spawning duplicates.
 
 mod client;
+pub mod http;
 mod manager;
+pub mod oauth;
+mod pending;
 pub mod pool;
 mod protocol;
 pub mod schema_cache;
+pub mod sse;
+mod sse_wire;
 mod tool;
 
 pub use client::{DEFAULT_MCP_REQUEST_TIMEOUT, McpClient, McpHandle, request_timeout_for};
