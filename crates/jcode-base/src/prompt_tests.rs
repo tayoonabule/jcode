@@ -17,6 +17,18 @@ fn test_default_system_prompt_no_claude_code_identity() {
 }
 
 #[test]
+fn test_default_system_prompt_prefers_native_integrations_to_browser_use() {
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("use a suitable native integration before a browser"),
+        "DEFAULT_SYSTEM_PROMPT should require native integrations before browser use"
+    );
+    assert!(
+        DEFAULT_SYSTEM_PROMPT.contains("State the fallback reason before browsing"),
+        "DEFAULT_SYSTEM_PROMPT should require an explicit browser fallback reason"
+    );
+}
+
+#[test]
 fn mermaid_prompt_module_follows_capability() {
     let (enabled, _) = build_system_prompt_split_with_capabilities(
         None,
