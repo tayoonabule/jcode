@@ -648,7 +648,6 @@ pub fn populate_anthropic_models_for_scope(scope: &str, slugs: Vec<String>) {
     crate::bus::Bus::global().publish_models_updated();
 }
 
-#[cfg(test)]
 pub(crate) fn merge_openai_model_ids(dynamic_models: Vec<String>) -> Vec<String> {
     let mut models = openai_static_model_ids();
     let mut seen: HashSet<String> = models
@@ -676,7 +675,6 @@ pub(crate) fn merge_openai_model_ids(dynamic_models: Vec<String>) -> Vec<String>
     models
 }
 
-#[cfg(test)]
 pub(crate) fn merge_anthropic_model_ids(dynamic_models: Vec<String>) -> Vec<String> {
     let mut models = anthropic_static_model_ids();
     let mut seen: HashSet<String> = models
@@ -717,18 +715,13 @@ pub fn known_anthropic_model_ids() -> Vec<String> {
                 .is_ok()
                 .then(anthropic_static_model_ids)
         });
-    if api.is_none() && oauth.is_none() {
-        return anthropic_static_model_ids();
-    }
-    let mut models = api.unwrap_or_default();
-    models.extend(oauth.unwrap_or_default());
-    models.sort();
-    models.dedup();
-    models
+    let mut dynamic_models = api.unwrap_or_default();
+    dynamic_models.extend(oauth.unwrap_or_default());
+    merge_anthropic_model_ids(dynamic_models)
 }
 
 pub fn known_anthropic_model_ids_for_scope(scope: &str) -> Vec<String> {
-    cached_anthropic_model_ids_for_scope(scope).unwrap_or_else(anthropic_static_model_ids)
+    merge_anthropic_model_ids(cached_anthropic_model_ids_for_scope(scope).unwrap_or_default())
 }
 
 /// True when an OpenAI platform API key is configured (env or openai.env).
@@ -743,7 +736,7 @@ pub fn openai_platform_api_key_configured() -> bool {
 }
 
 pub fn known_openai_model_ids() -> Vec<String> {
-    let mut models = cached_openai_model_ids().unwrap_or_else(openai_static_model_ids);
+    let mut models = merge_openai_model_ids(cached_openai_model_ids().unwrap_or_default());
     if !models.iter().any(|model| model == CHATGPT_WEB_MODEL) {
         models.push(CHATGPT_WEB_MODEL.to_string());
     }

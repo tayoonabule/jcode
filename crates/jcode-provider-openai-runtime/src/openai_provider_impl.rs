@@ -836,8 +836,10 @@ impl Provider for OpenAIProvider {
         if self.is_browser_only() {
             return vec![CHATGPT_WEB_MODEL.to_string()];
         }
-        let mut models =
-            jcode_base::provider::cached_openai_model_ids().unwrap_or_else(|| vec![self.model()]);
+        let mut models = jcode_base::provider::known_openai_model_ids();
+        if models.is_empty() {
+            models.push(self.model());
+        }
         if !models.iter().any(|model| model == CHATGPT_WEB_MODEL) {
             models.insert(0, CHATGPT_WEB_MODEL.to_string());
         }
