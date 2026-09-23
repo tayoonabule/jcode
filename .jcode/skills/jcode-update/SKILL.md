@@ -85,18 +85,29 @@ Use this skill when the user asks to finish, ship, sync, install, or update the 
 5. **Install the integrated local build**
    For a fast local install from source:
    ```bash
+   expected=$(git rev-parse --short HEAD)
    JCODE_RELEASE_PROFILE=release scripts/install_release.sh --fast
    ```
-   This updates `~/.jcode/builds/versions`, `current`, `stable`, and the launcher. For normal self-development activation, use the supported `selfdev build` followed by `selfdev reload` instead of a release build.
+   This updates `~/.jcode/builds/versions`, `current`, `stable`, and the launcher. For normal
+   self-development activation, use the supported `selfdev build` followed by
+   `selfdev reload` instead of a release build.
 
 6. **Reload and verify the shared daemon**
    ```bash
-   jcode server reload
+   jcode server promote "$expected" --json
+   jcode server reload --force --json
    jcode --version
-   readlink ~/.jcode/builds/current/jcode
-   readlink ~/.jcode/builds/shared-server/jcode
+   readlink -f ~/.jcode/builds/current/jcode
+   readlink -f ~/.jcode/builds/shared-server/jcode
    ```
-   Verify the current and shared-server binaries resolve to the integrated commit. For source builds, `selfdev status` must report the same hash for `Current` and `Shared server`, with reload state `SocketReady`.
+   Do not treat the install script's reload message as proof of activation. The
+   shared-server channel may be pinned to an older self-dev binary, and a reload
+   can be a successful no-op when no listener is found. Verify that `current`,
+   `stable`, `shared-server`, the launcher, and the live daemon executable all
+   resolve to `expected`. On macOS, if the daemon was launched with a different
+   runtime directory, discover its actual socket from the live process and pass
+   it explicitly with `--socket`. For source builds, `selfdev status` must report
+   the same hash for `Current` and `Shared server`, with reload state `SocketReady`.
 
 7. **Safely clean old builds**
    First inspect:
