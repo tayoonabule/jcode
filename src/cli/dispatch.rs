@@ -83,6 +83,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
     if let Some(Command::Auth(AuthCommand::Import { json, .. })) = &args.command {
         return super::auth_import::run(&args.provider, *json);
     }
+    resolve_fork_arg(&mut args)?;
     resolve_resume_arg(&mut args)?;
 
     // One-time config migration: users whose config.toml still carries the old
@@ -446,6 +447,9 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                 clear,
                 json,
             } => commands::run_session_rename_command(&session, name.as_deref(), clear, json)?,
+            SessionCommand::Fork { session, json } => {
+                commands::run_session_fork_command(&session, json)?
+            }
         },
         Some(Command::Ambient(subcmd)) => {
             commands::run_ambient_command(map_ambient_subcommand(subcmd)).await?;
@@ -652,6 +656,16 @@ fn auth_doctor_provider_arg<'a>(
             Some(global_provider.as_arg_value())
         }
     })
+}
+
+/// `--fork <id>` clones the saved session into a new one and then opens it
+/// exactly like `--resume <new id>`, so `-C`, `-m` and the TUI launch apply.
+fn resolve_fork_arg(args: &mut Args) -> Result<()> {
+    if let Some(source) = args.fork.take() {
+        let fork_id = commands::fork_saved_session(&source)?.id;
+        args.resume = Some(fork_id);
+    }
+    Ok(())
 }
 
 fn resolve_resume_arg(args: &mut Args) -> Result<()> {

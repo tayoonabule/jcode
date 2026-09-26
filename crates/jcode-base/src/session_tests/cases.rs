@@ -3006,3 +3006,31 @@ fn first_visible_user_prompt_becomes_the_generated_title() {
     session.rename_title(Some("Custom".into()));
     assert_eq!(session.display_title(), Some("Custom"));
 }
+
+#[test]
+fn fork_from_clones_transcript_into_independent_session() {
+    let mut parent = Session::create(None, Some("parent".into()));
+    parent.working_dir = Some("/repo".into());
+    parent.model = Some("gpt-6-sol".into());
+    parent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "original request".to_string(),
+            cache_control: None,
+        }],
+    );
+    let parent_len = parent.messages.len();
+
+    let child = Session::fork_from(&parent);
+
+    assert_ne!(child.id, parent.id);
+    assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+    assert_eq!(child.working_dir.as_deref(), Some("/repo"));
+    assert_eq!(child.model.as_deref(), Some("gpt-6-sol"));
+    assert_eq!(child.status, SessionStatus::Closed);
+    // Inherited transcript plus the fork notice; the parent is untouched.
+    assert_eq!(child.messages.len(), parent_len + 1);
+    assert_eq!(parent.messages.len(), parent_len);
+    assert!(child.messages[0].content_preview().contains("original request"));
+    assert!(child.messages.last().unwrap().content_preview().contains(&parent.id));
+}
