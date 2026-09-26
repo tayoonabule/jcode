@@ -185,6 +185,36 @@ pub struct ResourceContent {
     pub blob: Option<String>,
 }
 
+/// Optional static OAuth configuration for remote MCP servers.
+///
+/// When omitted, the remote transport uses protected-resource metadata and
+/// dynamic client registration when the authorization server supports it.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct McpOAuthConfig {
+    /// A pre-created OAuth client id.
+    #[serde(rename = "clientId", alias = "client_id", default)]
+    pub client_id: Option<String>,
+    /// Optional client secret. Prefer an environment reference in mcp.json.
+    #[serde(rename = "clientSecret", alias = "client_secret", default)]
+    pub client_secret: Option<String>,
+    /// Explicit authorization endpoint for providers without discovery.
+    #[serde(
+        rename = "authorizationEndpoint",
+        alias = "authorization_endpoint",
+        default
+    )]
+    pub authorization_endpoint: Option<String>,
+    /// Explicit token endpoint for providers without discovery.
+    #[serde(rename = "tokenEndpoint", alias = "token_endpoint", default)]
+    pub token_endpoint: Option<String>,
+    /// Scopes to request when the server does not advertise them.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Optional fixed loopback callback URL.
+    #[serde(rename = "redirectUri", alias = "redirect_uri", default)]
+    pub redirect_uri: Option<String>,
+}
+
 /// MCP server configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
@@ -212,6 +242,9 @@ pub struct McpServerConfig {
     /// but retained so environment expansion is ready when those transports are.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub headers: std::collections::HashMap<String, String>,
+    /// Optional static OAuth client configuration for remote HTTP/SSE servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpOAuthConfig>,
     /// Whether this server is enabled (default: true). Disabled servers stay
     /// registered in config but are not spawned or connected at load time
     /// until re-enabled (issue #436). opencode-style `"enabled": false`.
@@ -371,6 +404,22 @@ impl McpConfig {
             for value in config.headers.values_mut() {
                 *value = expand_environment_string(value, &lookup, &mut unresolved);
             }
+            if let Some(oauth) = &mut config.oauth {
+                for value in [
+                    &mut oauth.client_id,
+                    &mut oauth.client_secret,
+                    &mut oauth.authorization_endpoint,
+                    &mut oauth.token_endpoint,
+                    &mut oauth.redirect_uri,
+                ] {
+                    if let Some(value) = value {
+                        *value = expand_environment_string(value, &lookup, &mut unresolved);
+                    }
+                }
+                for scope in &mut oauth.scopes {
+                    *scope = expand_environment_string(scope, &lookup, &mut unresolved);
+                }
+            }
 
             warnings.extend(
                 unresolved
@@ -525,6 +574,7 @@ impl McpConfig {
                             transport: None,
                             url: None,
                             headers: std::collections::HashMap::new(),
+                            oauth: None,
                             enabled,
                             disabled: None,
                             timeout_secs: None,
