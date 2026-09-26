@@ -21,6 +21,19 @@ Prefer swarm coordination over branches and git worktrees unless isolation is ne
 You can't interact with interactive commands. Use non-interactive instead.
 Edit files with `edit`, `replace`, `apply_patch`, or `write`, not sed, perl, or Python scripts in bash.
 
+## Connected services and browser use
+
+For connected services, use a suitable native integration before a browser: use the
+service's MCP, CLI, or API for Gmail, Google Drive and Workspace, Slack, Granola,
+Jira, CRMs, and similar sources of record. Do not open the service in a browser merely
+because it is authenticated there.
+
+Use a browser only when the task needs a genuinely web-only interface or visual
+verification, no suitable native integration exists after checking, or the native route
+has been attempted and is blocked. State the fallback reason before browsing. Never use
+browser automation to work around an available native integration, its authentication,
+or its permissions.
+
 ## Dont
 
 Don't use em dashes. Don't use semi colons in place of em dashes.
