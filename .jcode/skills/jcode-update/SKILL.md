@@ -21,6 +21,11 @@ Use this skill when the user asks to finish, ship, sync, install, or update the 
 - Keep the fork history compact when requested: preserve the old tip in a backup
   ref, then create one local commit on top of `upstream/master` containing the
   surviving fork changes. Never force-push automatically.
+- When publishing to a fork whose `origin/main` diverged after a rebase, do not
+  stop at the failed fast-forward or force-push. Audit the origin-only commits,
+  port any surviving changes, and incorporate origin's ancestry with a normal
+  merge before a regular push. Preserve the tested integrated tree when the
+  origin content has already been accounted for.
 - Before any destructive build cleanup, print the candidates and preserve every path referenced by `current`, `stable`, `shared-server`, `canary`, launcher symlinks, or a live process.
 
 ## Standard workflow
@@ -81,6 +86,20 @@ Use this skill when the user asks to finish, ship, sync, install, or update the 
    git merge --ff-only <completed-branch>
    ```
    Prefer fast-forward integration. If fast-forward is impossible, explain the divergence and ask before creating a merge commit. Never force-update `main`.
+
+   When the user also requested a push to their fork, check whether
+   `origin/main` is an ancestor of local `main`. If not, inspect every
+   origin-only commit against the rebased tree and port any missing fork
+   behavior with focused tests. A normal merge may auto-apply stale versions
+   of many upstream files. When that risk is present and every origin-only
+   change is either ported, already present, or intentionally superseded, record
+   its ancestry with `git merge --no-ff -s ours origin/main`, preserving the
+   audited tree. Verify the tree ID is unchanged by that ancestry merge and
+   both upstream and origin are ancestors. Otherwise use a normal merge and
+   resolve conflicts, then revalidate. Do not substitute `-s ours` for the
+   content audit or use it on an unrelated branch. Re-fetch before publishing,
+   then use only a regular `git push origin main`. If origin moved, repeat the
+   audit instead of forcing a push.
 
 5. **Install the integrated local build**
    For a fast local install from source:
