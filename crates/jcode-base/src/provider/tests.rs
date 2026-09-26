@@ -38,6 +38,7 @@ fn with_clean_provider_test_env<T>(f: impl FnOnce() -> T) -> T {
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
         "JCODE_INITIAL_PROVIDER_EXPLICIT",
+        INITIAL_MODEL_EXPLICIT_ENV,
         "JCODE_OPENAI_MODEL",
         "JCODE_NAMED_PROVIDER_PROFILE",
         "JCODE_PROVIDER_PROFILE_ACTIVE",
@@ -1196,6 +1197,35 @@ fn new_session_fork_reloads_changed_config_provider_and_model() {
             let preserved = template.fork();
             assert_eq!(preserved.name(), "Claude");
             assert_eq!(preserved.model(), "claude-fable-5");
+        });
+    });
+}
+
+#[test]
+fn new_session_fork_preserves_explicit_initial_model_across_providers() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        runtime.block_on(async {
+            crate::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
+            crate::env::set_var("OPENAI_API_KEY", "sk-openai-test");
+            crate::config::Config::set_default_model(Some("gpt-6-luna"), Some("openai-api"))
+                .expect("save OpenAI default");
+
+            // `--provider auto --model claude-opus-5` first builds an auto
+            // provider, then switches it to the CLI model. The model marker is
+            // what distinguishes that startup choice from the persisted default
+            // when the server creates its first client session.
+            crate::env::set_var(INITIAL_MODEL_EXPLICIT_ENV, "1");
+            let template = MultiProvider::new_fast();
+            template
+                .set_model("claude-opus-5")
+                .expect("select explicit Claude model");
+            assert_eq!(template.name(), "Claude");
+            assert_eq!(template.model(), "claude-opus-5");
+
+            let fresh = template.fork_for_new_session();
+            assert_eq!(fresh.name(), "Claude");
+            assert_eq!(fresh.model(), "claude-opus-5");
         });
     });
 }

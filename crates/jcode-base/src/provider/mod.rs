@@ -331,6 +331,11 @@ use self::state::ProviderState;
 pub use self::state::{ProviderModelSelectionSource, ProviderRuntimeState, ProviderStateEvent};
 
 pub(crate) const GROK_BUILD_PROFILE_ID: &str = "grok-build";
+/// Marks a CLI-provided model as the startup selection for new server sessions.
+///
+/// The server forks provider templates per client. Unlike a persisted default,
+/// an explicit `--model` must survive that fork.
+pub const INITIAL_MODEL_EXPLICIT_ENV: &str = "JCODE_INITIAL_MODEL_EXPLICIT";
 
 /// MultiProvider wraps multiple providers and allows seamless model switching
 pub struct MultiProvider {
@@ -2879,7 +2884,8 @@ impl Provider for MultiProvider {
 
         // An explicit CLI initial provider/model remains the starting selection
         // for new sessions, while each session can switch freely afterward.
-        if self.initial_provider.is_some() {
+        if self.initial_provider.is_some() || std::env::var_os(INITIAL_MODEL_EXPLICIT_ENV).is_some()
+        {
             let active = self.active_provider();
             let current_model = self.model();
             let switch_request = self.fork_model_switch_request(active, &current_model);

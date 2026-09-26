@@ -1439,6 +1439,18 @@ async fn init_provider_with_options(
     allow_login_bootstrap: bool,
     allow_deferred_auth: bool,
 ) -> Result<Arc<dyn provider::Provider>> {
+    // New sessions normally rebuild the provider from the current persisted
+    // defaults. A model supplied on the command line is a stronger, process
+    // startup selection though, so retain that distinction for daemon session
+    // forks. This matters when `jcode -m ...` launches an auto-provider server:
+    // the server template has the requested model, while each client gets a
+    // fresh provider instance.
+    if model.is_some() {
+        crate::env::set_var(provider::INITIAL_MODEL_EXPLICIT_ENV, "1");
+    } else {
+        crate::env::remove_var(provider::INITIAL_MODEL_EXPLICIT_ENV);
+    }
+
     // Provider construction resolves concrete runtimes through the base
     // crate's external-runtime registry (composition-root pattern). The
     // binary's normal path registers them in `startup::run()`, but this
