@@ -336,6 +336,17 @@ async fn assert_history_service_tier_and_pdf_capability(
     // older transcript rather than a metadata-only journal update.
     session.replace_messages(session.messages.clone());
     session.save().expect("restore persisted history snapshot");
+    if busy {
+        // Agent startup persists an Active snapshot. Establish the interrupted
+        // disk fixture afterwards so the fallback history and recovery metadata
+        // inspect the same crashed snapshot.
+        let mut persisted = crate::session::Session::load_for_remote_startup(session_id)
+            .expect("load startup snapshot");
+        persisted.status = crate::session::SessionStatus::Crashed {
+            message: Some("test interruption".into()),
+        };
+        persisted.save().expect("save interrupted snapshot");
+    }
     let busy_guard = if busy { Some(agent.lock().await) } else { None };
 
     let sessions = Arc::new(RwLock::new(HashMap::from([(
@@ -348,6 +359,9 @@ async fn assert_history_service_tier_and_pdf_capability(
     let (stream_a, mut stream_b) = crate::transport::stream_pair().expect("stream pair");
     let (_reader_a, writer_a) = stream_a.into_split();
     let writer = Arc::new(Mutex::new(writer_a));
+    if busy {
+        super::HISTORY_SESSION_LOADS.with(|loads| loads.set(0));
+    }
 
     if racing_turn {
         // Reproduce the exact decision/preparation boundary without scheduler
@@ -460,6 +474,7 @@ async fn assert_history_service_tier_and_pdf_capability(
             messages,
             activity,
             service_tier,
+            reload_recovery,
             side_panel,
             ..
         } => {
@@ -475,6 +490,19 @@ async fn assert_history_service_tier_and_pdf_capability(
                 }
             );
             assert_eq!(service_tier.as_deref(), tier);
+            if busy {
+                assert!(
+                    reload_recovery.is_some(),
+                    "crashed persisted snapshot must infer recovery"
+                );
+                super::HISTORY_SESSION_LOADS.with(|loads| {
+                    assert_eq!(
+                        loads.get(),
+                        1,
+                        "history and recovery must share one persisted snapshot"
+                    )
+                });
+            }
             assert_eq!(
                 side_panel,
                 super::super::client_writer::side_panel_for_client(
@@ -669,7 +697,7 @@ fn history_reload_recovery_infers_pending_active_user_turn_during_reload() -> Re
         Some(session_id.to_string()),
     );
 
-    let snapshot = super::history_reload_recovery_snapshot(session_id, None);
+    let snapshot = super::history_reload_recovery_snapshot(session_id, None, None);
     assert!(
         snapshot.is_some(),
         "pending user turn during reload should get recovery directive"
@@ -695,7 +723,7 @@ fn history_reload_recovery_does_not_infer_pending_user_turn_without_reload_marke
     let session_id = "session_history_no_reload_fallback";
     write_pending_user_session(session_id, crate::session::SessionStatus::Active)?;
 
-    assert!(super::history_reload_recovery_snapshot(session_id, None).is_none());
+    assert!(super::history_reload_recovery_snapshot(session_id, None, None).is_none());
     Ok(())
 }
 
@@ -717,7 +745,7 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
         "test store intent",
     )?;
 
-    let Some(snapshot) = super::history_reload_recovery_snapshot(session_id, None) else {
+    let Some(snapshot) = super::history_reload_recovery_snapshot(session_id, None, None) else {
         anyhow::bail!("server-owned recovery intent should be used");
     };
     assert_eq!(snapshot.continuation_message, "stored continuation");
@@ -726,7 +754,8 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
         "building a History payload must not consume the intent; the client may disconnect before queuing it"
     );
 
-    let Some(snapshot_again) = super::history_reload_recovery_snapshot(session_id, None) else {
+    let Some(snapshot_again) = super::history_reload_recovery_snapshot(session_id, None, None)
+    else {
         anyhow::bail!("pending server-owned recovery intent should be re-emitted until accepted");
     };
     assert_eq!(snapshot_again.continuation_message, "stored continuation");
@@ -756,7 +785,7 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
         "accepted continuation should consume the durable pending intent"
     );
     assert!(
-        super::history_reload_recovery_snapshot(session_id, None).is_none(),
+        super::history_reload_recovery_snapshot(session_id, None, None).is_none(),
         "delivered server-owned recovery intent should no longer be emitted"
     );
     Ok(())

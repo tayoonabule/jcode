@@ -425,6 +425,7 @@ fn rendered_to_history_message(msg: crate::session::RenderedMessage) -> HistoryM
 fn history_reload_recovery_snapshot(
     session_id: &str,
     was_interrupted: Option<bool>,
+    persisted_session: Option<&Session>,
 ) -> Option<crate::protocol::ReloadRecoverySnapshot> {
     match super::reload_recovery::pending_directive_for_session(session_id) {
         Ok(Some(directive)) => {
@@ -444,8 +445,12 @@ fn history_reload_recovery_snapshot(
     let reload_ctx = crate::tool::selfdev::ReloadContext::peek_for_session(session_id)
         .ok()
         .flatten();
-    let inferred_interrupted = was_interrupted
-        .unwrap_or_else(|| infer_persisted_session_interrupted_by_reload(session_id));
+    let inferred_interrupted = was_interrupted.unwrap_or_else(|| {
+        persisted_session.map_or_else(
+            || infer_persisted_session_interrupted_by_reload(session_id),
+            infer_session_interrupted_by_reload,
+        )
+    });
     let directive = crate::tool::selfdev::ReloadContext::recovery_directive_for_session(
         session_id,
         reload_ctx.as_ref(),
@@ -484,10 +489,19 @@ fn persisted_session_has_reload_interruption_marker(session: &Session) -> bool {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static HISTORY_SESSION_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn load_history_session(session_id: &str) -> Result<Session> {
+    #[cfg(test)]
+    HISTORY_SESSION_LOADS.with(|loads| loads.set(loads.get() + 1));
+    Session::load_for_remote_startup(session_id).or_else(|_| Session::load_startup_stub(session_id))
+}
+
 fn infer_persisted_session_interrupted_by_reload(session_id: &str) -> bool {
-    let session = match Session::load_for_remote_startup(session_id)
-        .or_else(|_| Session::load_startup_stub(session_id))
-    {
+    let session = match load_history_session(session_id) {
         Ok(session) => session,
         Err(err) => {
             crate::logging::warn(&format!(
@@ -498,6 +512,10 @@ fn infer_persisted_session_interrupted_by_reload(session_id: &str) -> bool {
         }
     };
 
+    infer_session_interrupted_by_reload(&session)
+}
+
+fn infer_session_interrupted_by_reload(session: &Session) -> bool {
     let last_is_user = session
         .messages
         .last()
@@ -507,11 +525,11 @@ fn infer_persisted_session_interrupted_by_reload(session_id: &str) -> bool {
     let interrupted = matches!(session.status, SessionStatus::Crashed { .. })
         || (matches!(session.status, SessionStatus::Active) && last_is_user && marker_active)
         || (matches!(session.status, SessionStatus::Closed) && last_is_user && marker_active)
-        || persisted_session_has_reload_interruption_marker(&session);
+        || persisted_session_has_reload_interruption_marker(session);
 
     crate::logging::info(&format!(
         "history_reload_recovery_snapshot: fallback inspect session={} status={} last_is_user={} marker_active={} interrupted={}",
-        session_id,
+        session.id,
         session.status.display(),
         last_is_user,
         marker_active,
@@ -538,9 +556,7 @@ async fn send_history_from_persisted_session(
     activity: Option<SessionActivitySnapshot>,
     supports_pdf_panels: bool,
 ) -> Result<()> {
-    let session = match crate::session::Session::load_for_remote_startup(session_id)
-        .or_else(|_| crate::session::Session::load_startup_stub(session_id))
-    {
+    let session = match load_history_session(session_id) {
         Ok(session) => session,
         Err(error)
             if error
@@ -574,6 +590,8 @@ async fn send_history_from_persisted_session(
         .reasoning_effort
         .clone()
         .or_else(|| provider.reasoning_effort());
+    let reload_recovery =
+        history_reload_recovery_snapshot(session_id, was_interrupted, Some(&session));
     drop(session);
 
     let messages = rendered_messages
@@ -617,7 +635,7 @@ async fn send_history_from_persisted_session(
         server_icon: Some(server_icon.to_string()),
         server_has_update: Some(server_has_newer_binary()),
         was_interrupted,
-        reload_recovery: history_reload_recovery_snapshot(session_id, was_interrupted),
+        reload_recovery,
         connection_type: None,
         status_detail: None,
         upstream_provider: None,
@@ -835,7 +853,7 @@ async fn send_history_with_guard(
         server_icon: Some(server_icon.to_string()),
         server_has_update: Some(server_has_newer_binary()),
         was_interrupted,
-        reload_recovery: history_reload_recovery_snapshot(session_id, was_interrupted),
+        reload_recovery: history_reload_recovery_snapshot(session_id, was_interrupted, None),
         connection_type,
         status_detail,
         upstream_provider,
