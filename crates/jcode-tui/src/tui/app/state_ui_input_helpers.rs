@@ -1795,7 +1795,7 @@ impl App {
         }
 
         if current_suggestions.len() == 1 && current_suggestions[0].0 == current_token {
-            if Self::command_accepts_args(&current_token) {
+            if self.command_accepts_args(&current_token) {
                 self.remember_input_undo_state();
                 self.input
                     .replace_range(range.0..range.1, &format!("{} ", current_token));
@@ -1812,7 +1812,7 @@ impl App {
         let (command, _) = &current_suggestions[selected];
         let base = self.input.clone();
         let mut replacement = command.clone();
-        if current_suggestions.len() == 1 && Self::command_accepts_args(command) {
+        if current_suggestions.len() == 1 && self.command_accepts_args(command) {
             replacement.push(' ');
         }
         self.remember_input_undo_state();

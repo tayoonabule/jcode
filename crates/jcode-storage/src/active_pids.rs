@@ -350,6 +350,63 @@ pub fn user_session_counts() -> SessionCounts {
     }
 }
 
+/// Remove active-PID markers that cannot correspond to a live session.
+///
+/// Dead owners are always removed. Live owners are removed only when their
+/// marker has settled past `min_age` and the session has no persisted record.
+/// The storage layer does not know how session records are stored, so callers
+/// provide that check.
+pub fn prune_orphan_active_pids(
+    min_age: std::time::Duration,
+    has_session_record: impl Fn(&str) -> bool,
+) -> usize {
+    let Some(dir) = active_pids_dir() else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        let session_id = entry.file_name().to_string_lossy().to_string();
+        let pid = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok());
+        let orphan = match pid {
+            Some(pid) if !process_is_running(pid) => true,
+            Some(_) | None => {
+                let settled = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age >= min_age);
+                settled && !has_session_record(&session_id)
+            }
+        };
+        if orphan {
+            let _ = std::fs::remove_file(&path);
+            unmark_streaming(&session_id);
+            set_session_internal(&session_id, false);
+            removed += 1;
+        }
+    }
+
+    if let Some(streaming_dir) = streaming_pids_dir()
+        && let Ok(entries) = std::fs::read_dir(streaming_dir)
+    {
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            if !dir.join(entry.file_name()).exists() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
