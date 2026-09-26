@@ -10,6 +10,23 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+fn remove_null_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|_, value| !value.is_null());
+            for value in object.values_mut() {
+                remove_null_fields(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                remove_null_fields(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A tool that proxies to an MCP server
 pub struct McpTool {
     server_name: String,
@@ -68,6 +85,11 @@ impl Tool for McpTool {
         if !server_declares_intent && let Some(object) = input.as_object_mut() {
             object.remove("intent");
         }
+        // Models commonly emit `null` for optional properties. MCP schemas
+        // generally mean those properties to be omitted, and some servers
+        // reject an explicit JSON null even when the field is optional.
+        // Preserve nulls inside arrays, but omit null object fields.
+        remove_null_fields(&mut input);
         let manager = self.manager.read().await;
         let result = manager
             .call_tool(&self.server_name, &self.tool_def.name, input)
@@ -271,7 +293,7 @@ pub fn create_mcp_tools_from_cached_many(
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch_name, dispatch_names};
+    use super::{dispatch_name, dispatch_names, remove_null_fields};
     use crate::mcp::protocol::McpToolDef;
     use serde_json::json;
 
@@ -393,5 +415,24 @@ mod tests {
         assert_eq!(first.len(), 2);
         assert_ne!(first[0], first[1]);
         assert!(first.iter().all(|name| name.starts_with("mcp__")));
+    }
+
+    #[test]
+    fn optional_null_mcp_fields_are_omitted_recursively() {
+        let mut value = json!({
+            "document_ids": null,
+            "nested": {"keep": "value", "drop": null},
+            "items": [null, {"drop": null, "keep": true}]
+        });
+
+        remove_null_fields(&mut value);
+
+        assert_eq!(
+            value,
+            json!({
+                "nested": {"keep": "value"},
+                "items": [null, {"keep": true}]
+            })
+        );
     }
 }
