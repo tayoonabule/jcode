@@ -173,6 +173,7 @@ async fn explicit_openai_api_choice_overrides_configured_compatible_default() {
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
         "JCODE_INITIAL_PROVIDER_EXPLICIT",
+        provider::INITIAL_MODEL_EXPLICIT_ENV,
     ];
     let saved: Vec<(&str, Option<String>)> = keys
         .iter()
@@ -209,6 +210,12 @@ requires_api_key = false
 
     assert_eq!(provider.active_auth_method_label(), Some("API key"));
     assert_eq!(provider.model(), "gpt-5.6-luna");
+    assert_eq!(
+        std::env::var(provider::INITIAL_MODEL_EXPLICIT_ENV)
+            .ok()
+            .as_deref(),
+        Some("1")
+    );
     assert_eq!(
         std::env::var("JCODE_RUNTIME_PROVIDER").ok().as_deref(),
         Some("openai-api")
