@@ -2435,6 +2435,12 @@ Re-run with `--force` if you really want to stop the server.";
     let socket = crate::server::socket_path();
     let had_listener = crate::server::has_live_listener(&socket).await;
     let server_info = crate::registry::find_server_by_socket_sync(&socket);
+    // Temporary servers (JCODE_TEMP_SERVER) never join the shared registry;
+    // they record their pid beside the socket instead.
+    let registered_pid = server_info
+        .as_ref()
+        .map(|info| info.pid)
+        .or_else(|| had_listener.then(|| crate::server::temporary_server_pid(&socket)).flatten());
 
     #[derive(Serialize)]
     struct ServerStopReport {
@@ -2450,8 +2456,7 @@ Re-run with `--force` if you really want to stop the server.";
     let mut stopped = false;
     let detail: String;
 
-    if let Some(info) = server_info.as_ref() {
-        let pid = info.pid;
+    if let Some(pid) = registered_pid {
         if crate::platform::is_process_running(pid) {
             #[cfg(unix)]
             {

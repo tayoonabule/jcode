@@ -617,6 +617,7 @@ pub use self::reload_state::{
 };
 
 pub use self::lifecycle::configure_temporary_server;
+pub use self::lifecycle::temporary_server_pid;
 #[cfg(unix)]
 pub use self::socket::spawn_server_notify;
 #[cfg(unix)]

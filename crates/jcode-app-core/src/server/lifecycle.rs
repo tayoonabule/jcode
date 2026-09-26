@@ -101,6 +101,19 @@ pub(crate) fn metadata_path(socket_path: &Path) -> PathBuf {
     socket_path.with_file_name(format!("{filename}.server.json"))
 }
 
+/// The pid a temporary server recorded beside `socket_path`, if any.
+///
+/// Temporary servers do not register in the shared server registry, so this
+/// metadata file is the only way `jcode server stop` can find their process.
+pub fn temporary_server_pid(socket_path: &Path) -> Option<u32> {
+    let bytes = std::fs::read(metadata_path(socket_path)).ok()?;
+    let metadata: TemporaryServerMetadata = serde_json::from_slice(&bytes).ok()?;
+    (metadata.scope == "temporary"
+        && metadata.socket_path == socket_path.display().to_string()
+        && metadata.pid > 0)
+        .then_some(metadata.pid)
+}
+
 pub(crate) fn write_temporary_metadata(
     socket_path: &Path,
     debug_socket_path: &Path,
@@ -326,6 +339,23 @@ mod tests {
             metadata_path(Path::new("/tmp/example/jcode.sock")),
             PathBuf::from("/tmp/example/jcode.sock.server.json")
         );
+    }
+
+    #[test]
+    fn temporary_server_pid_reads_only_matching_socket_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("jcode.sock");
+        let debug = dir.path().join("jcode-debug.sock");
+        assert_eq!(temporary_server_pid(&socket), None);
+
+        let policy = TemporaryServerPolicy { owner_pid: None, idle_timeout_secs: 60 };
+        write_temporary_metadata(&socket, &debug, &policy).expect("metadata written");
+        assert_eq!(temporary_server_pid(&socket), Some(std::process::id()));
+
+        // Metadata copied beside a different socket must not be trusted.
+        let other = dir.path().join("other.sock");
+        std::fs::copy(metadata_path(&socket), metadata_path(&other)).expect("copy");
+        assert_eq!(temporary_server_pid(&other), None);
     }
 
     #[cfg(unix)]
