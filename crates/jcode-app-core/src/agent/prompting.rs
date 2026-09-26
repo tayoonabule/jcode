@@ -246,6 +246,7 @@ mod capability_reminder_tests {
             name: name.to_string(),
             description: String::new(),
             input_schema: serde_json::json!({}),
+            defer_loading: false,
         }
     }
 
