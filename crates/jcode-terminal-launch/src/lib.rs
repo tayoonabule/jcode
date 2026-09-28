@@ -637,6 +637,7 @@ pub fn build_hook_spawn_command(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    clear_tui_exec_handoff_env(&mut cmd);
     if command.fresh_spawn {
         cmd.env("JCODE_FRESH_SPAWN", "1");
     }
@@ -653,6 +654,7 @@ fn build_spawn_command(term: &str, command: &TerminalCommand, cwd: &Path) -> Opt
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    clear_tui_exec_handoff_env(&mut cmd);
     if command.fresh_spawn {
         cmd.env("JCODE_FRESH_SPAWN", "1");
     }
@@ -830,6 +832,15 @@ fn build_spawn_command(term: &str, command: &TerminalCommand, cwd: &Path) -> Opt
     }
 
     Some(cmd)
+}
+
+/// The inherited terminal modes and resume marker describe a same-terminal
+/// exec handoff only. A spawned tool/terminal (including a tmux split) starts a
+/// separate interaction and must not inherit that one-shot state.
+fn clear_tui_exec_handoff_env(command: &mut Command) {
+    command
+        .env_remove("JCODE_TUI_INHERITED_MODES")
+        .env_remove("JCODE_RESUMING");
 }
 
 #[cfg(any(not(unix), test))]
@@ -1019,6 +1030,25 @@ mod tests {
     }
 
     #[test]
+    fn spawned_terminal_and_hook_clear_tui_exec_handoff_state() {
+        let command = TerminalCommand::new("jcode", vec!["--resume".to_string()]);
+
+        let tmux =
+            build_spawn_command("tmux", &command, Path::new("/tmp")).expect("tmux spawn command");
+        let hook = build_hook_spawn_command("tmux split-window", &command, Path::new("/tmp"))
+            .expect("hook spawn command");
+
+        for (kind, command) in [("tmux", tmux), ("hook", hook)] {
+            let env = command
+                .get_envs()
+                .map(|(key, value)| (key.to_string_lossy().into_owned(), value))
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(env.get("JCODE_TUI_INHERITED_MODES"), Some(&None), "{kind}");
+            assert_eq!(env.get("JCODE_RESUMING"), Some(&None), "{kind}");
+        }
+    }
+
+    #[test]
     #[cfg(unix)]
     fn snapshot_client_terminal_env_captures_set_vars_only() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -1041,21 +1071,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn detected_resume_terminal_recognizes_ghostty_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var("HANDTERM_SESSION");
-            std::env::remove_var("HANDTERM_PID");
-            std::env::remove_var("KITTY_PID");
-            std::env::remove_var("WEZTERM_EXECUTABLE");
-            std::env::remove_var("WEZTERM_PANE");
-            std::env::remove_var("ALACRITTY_WINDOW_ID");
-            std::env::set_var("GHOSTTY_RESOURCES_DIR", "/tmp/ghostty");
-        }
-        #[cfg(target_os = "macos")]
-        assert_eq!(detected_resume_terminal().as_deref(), Some("ghostty"));
-        unsafe {
-            std::env::remove_var("GHOSTTY_RESOURCES_DIR");
-        }
+        let client_env = vec![(
+            "GHOSTTY_RESOURCES_DIR".to_string(),
+            "/tmp/ghostty".to_string(),
+        )];
+        assert_eq!(
+            detected_resume_terminal_with_client_env(&client_env).as_deref(),
+            Some("ghostty")
+        );
     }
 
     #[test]
