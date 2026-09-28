@@ -50,6 +50,7 @@ pub mod hooks;
 pub mod id;
 pub mod image_normalize;
 pub mod import;
+pub mod inherited_children;
 pub mod jev;
 pub mod kv_cache_monitor;
 pub mod lid_override;

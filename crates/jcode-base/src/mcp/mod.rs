@@ -4,6 +4,8 @@
 //! Supports shared server pools so multiple sessions reuse the same
 //! MCP server processes instead of spawning duplicates.
 
+#[cfg(unix)]
+pub mod broker;
 mod client;
 pub mod http;
 mod manager;
