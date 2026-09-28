@@ -589,3 +589,21 @@ fn backdated_now_never_panics_and_prefers_past_instants() {
     let zero = super::backdated_now(Duration::ZERO);
     assert!(zero <= Instant::now());
 }
+
+#[test]
+fn ctrl_m_is_treated_as_enter_but_other_ctrl_chords_are_not() {
+    use super::ctrl_m_to_enter;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let (mut code, mut mods) = (KeyCode::Char('m'), KeyModifiers::CONTROL);
+    ctrl_m_to_enter(&mut code, &mut mods);
+    assert_eq!((code, mods), (KeyCode::Enter, KeyModifiers::NONE));
+
+    // Ctrl+Shift+M and Ctrl+J keep their own meaning.
+    let (mut code, mut mods) = (KeyCode::Char('m'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    ctrl_m_to_enter(&mut code, &mut mods);
+    assert_eq!(code, KeyCode::Char('m'));
+    let (mut code, mut mods) = (KeyCode::Char('j'), KeyModifiers::CONTROL);
+    ctrl_m_to_enter(&mut code, &mut mods);
+    assert_eq!(code, KeyCode::Char('j'));
+}

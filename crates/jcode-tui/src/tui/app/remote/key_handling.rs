@@ -276,6 +276,7 @@ async fn handle_remote_key_internal(
     let mut code = code;
     let mut modifiers = modifiers;
     ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
+    ctrl_m_to_enter(&mut code, &mut modifiers);
 
     if app.handle_ssh_login_key(code, modifiers, text_input.as_deref()) {
         return Ok(());
