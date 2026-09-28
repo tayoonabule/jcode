@@ -151,6 +151,21 @@ fn enable_keyboard_enhancement_to(
     )
 }
 
+/// Re-request tmux extended keys without touching the Kitty keyboard stack.
+///
+/// tmux's modifyOtherKeys opt-in is idempotent, so an exec handoff can reassert
+/// it safely. Without this, a pane whose earlier request was dropped (for
+/// example because `extended-keys` was off at the time) stays in VT10x mode
+/// and Shift+Enter collapses to Enter.
+pub fn reassert_tmux_extended_keys() {
+    let mut stdout = std::io::stdout();
+    let result = request_tmux_extended_keys_to(&mut stdout, inside_tmux())
+        .and_then(|()| std::io::Write::flush(&mut stdout));
+    if let Err(error) = result {
+        crate::logging::warn(&format!("failed to reassert tmux extended keys: {error}"));
+    }
+}
+
 /// Reset tmux extended keys and pop Kitty keyboard reporting.
 pub fn disable_keyboard_enhancement() {
     let _ = disable_keyboard_enhancement_to(&mut std::io::stdout(), inside_tmux());
