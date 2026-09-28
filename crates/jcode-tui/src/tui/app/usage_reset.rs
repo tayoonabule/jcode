@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn usage_reset_registered_with_subcommand_completions() {
         let app = crate::tui::app::tests::create_test_app();
-        assert!(App::command_accepts_args("/reset"));
+        assert!(app.command_accepts_args("/reset"));
         let suggestions = app.get_suggestions_for("/reset usage limits openai ");
         assert!(
             suggestions
