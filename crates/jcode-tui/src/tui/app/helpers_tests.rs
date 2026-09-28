@@ -600,7 +600,10 @@ fn ctrl_m_is_treated_as_enter_but_other_ctrl_chords_are_not() {
     assert_eq!((code, mods), (KeyCode::Enter, KeyModifiers::NONE));
 
     // Ctrl+Shift+M and Ctrl+J keep their own meaning.
-    let (mut code, mut mods) = (KeyCode::Char('m'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    let (mut code, mut mods) = (
+        KeyCode::Char('m'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
     ctrl_m_to_enter(&mut code, &mut mods);
     assert_eq!(code, KeyCode::Char('m'));
     let (mut code, mut mods) = (KeyCode::Char('j'), KeyModifiers::CONTROL);
