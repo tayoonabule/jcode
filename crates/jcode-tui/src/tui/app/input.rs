@@ -2,8 +2,8 @@
 
 use super::{
     App, ContentBlock, DisplayMessage, Message, ProcessingStatus, Role, SendAction, commands,
-    ctrl_bracket_fallback_to_esc, is_context_limit_error, is_request_payload_too_large_error,
-    remote,
+    ctrl_bracket_fallback_to_esc, ctrl_m_to_enter, is_context_limit_error,
+    is_request_payload_too_large_error, remote,
 };
 use crate::bus::{
     Bus, BusEvent, ClipboardPasteCompleted, ClipboardPasteContent, ClipboardPasteKind,
@@ -2306,6 +2306,7 @@ pub(super) fn is_scroll_only_key(app: &App, code: KeyCode, modifiers: KeyModifie
     let mut code = code;
     let mut modifiers = modifiers;
     ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
+    ctrl_m_to_enter(&mut code, &mut modifiers);
 
     if app.scroll_keys.scroll_amount(code, modifiers).is_some()
         || app.scroll_keys.prompt_jump(code, modifiers).is_some()
@@ -3083,6 +3084,7 @@ impl App {
         let mut code = code;
         let mut modifiers = modifiers;
         ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
+        ctrl_m_to_enter(&mut code, &mut modifiers);
 
         if self.handle_ssh_login_key(code, modifiers, text_input.as_deref()) {
             return Ok(());

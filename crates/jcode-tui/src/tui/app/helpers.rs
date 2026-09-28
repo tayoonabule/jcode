@@ -230,6 +230,20 @@ pub(super) fn ctrl_bracket_fallback_to_esc(code: &mut KeyCode, modifiers: &mut K
 #[cfg(not(target_os = "macos"))]
 pub(super) fn ctrl_bracket_fallback_to_esc(_code: &mut KeyCode, _modifiers: &mut KeyModifiers) {}
 
+/// Treat a bare Ctrl+M as Enter.
+///
+/// Ctrl+M is the terminal's carriage return, and tools that drive jcode through
+/// tmux (for example `tmux send-keys C-m`, which OpenRig's `rig send` uses to
+/// submit) rely on that. Once tmux forwards extended keys, it reports the chord
+/// as `CSI 109;5u` instead of a bare CR, so without this mapping the message is
+/// typed but never submitted. Ctrl+M has no binding of its own in jcode.
+pub(super) fn ctrl_m_to_enter(code: &mut KeyCode, modifiers: &mut KeyModifiers) {
+    if *modifiers == KeyModifiers::CONTROL && matches!(*code, KeyCode::Char('m' | 'M')) {
+        *code = KeyCode::Enter;
+        *modifiers = KeyModifiers::NONE;
+    }
+}
+
 /// Debug command file path
 pub(super) fn debug_cmd_path() -> PathBuf {
     if let Ok(path) = std::env::var("JCODE_DEBUG_CMD_PATH") {

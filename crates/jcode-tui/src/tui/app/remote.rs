@@ -2,7 +2,7 @@
 
 use super::{
     App, DisplayMessage, PendingReloadReconnectStatus, ProcessingStatus, RemoteResumeActivity,
-    SendAction, ctrl_bracket_fallback_to_esc, input, parse_rate_limit_error,
+    SendAction, ctrl_bracket_fallback_to_esc, ctrl_m_to_enter, input, parse_rate_limit_error,
     remote_notifications::present_swarm_notification, spawn_in_new_terminal,
 };
 use crate::bus::BusEvent;
@@ -1973,6 +1973,7 @@ fn handle_disconnected_key_internal(
     let mut code = code;
     let mut modifiers = modifiers;
     ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
+    ctrl_m_to_enter(&mut code, &mut modifiers);
 
     if app.handle_ssh_login_key(code, modifiers, text_input.as_deref()) {
         return Ok(());
