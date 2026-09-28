@@ -25,6 +25,9 @@ enum Transport {
     },
     Http(Arc<super::http::HttpTransport>),
     Sse(Arc<super::sse::SseTransport>),
+    /// A shared stdio server owned by the machine-wide broker process.
+    #[cfg(unix)]
+    Broker(Arc<super::broker::BrokerTransport>),
 }
 
 /// Shared communication handle for an MCP server.
@@ -84,6 +87,11 @@ impl McpHandle {
                     .await?
                     .context("MCP server returned no JSON-RPC response"),
                 Transport::Sse(sse) => sse
+                    .send(&body, id, true)
+                    .await?
+                    .context("MCP server returned no JSON-RPC response"),
+                #[cfg(unix)]
+                Transport::Broker(broker) => broker
                     .send(&body, id, true)
                     .await?
                     .context("MCP server returned no JSON-RPC response"),
@@ -153,6 +161,10 @@ impl McpHandle {
             Transport::Sse(sse) => {
                 sse.notify(&body).await?;
             }
+            #[cfg(unix)]
+            Transport::Broker(broker) => {
+                broker.notify(&body).await?;
+            }
             Transport::Stdio { writer_tx, .. } => {
                 writer_tx.send(body + "\n").await?;
             }
@@ -195,6 +207,8 @@ impl McpHandle {
                         continue;
                     }
                     Transport::Stdio { .. } => {}
+                    #[cfg(unix)]
+                    Transport::Broker(_) => {}
                 }
             }
             return Ok(tool_result);
@@ -251,6 +265,80 @@ impl McpClient {
     /// Connect to an MCP server, inheriting the current process working directory
     pub async fn connect(name: String, config: &McpServerConfig) -> Result<Self> {
         Self::connect_in_dir(name, config, None).await
+    }
+
+    /// Connect a server that every jcode daemon on this machine may share.
+    ///
+    /// Stdio servers are routed through the machine-wide broker so all
+    /// daemons reuse one child process. If the broker cannot be reached or
+    /// started, the server is spawned directly as before, so a broker problem
+    /// can cost memory but never MCP availability.
+    pub async fn connect_shared(name: String, config: &McpServerConfig) -> Result<Self> {
+        #[cfg(unix)]
+        if config.is_stdio() && super::broker::broker_available() {
+            match super::broker::socket_path() {
+                Ok(socket) => {
+                    match Self::connect_via_broker(name.clone(), config, socket, true).await {
+                        Ok(client) => return Ok(client),
+                        Err(super::broker::BrokerConnectError::Upstream(error)) => {
+                            return Err(error)
+                                .with_context(|| format!("MCP server '{name}' failed to start"));
+                        }
+                        Err(error) => crate::logging::warn(&format!(
+                            "MCP: {error}; spawning '{name}' directly"
+                        )),
+                    }
+                }
+                Err(error) => crate::logging::warn(&format!(
+                    "MCP: no broker socket path ({error:#}); spawning '{name}' directly"
+                )),
+            }
+        }
+        Self::connect_in_dir(name, config, None).await
+    }
+
+    /// Attach to `name` through the broker listening at `socket`.
+    #[cfg(unix)]
+    pub async fn connect_via_broker(
+        name: String,
+        config: &McpServerConfig,
+        socket: std::path::PathBuf,
+        autostart: bool,
+    ) -> std::result::Result<Self, super::broker::BrokerConnectError> {
+        use super::broker::{BrokerConnectError, BrokerTransport};
+        let transport = BrokerTransport::connect(name.clone(), config, socket, autostart).await?;
+        let handle = McpHandle {
+            name: name.clone(),
+            request_id: Arc::new(AtomicU64::new(1)),
+            transport: Transport::Broker(Arc::new(transport)),
+            server_info: Arc::new(std::sync::RwLock::new(None)),
+            capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
+            tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+            request_timeout: request_timeout_for(config),
+        };
+        let mut client = Self {
+            handle,
+            child: None,
+        };
+        // The broker is up and the upstream answered its own handshake, so a
+        // failure from here on is the server's, not the broker's.
+        client
+            .initialize()
+            .await
+            .with_context(|| format!("MCP server '{name}' failed to initialize"))
+            .map_err(BrokerConnectError::Upstream)?;
+        client
+            .handle
+            .refresh_tools()
+            .await
+            .with_context(|| format!("MCP server '{name}' failed to list tools"))
+            .map_err(BrokerConnectError::Upstream)?;
+        crate::logging::info(&format!(
+            "MCP: Connected to '{}' via broker with {} tools",
+            name,
+            client.handle.tools().len()
+        ));
+        Ok(client)
     }
 
     /// Connect to an MCP server, optionally running it in `working_dir`.
@@ -587,7 +675,7 @@ fn is_sensitive_inherited_env_key(key: &str) -> bool {
         )
 }
 
-fn mcp_child_env(
+pub(super) fn mcp_child_env(
     mut inherited: HashMap<String, String>,
     explicit: &HashMap<String, String>,
 ) -> HashMap<String, String> {

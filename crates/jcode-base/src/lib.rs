@@ -49,6 +49,7 @@ pub mod goal;
 pub mod hooks;
 pub mod id;
 pub mod import;
+pub mod inherited_children;
 pub mod jev;
 pub mod lid_override;
 pub mod live_tests;
