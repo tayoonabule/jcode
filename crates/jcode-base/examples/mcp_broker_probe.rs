@@ -13,6 +13,23 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() {
     let pool = jcode_base::mcp::SharedMcpPool::from_default_config();
+    if std::env::var_os("PROBE_LIST").is_some() {
+        // Print the effective merged config: which servers would go through
+        // the broker (shared stdio) and which stay per-session.
+        let config = pool.config().await;
+        let mut names: Vec<_> = config.servers.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            let server = &config.servers[&name];
+            let route = match (server.is_stdio(), server.shared) {
+                (true, true) => "broker",
+                (true, false) => "per-session",
+                (false, _) => "remote",
+            };
+            println!("{route:12} {name:22} {}", server.command);
+        }
+        return;
+    }
     let started = std::time::Instant::now();
     let (ok, failed) = pool.connect_all().await;
     println!(

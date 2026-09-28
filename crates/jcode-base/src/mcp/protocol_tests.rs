@@ -624,6 +624,35 @@ fn stdio_entry_of_same_transport_still_overrides_by_precedence() {
 }
 
 #[test]
+fn jcode_shared_opt_out_survives_a_higher_precedence_override() {
+    // A server marked `shared: false` in jcode's config (because it depends on
+    // the session's working directory) must stay per-session even when a
+    // config format without a `shared` field redefines it.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path();
+    std::fs::create_dir_all(project.join(".jcode")).unwrap();
+    std::fs::write(
+        project.join(".jcode/mcp.json"),
+        r#"{"servers":{"img":{"command":"old-bin","shared":false},"plain":{"command":"a"},"remote":{"type":"http","url":"https://x.test/mcp","shared":false}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".mcp.json"),
+        r#"{"mcpServers":{"img":{"command":"new-bin"},"plain":{"command":"b"},"remote":{"command":"npx"}}}"#,
+    )
+    .unwrap();
+
+    let config = McpConfig::load_project_locals(project);
+    let img = config.servers.get("img").unwrap();
+    assert_eq!(img.command, "new-bin", "the override still wins otherwise");
+    assert!(!img.shared, "the opt-out must be kept");
+    assert!(config.servers.get("plain").unwrap().shared);
+    // An opt-out on a remote definition does not stick to a stdio replacement.
+    let remote = config.servers.get("remote").unwrap();
+    assert!(remote.is_stdio() && remote.shared);
+}
+
+#[test]
 fn claude_json_http_entry_does_not_displace_jcode_stdio_server() {
     // The exact configuration from issue #653: `github` is stdio in
     // ~/.jcode/mcp.json and http in ~/.claude.json. The http entry used to win

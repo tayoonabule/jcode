@@ -771,6 +771,19 @@ impl McpConfig {
                 ));
                 continue;
             }
+            // Claude Code and legacy configs have no notion of sharing, so their
+            // `shared` is always the default. An explicit jcode opt-out on a
+            // stdio server (one that depends on the session's working
+            // directory) must survive being overridden by such an entry. A flag
+            // on a remote definition says nothing about a stdio replacement.
+            let mut cfg = cfg;
+            if cfg.is_stdio()
+                && existing
+                    .get(&name)
+                    .is_some_and(|current| current.is_stdio() && !current.shared)
+            {
+                cfg.shared = false;
+            }
             existing.insert(name, cfg);
         }
     }
