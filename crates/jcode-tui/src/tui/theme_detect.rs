@@ -83,13 +83,36 @@ pub fn init_theme_mode_for_resume(inherited_theme: Option<&str>) -> ThemeMode {
     // second query, but never start one on an inherited raw-mode terminal.
     let prewarmed = take_prewarmed_theme_mode();
     let mode = *DETECTED.get_or_init(|| {
-        inherited_theme
+        // An explicit dark/light choice (config or JCODE_THEME) always wins. The
+        // inherited theme is only a guess from an earlier auto-detection, and
+        // letting it win pins every resumed session to that guess forever, so a
+        // user who later sets `display.theme` could never get it applied by a reload.
+        explicit_theme_choice()
+            .or(inherited_theme)
             .or(prewarmed)
             .unwrap_or_else(resolve_theme_mode_without_terminal_query)
     });
     jcode_tui_style::set_theme_mode(mode);
     init_palette();
     mode
+}
+
+/// The user's explicit `dark`/`light` choice, if any. `auto`, empty or unknown
+/// values mean "no explicit choice".
+fn explicit_theme_choice() -> Option<ThemeMode> {
+    let configured = std::env::var("JCODE_THEME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| crate::config::config().display.theme.clone());
+    parse_explicit_theme(&configured)
+}
+
+fn parse_explicit_theme(configured: &str) -> Option<ThemeMode> {
+    match configured.trim().to_ascii_lowercase().as_str() {
+        "dark" => Some(ThemeMode::Dark),
+        "light" => Some(ThemeMode::Light),
+        _ => None,
+    }
 }
 
 /// Install the user's configured color palette from `[display.colors]`.
@@ -314,9 +337,20 @@ fn terminal_background_query_supported(
 #[cfg(test)]
 mod tests {
     use super::{
-        SILENT_TERMINAL_CACHE_MAX, cache_silent_terminal_at, silent_terminal_is_cached_at,
-        terminal_background_query_supported,
+        SILENT_TERMINAL_CACHE_MAX, ThemeMode, cache_silent_terminal_at, parse_explicit_theme,
+        silent_terminal_is_cached_at, terminal_background_query_supported,
     };
+
+    #[test]
+    fn only_dark_or_light_count_as_an_explicit_theme_choice() {
+        // An explicit choice must beat the inherited theme on resume, so a
+        // reload applies `display.theme`. Anything else falls back to inheritance.
+        assert_eq!(parse_explicit_theme("dark"), Some(ThemeMode::Dark));
+        assert_eq!(parse_explicit_theme(" Light "), Some(ThemeMode::Light));
+        for no_choice in ["", "auto", "AUTO", "solarized"] {
+            assert_eq!(parse_explicit_theme(no_choice), None, "{no_choice:?}");
+        }
+    }
 
     #[test]
     fn skips_terminals_without_osc_query_support() {
