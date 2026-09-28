@@ -403,6 +403,9 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
         // stack-based keyboard enhancement flags again. A later normal exit must
         // still disable every inherited mode, so retain them in the guard.
         let modes = inherited_modes.unwrap_or(fallback_modes);
+        if modes.keyboard_enhanced {
+            tui::reassert_tmux_extended_keys();
+        }
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
         if modes.focus_change {
             crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
