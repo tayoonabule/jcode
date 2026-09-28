@@ -4,7 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 mod title;
+mod transcription;
 pub use title::prompt_title;
+pub use transcription::{
+    TRANSCRIPTION_CLOSE, TRANSCRIPTION_OPEN, strip_transcription, wrap_transcription,
+};
 
 /// Identifies a session to resume, across the agent backends jcode can import
 /// from. This is pure data (only ids/paths) with no UI dependency; it lives in

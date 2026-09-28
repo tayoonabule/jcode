@@ -32,6 +32,37 @@ fn token_usage_preserves_cache_creation_and_missing_counters() {
     }
 }
 
+#[test]
+fn kv_cache_miss_is_forwarded_with_session() {
+    let mut state = BridgeState {
+        session_id: Some("s1".into()),
+        ..Default::default()
+    };
+    let wire = serde_json::to_value(jcode_protocol_like_kv_miss()).unwrap();
+    let frames = state.legacy_event_to_api(&wire);
+    assert_eq!(
+        frames.iter().map(|f| f.event.clone()).collect::<Vec<_>>(),
+        vec![ApiEvent::KvCacheMiss {
+            session_id: "s1".into(),
+            reason: "prefix_changed".into(),
+            harness_caused: true,
+            missed_tokens: 46_000,
+            expected_tokens: 50_000,
+            read_tokens: 4_000,
+            documented_cause: None,
+            message: "KV cache miss: ~46K tokens resent".into(),
+        }]
+    );
+}
+
+fn jcode_protocol_like_kv_miss() -> Value {
+    json!({
+        "type": "kv_cache_miss", "reason": "prefix_changed", "harness_caused": true,
+        "missed_tokens": 46_000, "expected_tokens": 50_000, "read_tokens": 4_000,
+        "message": "KV cache miss: ~46K tokens resent"
+    })
+}
+
 struct ScopedJcodeHome {
     path: PathBuf,
     previous: Option<OsString>,
@@ -1746,6 +1777,7 @@ fn runtime_info_reports_the_active_provider_and_complete_route_catalog() {
         "provider_name": "anthropic",
         "provider_model": "claude-sonnet",
         "reasoning_effort": "high",
+        "resolved_credential": "oauth",
         "available_models": ["claude-sonnet", "gemini-pro"],
         "available_model_routes": [
             {
@@ -1775,6 +1807,7 @@ fn runtime_info_reports_the_active_provider_and_complete_route_catalog() {
         provider,
         model,
         reasoning_effort,
+        auth_method,
         routes,
     } = event
     else {
@@ -1784,6 +1817,9 @@ fn runtime_info_reports_the_active_provider_and_complete_route_catalog() {
     assert_eq!(provider.as_deref(), Some("anthropic"));
     assert_eq!(model.as_deref(), Some("claude-sonnet"));
     assert_eq!(reasoning_effort.as_deref(), Some("high"));
+    // The daemon's resolved credential travels with the identity, so a
+    // client never has to guess it from a model that has both routes.
+    assert_eq!(auth_method.as_deref(), Some("oauth"));
     assert_eq!(routes.len(), 2);
     assert_eq!(routes[1].provider, "gemini");
     assert!(!routes[1].available);

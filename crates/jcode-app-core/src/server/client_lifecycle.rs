@@ -10,6 +10,7 @@ use super::client_comm::{
     handle_comm_read, handle_comm_share, handle_comm_subscribe_channel,
     handle_comm_unsubscribe_channel,
 };
+use super::client_comm_swarms::{handle_comm_list_swarms, handle_comm_set_swarm_label};
 use super::client_disconnect_cleanup::{cleanup_client_connection, detach_client_attachment};
 use super::client_lifecycle_logging::{
     ServerRequestLifecycleFields, interrupt_request_log_fields, request_payload_summary,
@@ -2430,6 +2431,7 @@ pub(super) async fn handle_client(
                 delivery,
                 wake,
                 tldr,
+                to_swarm,
             } => {
                 handle_comm_message(
                     id,
@@ -2440,6 +2442,7 @@ pub(super) async fn handle_client(
                     delivery,
                     wake,
                     tldr,
+                    to_swarm,
                     &client_event_tx,
                     &sessions,
                     &soft_interrupt_queues,
@@ -2467,6 +2470,41 @@ pub(super) async fn handle_client(
                     &file_touch,
                     &sessions,
                     &client_connections,
+                )
+                .await;
+            }
+
+            Request::CommListSwarms {
+                id,
+                session_id: req_session_id,
+            } => {
+                handle_comm_list_swarms(
+                    id,
+                    req_session_id,
+                    &client_event_tx,
+                    &swarm_members,
+                    &swarms_by_id,
+                    &swarm_coordinators,
+                )
+                .await;
+            }
+
+            Request::CommSetSwarmLabel {
+                id,
+                session_id: req_session_id,
+                label,
+            } => {
+                handle_comm_set_swarm_label(
+                    id,
+                    req_session_id,
+                    label,
+                    &client_event_tx,
+                    &swarm_members,
+                    &swarms_by_id,
+                    &swarm_coordinators,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
                 )
                 .await;
             }

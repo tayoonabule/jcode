@@ -729,6 +729,7 @@ pub(super) async fn run(
             if let Some(quota) = crate::subscription_notice::from_error(&error) {
                 // A plan limit cannot be fixed by retrying. Tell the agent to
                 // relay the upgrade prompt to the user and use direct actions.
+                crate::subscription_notice::show_upgrade_card(quota, &ctx.session_id);
                 requested_help = Some("upgrade");
                 (
                     "hand_back",

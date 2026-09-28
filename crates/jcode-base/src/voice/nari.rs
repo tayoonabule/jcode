@@ -70,9 +70,39 @@ const BUILTIN_VOCABULARY: &[&str] = &[
     "swarm",
     "hot reload",
     "Claude",
+    "Claude Code",
     "Codex",
     "OpenAI",
     "Anthropic",
+    "Gemini",
+    "Cursor",
+    "Opus",
+    "Sonnet",
+    "GPT",
+    "Qwen",
+    "Ollama",
+    // Coding agent vocabulary.
+    "MCP",
+    "LLM",
+    "API",
+    "SDK",
+    "CLI",
+    "TUI",
+    "subagent",
+    "system prompt",
+    "context window",
+    "tool call",
+    "GitHub",
+    "PR",
+    "repo",
+    "Rust",
+    "Cargo",
+    "TypeScript",
+    "JSON",
+    "YAML",
+    "OAuth",
+    "tmux",
+    "Neovim",
 ];
 /// Mishearings the recognition prompt cannot fix, because the audio is
 /// genuinely ambiguous ("Jev" is pronounced like "Jeff"). Applied to every
@@ -114,7 +144,7 @@ pub fn correct_transcript(text: &str) -> String {
         .fold(text.to_owned(), |text, (pattern, fixed)| {
             pattern.replace_all(&text, *fixed).into_owned()
         });
-    if is_prompt_leak(&text) {
+    if is_prompt_leak(&text) || is_prompt_echo(&text) {
         String::new()
     } else {
         text
@@ -154,6 +184,52 @@ fn is_prompt_leak(text: &str) -> bool {
     }
     let rest = words.len() - at;
     matched >= 2 && (rest == 0 || (matched >= 3 && rest <= 2))
+}
+
+fn words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Run length that counts as copied prompt text. Five words avoids flagging a
+/// genuine "Hey Jev, open settings" while catching any real echo.
+const ECHO_NGRAM: usize = 5;
+
+fn prompt_ngrams() -> &'static HashSet<Vec<String>> {
+    static NGRAMS: std::sync::OnceLock<HashSet<Vec<String>>> = std::sync::OnceLock::new();
+    NGRAMS.get_or_init(|| {
+        // Compare in corrected form, since transcripts are corrected first.
+        let prompt = corrections()
+            .iter()
+            .fold(build_prompt(&[]), |text, (pattern, fixed)| {
+                pattern.replace_all(&text, *fixed).into_owned()
+            });
+        words(&prompt)
+            .windows(ECHO_NGRAM)
+            .map(<[String]>::to_vec)
+            .collect()
+    })
+}
+
+/// True when most of the transcript is copied from the recognition prompt.
+/// Qwen3-ASR recites its whole context on silent audio ("The user often
+/// addresses Jev, a voice assistant..."), which the example check misses.
+fn is_prompt_echo(text: &str) -> bool {
+    let words = words(text);
+    if words.len() < ECHO_NGRAM {
+        return false;
+    }
+    let ngrams = prompt_ngrams();
+    let mut covered = vec![false; words.len()];
+    for (start, window) in words.windows(ECHO_NGRAM).enumerate() {
+        if ngrams.contains(window) {
+            covered[start..start + ECHO_NGRAM].fill(true);
+        }
+    }
+    let covered = covered.iter().filter(|c| **c).count();
+    covered * 5 >= words.len() * 3
 }
 
 /// Conservative bound on the recognition context sent per session.
@@ -208,7 +284,6 @@ pub fn nari_pcm_channel() -> (mpsc::Sender<Vec<i16>>, mpsc::Receiver<Vec<i16>>) 
 
 /// Microphone-owned channel. Holds 100 ms chunks for longer than the setup
 /// timeout so audio captured during the handshake is buffered, never dropped.
-#[cfg(feature = "voice-capture")]
 pub(super) fn capture_pcm_channel() -> (mpsc::Sender<Vec<i16>>, mpsc::Receiver<Vec<i16>>) {
     mpsc::channel((IO_TIMEOUT.as_secs() as usize + 5) * 10)
 }
@@ -520,6 +595,16 @@ mod tests {
             "Hey Jev, open settings. Okay Jev. Thanks Jev. Ask Jev.",
             "Hey, Jeff, open settings. Okay, Jeff, thanks, Jeff, asked up.",
             "Okay Jev. Thanks Jev.",
+            // Full prompt recital on silence, as observed.
+            "The user often addresses Jev, a voice assistant. Jev is spelled J- E- V and \
+             sounds like Jev. Write it as Jev. Examples: \"Hey Jev, open settings.\" \
+             \"Okay Jev.\" \"Thanks Jev.\" \"Ask Jev.\" The user also talks about Jcode, a \
+             coding app pronounced jay- code, and Jcode Desktop. Jcode and Jev are \
+             different names: write \"Jcode Desktop\", never \"Jcode Desktop\". Other \
+             names: Jcode, Jcode Desktop, Handterm, Nari, TypeSafe, GPUI, Wayland, niri, \
+             Copilot, swarm, hot reload, Claude, Codex, OpenAI, Anthropic.",
+            "Other names: Jcode, Jcode Desktop, Handterm, Nari, TypeSafe, GPUI, Wayland.",
+            "The user also talks about Jcode, a coding app.",
         ] {
             assert_eq!(correct_transcript(leak), "", "{leak}");
         }
@@ -528,6 +613,8 @@ mod tests {
             "Hey Jev, open settings.",
             "Okay Jev, thanks Jev, now fix the build.",
             "Hey Jev, open settings and switch the theme.",
+            "Tell the user about Jcode Desktop and Handterm today.",
+            "Can you ask Codex, Claude and OpenAI models to review the swarm hot reload code?",
         ] {
             assert_eq!(correct_transcript(real), real, "{real}");
         }

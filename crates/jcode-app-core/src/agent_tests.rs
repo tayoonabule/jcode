@@ -1616,7 +1616,7 @@ async fn register_fake_deferred_mcp_surface(registry: &Registry) {
     }
 }
 
-async fn agent_with_fake_mcp_surface(mode: crate::config::McpToolsMode, threshold: usize) -> Agent {
+async fn agent_with_fake_mcp_surface(mode: crate::config::McpToolsMode, _threshold: usize) -> Agent {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     register_fake_deferred_mcp_surface(&registry).await;
@@ -1631,7 +1631,6 @@ async fn agent_with_fake_mcp_surface(mode: crate::config::McpToolsMode, threshol
         .await;
     let mut agent = Agent::new(provider, registry);
     agent.mcp_tools_mode = mode;
-    agent.mcp_tools_token_threshold = threshold;
     agent
 }
 
@@ -1662,19 +1661,20 @@ async fn mcp_exposure_modes_select_eager_or_fixed_definitions() {
     assert!(deferred_names.iter().any(|name| name == "mcp_search"));
     assert!(deferred_names.iter().any(|name| name == "mcp_call"));
 
-    let mut auto_eager =
+    // `auto` never exposes per-server definitions on providers without
+    // native deferred loading, even for a tiny catalog: any later change to
+    // that list would bust the whole prompt cache.
+    let mut auto_small =
         agent_with_fake_mcp_surface(crate::config::McpToolsMode::Auto, usize::MAX).await;
-    let auto_eager_names: Vec<String> = auto_eager
+    let auto_small_names: Vec<String> = auto_small
         .tool_definitions()
         .await
         .into_iter()
         .map(|tool| tool.name)
         .collect();
-    assert!(
-        auto_eager_names
-            .iter()
-            .any(|name| name == "mcp__test__verbose")
-    );
+    assert!(!auto_small_names.iter().any(|name| name.starts_with("mcp__")));
+    assert!(auto_small_names.iter().any(|name| name == "mcp_search"));
+    assert!(auto_small_names.iter().any(|name| name == "mcp_call"));
 
     let mut auto_deferred = agent_with_fake_mcp_surface(crate::config::McpToolsMode::Auto, 1).await;
     let auto_deferred_names: Vec<String> = auto_deferred
@@ -1740,17 +1740,17 @@ async fn deferred_mcp_surface_ignores_late_per_tool_registration() {
 }
 
 #[tokio::test]
-async fn auto_mode_rechecks_late_mcp_definitions_before_deferring() {
+async fn auto_mode_never_changes_the_tool_list_for_late_mcp_tools() {
     let _guard = crate::storage::lock_test_env();
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     register_fake_deferred_mcp_surface(&registry).await;
     let mut agent = Agent::new(provider, registry);
     agent.mcp_tools_mode = crate::config::McpToolsMode::Auto;
-    agent.mcp_tools_token_threshold = 1;
 
     let before = agent.tool_definitions().await;
-    assert!(!before.iter().any(|tool| tool.name == "mcp_search"));
+    assert!(before.iter().any(|tool| tool.name == "mcp_search"));
+    assert!(before.iter().any(|tool| tool.name == "mcp_call"));
     agent
         .registry
         .register(
@@ -1761,11 +1761,14 @@ async fn auto_mode_rechecks_late_mcp_definitions_before_deferring() {
             }) as Arc<dyn crate::tool::Tool>,
         )
         .await;
+    agent.unlock_tools_if_needed("mcp");
 
     let after = agent.tool_definitions().await;
-    assert!(after.iter().any(|tool| tool.name == "mcp_search"));
-    assert!(after.iter().any(|tool| tool.name == "mcp_call"));
-    assert!(!after.iter().any(|tool| tool.name.starts_with("mcp__")));
+    assert_eq!(
+        serde_json::to_string(&before).unwrap(),
+        serde_json::to_string(&after).unwrap(),
+        "late MCP registration and the mcp tool must not change the cached tool list"
+    );
     assert!(agent.mcp_late_register_resolved);
 }
 
@@ -1781,6 +1784,9 @@ async fn mcp_tools_registered_after_lock_are_visible_to_agent() {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
+    // The late-registration rebuild (#206) only exists in explicit eager
+    // mode; every other mode keeps the tool list fixed for cache stability.
+    agent.mcp_tools_mode = crate::config::McpToolsMode::Eager;
 
     // First turn locks the snapshot (this is what happens before the async MCP
     // registration spawn completes).
@@ -1843,6 +1849,9 @@ async fn mcp_late_registration_rebuild_happens_at_most_once() {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
+    // The late-registration rebuild (#206) only exists in explicit eager
+    // mode; every other mode keeps the tool list fixed for cache stability.
+    agent.mcp_tools_mode = crate::config::McpToolsMode::Eager;
 
     // First turn locks the snapshot with no MCP tools yet.
     let _ = agent.tool_definitions().await;
@@ -1915,6 +1924,9 @@ async fn tool_snapshot_is_stable_without_new_mcp_tools() {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
+    // The late-registration rebuild (#206) only exists in explicit eager
+    // mode; every other mode keeps the tool list fixed for cache stability.
+    agent.mcp_tools_mode = crate::config::McpToolsMode::Eager;
 
     let first = agent.tool_definitions().await;
     // Register a NON-mcp tool after locking — this should NOT trigger a rebuild,
@@ -2512,7 +2524,6 @@ async fn native_deferred_agent(mode: crate::config::McpToolsMode) -> Agent {
     register_fake_deferred_mcp_surface(&registry).await;
     let mut agent = Agent::new(provider, registry);
     agent.mcp_tools_mode = mode;
-    agent.mcp_tools_token_threshold = 1;
     agent
 }
 
@@ -2676,4 +2687,207 @@ async fn switching_away_from_native_deferred_restores_mcp_fallback_surface() {
     native.store(true, std::sync::atomic::Ordering::SeqCst);
     let back = agent.tool_definitions().await;
     assert!(back.iter().any(|t| t.name == "mcp_call" && t.defer_loading));
+}
+
+fn transcript_texts(agent: &Agent) -> Vec<String> {
+    agent
+        .session
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// On providers without native deferred loading, MCP tools that register
+/// after the tool list locked are described once in the transcript (with
+/// their schema) instead of changing the cached tool list.
+#[tokio::test]
+async fn late_mcp_tools_are_announced_once_in_the_transcript() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    register_fake_deferred_mcp_surface(&registry).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.mcp_tools_mode = crate::config::McpToolsMode::Auto;
+
+    let before = agent.tool_definitions().await;
+    agent
+        .registry
+        .register(
+            "mcp__late__tool".to_string(),
+            Arc::new(FakeMcpTool {
+                name: "tool".to_string(),
+            }) as Arc<dyn crate::tool::Tool>,
+        )
+        .await;
+
+    agent.announce_late_mcp_tools().await;
+    let texts = transcript_texts(&agent);
+    let announcements: Vec<&String> = texts
+        .iter()
+        .filter(|t| t.contains("New MCP tools are available."))
+        .collect();
+    assert_eq!(announcements.len(), 1);
+    let text = announcements[0];
+    assert!(text.contains("mcp__late__tool"));
+    assert!(text.contains("server: late"));
+    assert!(text.contains("tool: tool"));
+    assert!(text.contains("input_schema: {"), "schema must be included: {text}");
+    assert!(text.contains("mcp_call"));
+
+    // Second pass: nothing new, no second announcement, and the cached
+    // tool list is unchanged.
+    agent.announce_late_mcp_tools().await;
+    let again = transcript_texts(&agent)
+        .into_iter()
+        .filter(|t| t.contains("New MCP tools are available."))
+        .count();
+    assert_eq!(again, 1);
+    let after = agent.tool_definitions().await;
+    assert_eq!(
+        serde_json::to_string(&before).unwrap(),
+        serde_json::to_string(&after).unwrap()
+    );
+}
+
+/// Tools already described by an `mcp connect`/`mcp_search` result (tool
+/// references in the transcript) must not be announced again, and nothing
+/// is announced on the native deferred path or in eager mode.
+#[tokio::test]
+async fn late_mcp_announcement_skips_referenced_native_and_eager() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    register_fake_deferred_mcp_surface(&registry).await;
+    registry
+        .register(
+            "mcp__srv__known".to_string(),
+            Arc::new(FakeMcpTool {
+                name: "known".to_string(),
+            }) as Arc<dyn crate::tool::Tool>,
+        )
+        .await;
+    let mut agent = Agent::new(provider, registry);
+    agent.mcp_tools_mode = crate::config::McpToolsMode::Auto;
+    agent.add_message(
+        Role::User,
+        vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: "Connected".into(),
+                is_error: None,
+            },
+            ContentBlock::ToolReference {
+                tool_use_id: "call_1".into(),
+                tool_name: "mcp__srv__known".into(),
+            },
+        ],
+    );
+    agent.announce_late_mcp_tools().await;
+    assert!(
+        !transcript_texts(&agent)
+            .iter()
+            .any(|t| t.contains("New MCP tools are available."))
+    );
+
+    for mode in [
+        crate::config::McpToolsMode::Eager,
+        crate::config::McpToolsMode::Auto,
+    ] {
+        let mut agent = if mode == crate::config::McpToolsMode::Eager {
+            let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+            let registry = Registry::new(provider.clone()).await;
+            let mut agent = Agent::new(provider, registry);
+            agent.mcp_tools_mode = mode;
+            agent
+        } else {
+            native_deferred_agent(mode).await
+        };
+        agent
+            .registry
+            .register(
+                "mcp__x__y".to_string(),
+                Arc::new(FakeMcpTool {
+                    name: "y".to_string(),
+                }) as Arc<dyn crate::tool::Tool>,
+            )
+            .await;
+        agent.announce_late_mcp_tools().await;
+        assert!(
+            !transcript_texts(&agent)
+                .iter()
+                .any(|t| t.contains("New MCP tools are available.")),
+            "mode={mode:?}"
+        );
+    }
+}
+
+struct IdentifiedFakeMcpTool {
+    server: String,
+    raw: String,
+}
+
+#[async_trait]
+impl crate::tool::Tool for IdentifiedFakeMcpTool {
+    fn name(&self) -> &str {
+        &self.raw
+    }
+    fn mcp_identity(&self) -> Option<(&str, &str)> {
+        Some((&self.server, &self.raw))
+    }
+    fn description(&self) -> &str {
+        "fake identified mcp tool"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: crate::tool::ToolContext,
+    ) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::new("ok"))
+    }
+}
+
+/// Dotted MCP names (YC's `hiring.create_job`) are sanitized for providers,
+/// but the late announcement must tell the model the real server/tool pair
+/// that `mcp_call` needs, not a guess split out of the sanitized alias.
+#[tokio::test]
+async fn late_mcp_announcement_uses_original_names_for_sanitized_aliases() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    register_fake_deferred_mcp_surface(&registry).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.mcp_tools_mode = crate::config::McpToolsMode::Auto;
+    let _ = agent.tool_definitions().await;
+
+    let alias = crate::mcp::dispatch_name("yc", "hiring.create_job");
+    assert_eq!(alias, "mcp__yc__hiring_create_job");
+    agent
+        .registry
+        .register(
+            alias.clone(),
+            Arc::new(IdentifiedFakeMcpTool {
+                server: "yc".to_string(),
+                raw: "hiring.create_job".to_string(),
+            }) as Arc<dyn crate::tool::Tool>,
+        )
+        .await;
+
+    agent.announce_late_mcp_tools().await;
+    let text = transcript_texts(&agent)
+        .into_iter()
+        .find(|t| t.contains("New MCP tools are available."))
+        .expect("announcement");
+    assert!(text.contains(&alias), "{text}");
+    assert!(
+        text.contains("server: yc  tool: hiring.create_job"),
+        "{text}"
+    );
 }

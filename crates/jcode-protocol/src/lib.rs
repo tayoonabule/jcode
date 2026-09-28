@@ -200,6 +200,23 @@ pub struct SwarmChannelInfo {
     pub member_count: usize,
 }
 
+/// Directory entry for one live swarm, used for cross-swarm discovery.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmInfo {
+    pub swarm_id: String,
+    /// Human-readable, unique swarm label, when one has been set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_name: Option<String>,
+    pub member_count: usize,
+    /// Whether the requesting session belongs to this swarm.
+    #[serde(default)]
+    pub is_own: bool,
+}
+
 /// A shared context entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextEntry {
@@ -636,6 +653,8 @@ impl Request {
             Request::CommMessage { id, .. } => *id,
             Request::CommList { id, .. } => *id,
             Request::CommListChannels { id, .. } => *id,
+            Request::CommListSwarms { id, .. } => *id,
+            Request::CommSetSwarmLabel { id, .. } => *id,
             Request::CommChannelMembers { id, .. } => *id,
             Request::CommProposePlan { id, .. } => *id,
             Request::CommApprovePlan { id, .. } => *id,
@@ -679,6 +698,8 @@ impl Request {
                 | Request::CommMessage { .. }
                 | Request::CommList { .. }
                 | Request::CommListChannels { .. }
+                | Request::CommListSwarms { .. }
+                | Request::CommSetSwarmLabel { .. }
                 | Request::CommChannelMembers { .. }
                 | Request::CommProposePlan { .. }
                 | Request::CommApprovePlan { .. }

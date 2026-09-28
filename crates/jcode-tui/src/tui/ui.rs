@@ -3072,9 +3072,9 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     let donut_height: u16 = idle_donut_reserved_height(show_donut, input_height);
     let notification_height =
         input_ui::notification_height(app, chat_area.width).min(chat_area.height.saturating_sub(4));
-    // Elastic overscroll status line revealed when the user scrolls past the
-    // bottom of the transcript. Rendered directly below the input line.
-    let overscroll_height: u16 = if app.chat_overscroll_active() { 1 } else { 0 };
+    // Session status line (dir, branch, context, provider, model), always
+    // pinned directly below the input line.
+    let overscroll_height: u16 = 1;
     let fixed_height = 1
         + queued_height
         + swarm_strip_height
@@ -3085,22 +3085,7 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
         + overscroll_height
         + donut_height; // status + queued + swarm strip + notification + inline UI + gap + input + overscroll + donut
     let available_height = chat_area.height;
-    // Overflow decisions (native scrollbar, and thus the wrap width) must not
-    // depend on the transient overscroll row. Otherwise revealing the line at
-    // the fits/overflows boundary flips the scrollbar on, re-wraps the whole
-    // transcript one column narrower, and the extra wrapped lines keep the
-    // scrollbar latched after the rebound: the screen visibly re-wraps twice
-    // per overscroll and can settle in a different state than it started
-    // (flicker). The packed/scrolling choice below still accounts for the real
-    // row so the elastic reveal remains a clean one-row slide.
-    //
-    // When the line is pinned permanently visible by config it is part of the
-    // stable layout, not a transient reveal, so it does count here.
-    let stable_fixed_height = if app.chat_overscroll_pinned() {
-        fixed_height
-    } else {
-        fixed_height - overscroll_height
-    };
+    let stable_fixed_height = fixed_height;
     let overflows = |prepared: &PreparedChatFrame| {
         let started = Instant::now();
         let result =
@@ -3452,7 +3437,7 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
         draw_inline_ui(frame, app, chunks[5]);
     }
 
-    let input_cursor = input_ui::draw_input(
+    let _input_cursor = input_ui::draw_input(
         frame,
         app,
         chunks[7],
@@ -3555,18 +3540,6 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     if visual_debug::overlay_enabled() {
         overlays::draw_debug_overlay(frame, &placements, &chunks);
     }
-
-    // Session facts use actual final-frame cells for collision detection. They
-    // prefer the composer chrome and may climb into a few transcript-tail rows
-    // only when the right suffix is genuinely unused.
-    input_ui::draw_right_fact_stack(
-        frame,
-        app,
-        messages_area,
-        chunks[7],
-        chat_scrollbar_visible,
-        input_cursor,
-    );
 
     // Command-suggestion popover: a late overlay pass so the palette floats
     // over existing rows (blank space, pinned footer, or the transcript tail)

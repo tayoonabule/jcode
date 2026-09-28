@@ -90,6 +90,12 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_NEW_TERMINAL_KEY") {
             self.keybindings.new_terminal = v;
         }
+        if let Ok(v) = std::env::var("JCODE_VOICE_INPUT_KEY") {
+            self.keybindings.voice_input = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_DICTATION_RECORDER") {
+            self.dictation.recorder = v;
+        }
 
         // Dictation
         if let Ok(v) = std::env::var("JCODE_DICTATION_COMMAND") {

@@ -729,7 +729,12 @@ impl Tool for TodoTool {
         // interpolate private thresholds, because that would teach the model
         // how to target the evaluator instead of reporting an honest assessment.
         "Read or update structured todo items and optional goal-level assessments. \
-         Use it very often: plan non-trivial work up front and update statuses as you go."
+         Use this tool VERY frequently, far more than feels necessary. The user watches \
+         todo progress live, so a stale list looks like stalled work. For any task with \
+         more than one step: write the full plan before starting, mark an item \
+         in_progress before working on it, mark it completed the moment it is done \
+         (never batch completions), and add newly discovered work as soon as you find it. \
+         Expect to call this after nearly every meaningful step."
     }
 
     fn parameters_schema(&self) -> Value {

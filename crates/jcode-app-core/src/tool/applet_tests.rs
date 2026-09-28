@@ -147,3 +147,33 @@ fn action_message_is_compact() {
         "[applet action] instance `chart-3f2a` (\"Title\"): `select` args {\"id\":2}\nstate: {\"q\":\"x\"}"
     );
 }
+
+/// The description teaches the agent field names. Documents built exactly as
+/// described must validate, or every agent-built control of that kind fails.
+#[test]
+fn documented_shapes_validate() {
+    let description = AppletTool::new().description().to_string();
+    assert!(description.contains("select{bind,options:[{value,label}]}"));
+    assert!(description.contains("host.send_prompt{prompt}"));
+    let view = json!({"type":"stack","children":[
+        {"type":"select","bind":"env","options":[{"value":"a","label":"A"}]},
+        {"type":"tabs","bind":"t","tabs":[{"id":"x","label":"X","children":[]}]},
+        {"type":"key_value","rows":[{"key":"k","value":"v"}]},
+        {"type":"button","label":"Go","variant":"danger","on_press":{"action":"host.send_prompt","args":{"prompt":"hi"}}},
+        {"type":"toggle","label":"T","bind":"on"},
+        {"type":"input","bind":"q","placeholder":"p","multiline":true},
+        {"type":"list","children":[{"type":"list_item","title":"a","subtitle":"b","meta":"c","badges":["d"],"on_press":{"action":"open"}}]},
+        {"type":"progress","value":0.5,"label":"half"},
+        {"type":"text","text":"t","style":"caption","tone":"dim","max_lines":2}
+    ]});
+    let document: jcode_applet_types::Document = serde_json::from_value(
+        json!({"revision":1,"title":"T","state":{"env":"a"},"view":view}),
+    )
+    .expect("documented shapes deserialize");
+    jcode_applet_types::validate_document(
+        &document,
+        &jcode_applet_types::agent::manifest(),
+        &Default::default(),
+    )
+    .expect("documented shapes validate");
+}

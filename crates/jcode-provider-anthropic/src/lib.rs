@@ -138,6 +138,31 @@ pub fn format_messages_with_tools(
         ));
     }
 
+    // Anthropic requires every tool_result answering the previous assistant
+    // turn to lead the user message. Merging separate tool-result messages can
+    // interleave sibling text (for example text moved out of a tool_result by
+    // `apply_tool_references` for parallel tool_search calls), which makes the
+    // API report later tool_use ids as missing their tool_result. Stable
+    // partition so tool_results come first and other blocks keep their order.
+    for msg in merged.iter_mut().filter(|m| m.role == "user") {
+        let first_non_result = msg
+            .content
+            .iter()
+            .position(|b| !matches!(b, ApiContentBlock::ToolResult { .. }));
+        let needs_reorder = first_non_result.is_some_and(|start| {
+            msg.content[start..]
+                .iter()
+                .any(|b| matches!(b, ApiContentBlock::ToolResult { .. }))
+        });
+        if needs_reorder {
+            let (results, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut msg.content)
+                .into_iter()
+                .partition(|b| matches!(b, ApiContentBlock::ToolResult { .. }));
+            msg.content = results;
+            msg.content.extend(rest);
+        }
+    }
+
     // Anthropic rejects a request whose final message is an assistant turn on
     // models that do not support assistant prefill ("This model does not support
     // assistant message prefill. The conversation must end with a user message.").

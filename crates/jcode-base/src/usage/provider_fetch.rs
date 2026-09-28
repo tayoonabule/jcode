@@ -49,20 +49,26 @@ pub(super) async fn fetch_anthropic_usage_for_token(
     match fetch_anthropic_usage_data(access_token.clone(), cache_key).await {
         Ok(data) => {
             let mut report = provider_report_from_usage_data(display_name, &data);
-            // The session reset only applies at the five-hour wall, and the
-            // server declines the lookup elsewhere. Read-only either way.
-            if report.error.is_none() && data.five_hour >= 0.99 {
+            // Availability can be inspected before reaching the five-hour wall.
+            // Looking it up is read-only and does not imply a reset can be spent.
+            if report.error.is_none() {
                 // External Claude Code logins report as "default" but are not
                 // stored accounts. Pin those to the default scope instead.
                 let stored = auth::claude::list_accounts()
                     .unwrap_or_default()
                     .iter()
                     .any(|account| account.label == account_label);
-                report.anthropic_limit_reset = super::anthropic_reset::fetch_limit_reset_offer(
+                let (offer, ineligible) = super::anthropic_reset::fetch_limit_reset_offer(
                     &access_token,
                     stored.then_some(account_label.as_str()),
                 )
                 .await;
+                report.anthropic_limit_reset = offer;
+                if ineligible {
+                    report
+                        .extra_info
+                        .push(("Session resets".into(), "Not eligible".into()));
+                }
             }
             report
         }

@@ -455,6 +455,9 @@ pub enum BusEvent {
         session_id: Option<String>,
         message: String,
     },
+    /// Built-in voice input has new state (meter level, partial transcript,
+    /// or a final result). The owning client polls its recording on receipt.
+    VoiceInputWake,
     /// Background compaction task finished (check_and_apply should be called)
     CompactionFinished,
     /// Provider's available models list may have changed

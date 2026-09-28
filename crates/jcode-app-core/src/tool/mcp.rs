@@ -685,14 +685,27 @@ impl McpManagementTool {
                         .as_ref()
                         .and_then(|r| r.mcp_alias(&server_name, &tool.name))
                         .unwrap_or_else(|| fallback.clone());
+                    // The schema is part of the result on purpose: on providers
+                    // without native deferred loading the cached tool list never
+                    // changes, so this transcript entry is the only place the
+                    // model learns how to call the new tool (via `mcp_call`).
                     output.push_str(&format!(
-                        "  - {}: {}\n",
+                        "  - {}: {}\n    tool: {}  input_schema: {}\n",
                         name,
-                        tool.description.as_deref().unwrap_or("(no description)")
+                        tool.description.as_deref().unwrap_or("(no description)"),
+                        tool.name,
+                        serde_json::to_string(&tool.input_schema)
+                            .unwrap_or_else(|_| "{}".to_string()),
                     ));
                     references.push(name);
                 }
                 references.truncate(MAX_SEARCH_TOOL_REFERENCES);
+                output.push_str(&format!(
+                    "\nCall these tools directly by name if they appear in your tool list; \
+                     otherwise use mcp_call with server=\"{}\", tool=<tool>, and arguments \
+                     matching input_schema.\n",
+                    server_name
+                ));
 
                 // The new server's tools load as provider-native deferred
                 // definitions (no prompt-cache miss) where supported.

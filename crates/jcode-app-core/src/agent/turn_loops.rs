@@ -46,7 +46,7 @@ impl Agent {
         notice: &crate::subscription_notice::QuotaExceeded,
     ) -> String {
         format!(
-            "<system-reminder>Jcode plan limit: {notice} Briefly tell the user this in your reply, including the upgrade link if one is given. Do not open checkout or purchase anything. Continue the task without that feature.</system-reminder>"
+            "<system-reminder>Jcode plan limit: {notice} An upgrade card with a button is already shown to the user in the chat. Mention the limit in one short sentence, including the upgrade link if one is given. Do not open checkout or purchase anything. Continue the task without that feature.</system-reminder>"
         )
     }
 
@@ -99,6 +99,7 @@ impl Agent {
             if let Some(event) = compaction_event {
                 // Reset cache tracker and tool lock on compaction since the message history changes
                 self.cache_tracker.reset();
+                self.kv_cache_monitor.reset();
                 self.locked_tools = None;
                 if print_output {
                     let tokens_str = event
@@ -158,7 +159,14 @@ impl Agent {
             // Background features (memory recall) can hit a plan limit with no
             // visible failure. Surface it once through the agent so every UI
             // shows the upgrade prompt instead of silently degrading.
-            if let Some(notice) = crate::subscription_notice::take() {
+            // Agents without memory (auth smoke tests, headless probes) leave
+            // the notice for a user-facing session.
+            if let Some(notice) = self
+                .memory_enabled
+                .then(crate::subscription_notice::take)
+                .flatten()
+            {
+                crate::subscription_notice::show_upgrade_card(&notice, &self.session.id);
                 messages_with_memory.push(Message::user(&Self::plan_limit_reminder(&notice)));
             }
 

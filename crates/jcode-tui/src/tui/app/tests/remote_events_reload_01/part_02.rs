@@ -352,7 +352,6 @@ fn test_remote_rewind_completion_shows_undo_hint_after_history_refresh() {
 
     app.handle_server_event(
         crate::protocol::ServerEvent::History {
-            applets: Default::default(),
             id: 1,
             session_id: "session_rewind_remote".to_string(),
             messages: vec![crate::protocol::HistoryMessage {
@@ -392,6 +391,7 @@ fn test_remote_rewind_completion_shows_undo_hint_after_history_refresh() {
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );

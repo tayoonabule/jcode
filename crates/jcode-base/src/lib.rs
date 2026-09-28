@@ -27,6 +27,7 @@ pub mod browser_detect;
 pub mod bus;
 pub mod cache_invalidation;
 pub mod cache_tracker;
+pub mod kv_cache_monitor;
 pub mod claude_live;
 pub mod client_input;
 pub mod compaction;

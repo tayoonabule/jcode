@@ -543,6 +543,26 @@ pub enum Request {
         /// message bodies collapsed to this with an expand control.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tldr: Option<String>,
+        /// Cross-swarm target: a swarm label or swarm id other than the
+        /// sender's own. When set, the message is a cross-swarm DM delivered
+        /// to `to_session` inside that swarm, or to its coordinator when
+        /// `to_session` is omitted. Channels and broadcasts never cross swarms.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_swarm: Option<String>,
+    },
+
+    /// List every live swarm (id, label, coordinator, member count) so agents
+    /// can discover cross-swarm DM targets.
+    #[serde(rename = "comm_list_swarms")]
+    CommListSwarms { id: u64, session_id: String },
+
+    /// Set (or clear, with an empty label) the human-readable label of the
+    /// caller's swarm. Labels are unique across swarms.
+    #[serde(rename = "comm_set_swarm_label")]
+    CommSetSwarmLabel {
+        id: u64,
+        session_id: String,
+        label: String,
     },
 
     /// List agents and their activity
@@ -989,6 +1009,24 @@ pub enum ServerEvent {
         ephemeral_chars: usize,
         #[serde(default)]
         ephemeral_message_count: usize,
+    },
+
+    /// Daemon-classified KV (prompt) cache miss for the request that just
+    /// completed. Emitted after `tokens`. `reason` is a stable snake_case id
+    /// (e.g. `prefix_changed`, `tools_changed`, `expired`, `model_switch`).
+    #[serde(rename = "kv_cache_miss")]
+    KvCacheMiss {
+        reason: String,
+        /// True when the harness itself changed the cached prefix.
+        harness_caused: bool,
+        missed_tokens: u64,
+        expected_tokens: u64,
+        read_tokens: u64,
+        /// Documented intentional invalidation that explains the miss.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        documented_cause: Option<String>,
+        /// Ready-to-display one-line summary.
+        message: String,
     },
 
     /// Active transport/connection type for the current stream
@@ -1494,6 +1532,10 @@ pub enum ServerEvent {
     /// Response to comm_list request
     #[serde(rename = "comm_members")]
     CommMembers { id: u64, members: Vec<AgentInfo> },
+
+    /// Response to comm_list_swarms and comm_set_swarm_label requests
+    #[serde(rename = "comm_swarms")]
+    CommSwarms { id: u64, swarms: Vec<SwarmInfo> },
 
     /// Response to comm_list_channels request
     #[serde(rename = "comm_channels")]

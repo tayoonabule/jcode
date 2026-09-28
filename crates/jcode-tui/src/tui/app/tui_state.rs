@@ -685,21 +685,6 @@ impl crate::tui::TuiState for App {
             .map(|anchor| anchor.lines_from_bottom)
     }
 
-    fn chat_overscroll_active(&self) -> bool {
-        self.chat_overscroll_active()
-    }
-
-    fn chat_overscroll_pinned(&self) -> bool {
-        matches!(
-            self.overscroll_status_mode,
-            crate::config::OverscrollStatusMode::On
-        )
-    }
-
-    fn chat_overscroll_remaining(&self) -> Option<f32> {
-        self.chat_overscroll_remaining()
-    }
-
     fn copy_selection_edge_autoscroll_active(&self) -> bool {
         self.copy_selection_edge_autoscroll.is_some() && self.copy_selection_dragging
     }
@@ -980,6 +965,10 @@ impl crate::tui::TuiState for App {
 
     fn connected_clients(&self) -> Option<usize> {
         self.remote_client_count
+    }
+
+    fn voice_input_status(&self) -> Option<(bool, String)> {
+        self.voice_input_status_line()
     }
 
     fn status_notice(&self) -> Option<String> {
@@ -1696,6 +1685,7 @@ impl crate::tui::TuiState for App {
                 false
             },
             git_info: gather_git_info(),
+            agent_edited: self.agent_edited_paths(),
         }
     }
 

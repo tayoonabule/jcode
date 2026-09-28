@@ -486,22 +486,6 @@ pub trait TuiState {
     fn pending_history_anchor_lines_from_bottom(&self) -> Option<usize> {
         None
     }
-    /// Whether the elastic overscroll status line (revealed by scrolling past
-    /// the bottom of the transcript) is currently shown.
-    fn chat_overscroll_active(&self) -> bool {
-        false
-    }
-    /// Whether the overscroll status line is pinned permanently visible by
-    /// config (`display.overscroll_status = "on"`). A pinned line is part of
-    /// the stable layout, unlike the transient elastic reveal.
-    fn chat_overscroll_pinned(&self) -> bool {
-        false
-    }
-    /// Seconds remaining in the overscroll dwell window, used to render the
-    /// `(overscroll x.x)` countdown. `None` when not shown.
-    fn chat_overscroll_remaining(&self) -> Option<f32> {
-        None
-    }
     /// Whether a mouse drag-selection is currently held at the top/bottom edge of
     /// a pane and should keep auto-scrolling on every tick (browser-style). When
     /// true the redraw loop must stay responsive even if the transcript is
@@ -621,6 +605,11 @@ pub trait TuiState {
     fn connected_clients(&self) -> Option<usize>;
     /// Short-lived notice shown in the status line (e.g., model switch, toggle diff)
     fn status_notice(&self) -> Option<String>;
+    /// Built-in voice input status while recording or transcribing:
+    /// `(recording, text)`. Shown ahead of every other notice.
+    fn voice_input_status(&self) -> Option<(bool, String)> {
+        None
+    }
     /// How long since the user last pressed a key, scrolled, or pasted, or
     /// `None` when they have not interacted yet.
     ///
@@ -898,6 +887,9 @@ pub trait TuiState {
     }
     /// Whether the notification line has content to show
     fn has_notification(&self) -> bool {
+        if self.voice_input_status().is_some() {
+            return true;
+        }
         if self.openai_reset_hint().is_some() {
             return true;
         }

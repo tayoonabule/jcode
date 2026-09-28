@@ -102,6 +102,67 @@ pub fn from_error(error: &anyhow::Error) -> Option<&QuotaExceeded> {
         .find_map(|cause| cause.downcast_ref::<QuotaExceeded>())
 }
 
+/// Stable per-session id so a later hit updates the same card instead of
+/// stacking duplicates in the transcript.
+pub const UPGRADE_CARD_ID: &str = "jcode-plan-limit";
+
+/// An inline chat card that shows the limit and, when a higher plan exists, a
+/// Subscribe/Upgrade button that opens jcode.sh pricing in the browser.
+/// Nothing is purchased in-app.
+pub fn upgrade_card(notice: &QuotaExceeded, session_id: &str) -> jcode_applet_types::Instance {
+    use jcode_applet_types::{Anchor, Lifetime, Placement, Scope};
+    let mut children = vec![
+        serde_json::json!({"type": "text", "text": notice.headline(), "style": "heading"}),
+        serde_json::json!({"type": "text", "tone": "dim", "text": match (&notice.upgrade_tier, &notice.upgrade_url) {
+            (Some(tier), Some(_)) => format!("Upgrade to {} for a higher daily limit, or wait for it to reset within 24 hours.", plan_name(tier)),
+            _ => "It resets within 24 hours.".to_string(),
+        }}),
+    ];
+    let mut buttons = Vec::new();
+    if let (Some(tier), Some(url)) = (&notice.upgrade_tier, &notice.upgrade_url) {
+        buttons.push(serde_json::json!({
+            "type": "button", "variant": "primary",
+            "label": format!("Upgrade to {}", plan_name(tier)),
+            "on_press": {"action": "host.open_url", "args": {"url": url}}
+        }));
+    }
+    buttons.push(serde_json::json!({
+        "type": "button", "variant": "secondary", "label": "Dismiss",
+        "on_press": {"action": "host.close"}
+    }));
+    children.push(serde_json::json!({"type": "stack", "direction": "horizontal", "gap": "sm", "children": buttons}));
+    let document = serde_json::from_value(serde_json::json!({
+        "revision": 1,
+        "title": "Jcode plan limit",
+        "view": {"type": "card", "title": "Jcode subscription", "children": [
+            {"type": "stack", "gap": "sm", "children": children}
+        ]}
+    }))
+    .expect("static upgrade card document");
+    jcode_applet_types::Instance {
+        id: UPGRADE_CARD_ID.to_string(),
+        applet: jcode_applet_types::agent::APPLET_ID.to_string(),
+        placement: Placement::Inline {
+            session_id: session_id.to_string(),
+            anchor: Anchor::End,
+        },
+        scope: Scope::Session {
+            session_id: session_id.to_string(),
+        },
+        lifetime: Lifetime::Session,
+        document,
+    }
+}
+
+/// Mount the upgrade card in a session's transcript and notify connected UIs.
+/// Best effort: a failure only loses the card, never the turn.
+pub fn show_upgrade_card(notice: &QuotaExceeded, session_id: &str) {
+    match crate::applets::mount(session_id, upgrade_card(notice, session_id)) {
+        Ok(snapshot) => crate::applets::publish(session_id, snapshot),
+        Err(error) => crate::logging::warn(&format!("Could not show plan-limit card: {error:#}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +175,44 @@ mod tests {
             upgrade_url: upgrade.then(|| "https://jcode.sh/pricing".into()),
             resets_at: Some("2026-09-27T00:00:00.000Z".into()),
         }
+    }
+
+    #[test]
+    fn upgrade_card_is_a_valid_applet_with_upgrade_button() {
+        let card = upgrade_card(&notice(true), "sess1");
+        jcode_applet_types::validate_document(
+            &card.document,
+            &jcode_applet_types::agent::manifest(),
+            &jcode_applet_types::Limits::default(),
+        )
+        .expect("card passes the same validation mount() applies");
+        let json = serde_json::to_string(&card.document).unwrap();
+        assert!(json.contains("Upgrade to Pro"));
+        assert!(json.contains("host.open_url"));
+        assert!(json.contains("https://jcode.sh/pricing"));
+        assert!(json.contains("Daily browser automation limit reached on your Plus plan"));
+        assert_eq!(card.id, UPGRADE_CARD_ID);
+        assert!(matches!(
+            card.placement,
+            jcode_applet_types::Placement::Inline {
+                anchor: jcode_applet_types::Anchor::End,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn top_tier_card_has_no_upgrade_button() {
+        let card = upgrade_card(&notice(false), "sess1");
+        jcode_applet_types::validate_document(
+            &card.document,
+            &jcode_applet_types::agent::manifest(),
+            &jcode_applet_types::Limits::default(),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&card.document).unwrap();
+        assert!(!json.contains("host.open_url"));
+        assert!(json.contains("Dismiss"));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -22,6 +22,8 @@ enum Transport {
     Stdio {
         pending: PendingMap,
         writer_tx: mpsc::Sender<String>,
+        /// Set by the reader on stdout EOF: no reply can arrive, so requests fail fast.
+        closed: Arc<AtomicBool>,
     },
     Http(Arc<super::http::HttpTransport>),
     Sse(Arc<super::sse::SseTransport>),
@@ -95,20 +97,30 @@ impl McpHandle {
                     .send(&body, id, true)
                     .await?
                     .context("MCP server returned no JSON-RPC response"),
-                Transport::Stdio { pending, writer_tx } => {
+                Transport::Stdio {
+                    pending,
+                    writer_tx,
+                    closed,
+                } => {
                     // Register before sending so a reply that arrives while we
                     // are still awaiting the writer still finds its waiter, and
                     // so the deadline below cannot leave the slot behind: the
                     // registration is released when this future is dropped.
                     let waiter = pending::PendingRequest::register(pending, id).await;
+                    // Checked after registering: the reader sets `closed` before
+                    // failing every waiter, so a request registered after that
+                    // sweep still sees the flag instead of waiting out its deadline.
+                    if closed.load(Ordering::SeqCst) {
+                        waiter.cancel().await;
+                        anyhow::bail!("MCP server '{}' exited (stdout closed)", self.name);
+                    }
                     if let Err(error) = writer_tx.send(body + "\n").await {
                         waiter.cancel().await;
                         return Err(error).context("Failed to send request");
                     }
-                    waiter
-                        .recv()
-                        .await
-                        .context("MCP server closed its output before replying")
+                    waiter.recv().await.with_context(|| {
+                        format!("MCP server '{}' exited (stdout closed)", self.name)
+                    })
                 }
             }
         };
@@ -433,6 +445,8 @@ impl McpClient {
 
         // Spawn reader task
         let pending_clone = Arc::clone(&pending);
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_clone = Arc::clone(&closed);
         let reader_name = name.clone();
         let mut reader = BufReader::new(stdout);
         tokio::spawn(async move {
@@ -466,13 +480,18 @@ impl McpClient {
             // Nothing will answer the outstanding requests now that the child's
             // stdout is gone, so wake their callers instead of making each one
             // sit out its full reply deadline.
+            closed_clone.store(true, Ordering::SeqCst);
             pending::fail_all(&pending_clone).await;
         });
 
         let handle = McpHandle {
             name: name.clone(),
             request_id: Arc::new(AtomicU64::new(1)),
-            transport: Transport::Stdio { pending, writer_tx },
+            transport: Transport::Stdio {
+                pending,
+                writer_tx,
+                closed,
+            },
             server_info: Arc::new(std::sync::RwLock::new(None)),
             capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
             tools: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -777,6 +796,27 @@ done
             disabled: None,
             timeout_secs: None,
         }
+    }
+
+    #[tokio::test]
+    async fn connect_fails_fast_when_server_exits_before_initialize() {
+        // A server that prints to stderr and exits before answering
+        // `initialize` must fail connect promptly, even with a huge
+        // `timeout_secs` (previously the pending request waited it out).
+        let config = McpServerConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "echo boom >&2; exit 1".to_string()],
+            timeout_secs: Some(86_400),
+            ..fake_server_config()
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            McpClient::connect("dead".to_string(), &config),
+        )
+        .await
+        .expect("connect must not hang on a server that exited");
+        let err = format!("{:#}", result.err().expect("connect must fail"));
+        assert!(err.contains("exited"), "unexpected error: {err}");
     }
 
     #[tokio::test]
