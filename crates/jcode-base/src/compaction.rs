@@ -1806,12 +1806,19 @@ async fn generate_compaction_artifact(
     );
 
     // Generate summary using simple completion
-    let summary = provider
-        .complete_simple(
+    let (summary, usage) = provider
+        .complete_simple_with_usage(
             &prompt,
             "You are a helpful assistant that summarizes conversations.",
         )
         .await?;
+    crate::telemetry::record_simple_completion_usage(
+        None,
+        provider.name(),
+        &provider.model(),
+        crate::telemetry::UsageSource::Compaction,
+        usage,
+    );
 
     Ok(CompactionResult {
         summary_text: summary,

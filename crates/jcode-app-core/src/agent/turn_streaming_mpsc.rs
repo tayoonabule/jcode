@@ -18,6 +18,35 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
 /// The wrapped-tool-call markers emitted by some models inside plain text.
 const WRAP_TOOL_MARKERS: [&str; 2] = ["to=functions.", "+#+#"];
 
+/// Report whatever usage a provider stream reported before it failed.
+///
+/// The normal `usage_report` is emitted after the stream completes. A stream
+/// that errors (or is retried after compaction) still consumed the tokens the
+/// provider already reported, so count them. `[input, output, cache_read,
+/// cache_creation]`; a no-op when nothing was reported.
+fn record_partial_stream_usage(
+    session_id: &str,
+    provider: &str,
+    model: &str,
+    [input, output, cache_read, cache_creation]: [Option<u64>; 4],
+) {
+    if input.is_none() && output.is_none() && cache_read.is_none() && cache_creation.is_none() {
+        return;
+    }
+    crate::telemetry::record_provider_usage(
+        Some(session_id),
+        provider,
+        model,
+        crate::telemetry::UsageSource::Agent,
+        crate::telemetry::ProviderUsage {
+            input_tokens: input.unwrap_or(0),
+            output_tokens: output.unwrap_or(0),
+            cache_read_input_tokens: cache_read,
+            cache_creation_input_tokens: cache_creation,
+        },
+    );
+}
+
 /// Find the first wrapped-tool-call marker in `accumulated`, scanning only the
 /// newly appended `delta` plus a short overlap from the previous tail (so a
 /// marker straddling the append boundary is still found).
@@ -471,6 +500,17 @@ impl Agent {
                 let event = match event {
                     Ok(event) => event,
                     Err(e) => {
+                        record_partial_stream_usage(
+                            &self.session.id,
+                            provider.name(),
+                            &model_at_request_start,
+                            [
+                                usage_input,
+                                usage_output,
+                                usage_cache_read,
+                                usage_cache_creation,
+                            ],
+                        );
                         let err_str = e.to_string();
                         if self.try_auto_compact_after_context_limit(&err_str) {
                             log_agent_provider_stream_lifecycle(
@@ -976,6 +1016,17 @@ impl Agent {
                         message,
                         retry_after_secs,
                     } => {
+                        record_partial_stream_usage(
+                            &self.session.id,
+                            provider.name(),
+                            &model_at_request_start,
+                            [
+                                usage_input,
+                                usage_output,
+                                usage_cache_read,
+                                usage_cache_creation,
+                            ],
+                        );
                         if self.try_auto_compact_after_context_limit(&message) {
                             log_agent_provider_stream_lifecycle(
                                 logging::LogLevel::Warn,
@@ -1093,6 +1144,18 @@ impl Agent {
                     usage_output.unwrap_or(0),
                     usage_cache_read,
                     usage_cache_creation,
+                );
+                crate::telemetry::record_provider_usage(
+                    Some(&self.session.id),
+                    provider.name(),
+                    &model_at_request_start,
+                    crate::telemetry::UsageSource::Agent,
+                    crate::telemetry::ProviderUsage {
+                        input_tokens: usage_input.unwrap_or(0),
+                        output_tokens: usage_output.unwrap_or(0),
+                        cache_read_input_tokens: usage_cache_read,
+                        cache_creation_input_tokens: usage_cache_creation,
+                    },
                 );
 
                 let input = usage_input.unwrap_or(0);
