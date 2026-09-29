@@ -1891,6 +1891,9 @@ impl crate::tui::TuiState for App {
     fn side_panel(&self) -> &crate::side_panel::SidePanelSnapshot {
         &self.side_panel
     }
+    fn side_panel_fullscreen(&self) -> bool {
+        self.side_panel_fullscreen
+    }
     fn pin_images(&self) -> bool {
         self.pin_images && !self.side_panel_user_hidden
     }

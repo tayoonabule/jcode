@@ -2017,7 +2017,6 @@ struct OverscrollLevels {
     auth: u8,
     provider: u8,
     model: u8,
-    tight_separators: bool,
 }
 
 /// Compaction ladder, applied one step at a time until the line fits.
@@ -2028,17 +2027,16 @@ struct OverscrollLevels {
 /// only shortened, so the line always answers "where am I, what am I running,
 /// how full is the context".
 const OVERSCROLL_LADDER: &[fn(&mut OverscrollLevels)] = &[
-    |l| l.auth = 1,                // hide auth ("OAuth"/"API key")
-    |l| l.git = 1,                 // "~3 +1 ?2 ↑1" -> "±6 ↑1"
-    |l| l.context = 1,             // "74k/256k ▰▰▰▱▱▱▱▱▱▱ 29%" -> "▰▱▱▱ 29%"
-    |l| l.branch = 1,              // long branch -> 12 chars
-    |l| l.provider = 1,            // hide provider
-    |l| l.context = 2,             // "▰▱▱▱ 29%" -> "29%"
-    |l| l.git = 2,                 // hide git status
-    |l| l.branch = 2,              // hide branch
-    |l| l.tight_separators = true, // " · " -> " "
-    |l| l.model = 1,               // drop reasoning effort
-    |l| l.dir = 1,                 // "~/…/jcode" -> "jcode"
+    |l| l.auth = 1,     // hide auth ("OAuth"/"API key")
+    |l| l.git = 1,      // "~3 +1 ?2 ↑1" -> "±6 ↑1"
+    |l| l.context = 1,  // "74k/256k ▰▰▰▱▱▱▱▱▱▱ 29%" -> "▰▱▱▱ 29%"
+    |l| l.branch = 1,   // long branch -> 12 chars
+    |l| l.provider = 1, // hide provider
+    |l| l.context = 2,  // "▰▱▱▱ 29%" -> "29%"
+    |l| l.git = 2,      // hide git status
+    |l| l.branch = 2,   // hide branch
+    |l| l.model = 1,    // drop reasoning effort
+    |l| l.dir = 1,      // "~/…/jcode" -> "jcode"
 ];
 
 fn overscroll_fact_spans(
@@ -2156,14 +2154,10 @@ fn overscroll_fact_spans(
 fn overscroll_fit_facts(facts: &OverscrollFacts, max_width: usize) -> (Vec<Span<'static>>, bool) {
     use unicode_width::UnicodeWidthStr;
     let render = |levels: OverscrollLevels| {
-        let sep_text = if levels.tight_separators { " " } else { " · " };
         let mut out: Vec<Span<'static>> = Vec::new();
         for group in overscroll_fact_spans(facts, levels) {
             if !out.is_empty() {
-                out.push(Span::styled(
-                    sep_text,
-                    Style::default().fg(rgb(100, 100, 110)),
-                ));
+                out.push(Span::raw(" "));
             }
             out.extend(group);
         }

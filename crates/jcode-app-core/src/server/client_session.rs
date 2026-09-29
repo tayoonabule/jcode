@@ -1254,6 +1254,18 @@ async fn claim_live_target_agent(
         .get(session_id)
         .filter(|existing| !Arc::ptr_eq(existing, source_agent))
         .cloned()?;
+    // A session that migrated back from another machine has a newer transcript
+    // on disk than this live agent. Never reattach to the stale copy. The
+    // caller then restores from disk and replaces the map entry.
+    if target
+        .try_lock()
+        .is_ok_and(|agent| agent.session_copy_is_stale())
+    {
+        crate::logging::info(&format!(
+            "Resume of {session_id}: live agent is older than the migrated transcript on disk; reloading"
+        ));
+        return None;
+    }
 
     let info = connections.get_mut(client_connection_id)?;
     info.session_id = session_id.to_string();

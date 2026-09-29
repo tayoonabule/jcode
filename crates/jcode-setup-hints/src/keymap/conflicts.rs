@@ -163,8 +163,13 @@ pub fn jcode_bindings(cfg: &KeybindingsConfig) -> Vec<JcodeBinding> {
         ),
         (
             "diagram_pane_toggle",
-            "Toggle diagram pane",
+            "Toggle diagram pane position",
             cfg.diagram_pane_toggle.as_str(),
+        ),
+        (
+            "diagram_pane_visibility_toggle",
+            "Show/hide diagram pane",
+            cfg.diagram_pane_visibility_toggle.as_str(),
         ),
         (
             "typing_scroll_lock_toggle",

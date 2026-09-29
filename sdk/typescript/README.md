@@ -353,6 +353,7 @@ discovery pass only.
 | `renameSession(id, title?)` | Set a session title, or clear it |
 | `rewindUndo(id)` | Restore what the last `rewind` removed |
 | `cancelSoftInterrupts(id)` | Retract queued soft interrupts |
+| `backgroundTool(id)` | Move the running tool call to the background |
 | `ping()` | Liveness |
 
 ## Models

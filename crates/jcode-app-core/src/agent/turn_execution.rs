@@ -2,6 +2,23 @@ use super::*;
 use crate::{terminal_eprintln as eprintln, terminal_println as println};
 
 impl Agent {
+    /// Refuse to run a model turn when this session moved to another machine
+    /// or this in-memory copy is older than the transcript on disk.
+    pub(crate) fn ensure_session_lease(&self) -> Result<()> {
+        match self.session.migration_lease_block() {
+            Some(block) => Err(anyhow::anyhow!("Session is not runnable here: {block}")),
+            None => Ok(()),
+        }
+    }
+
+    /// True when a newer migrated transcript replaced this copy on disk.
+    pub(crate) fn session_copy_is_stale(&self) -> bool {
+        matches!(
+            self.session.migration_lease_block(),
+            Some(crate::storage::SessionLeaseBlock::StaleCopy { .. })
+        )
+    }
+
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
         self.announce_late_mcp_tools().await;

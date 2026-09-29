@@ -1616,7 +1616,10 @@ async fn register_fake_deferred_mcp_surface(registry: &Registry) {
     }
 }
 
-async fn agent_with_fake_mcp_surface(mode: crate::config::McpToolsMode, _threshold: usize) -> Agent {
+async fn agent_with_fake_mcp_surface(
+    mode: crate::config::McpToolsMode,
+    _threshold: usize,
+) -> Agent {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     register_fake_deferred_mcp_surface(&registry).await;
@@ -1672,7 +1675,11 @@ async fn mcp_exposure_modes_select_eager_or_fixed_definitions() {
         .into_iter()
         .map(|tool| tool.name)
         .collect();
-    assert!(!auto_small_names.iter().any(|name| name.starts_with("mcp__")));
+    assert!(
+        !auto_small_names
+            .iter()
+            .any(|name| name.starts_with("mcp__"))
+    );
     assert!(auto_small_names.iter().any(|name| name == "mcp_search"));
     assert!(auto_small_names.iter().any(|name| name == "mcp_call"));
 
@@ -2736,7 +2743,10 @@ async fn late_mcp_tools_are_announced_once_in_the_transcript() {
     assert!(text.contains("mcp__late__tool"));
     assert!(text.contains("server: late"));
     assert!(text.contains("tool: tool"));
-    assert!(text.contains("input_schema: {"), "schema must be included: {text}");
+    assert!(
+        text.contains("input_schema: {"),
+        "schema must be included: {text}"
+    );
     assert!(text.contains("mcp_call"));
 
     // Second pass: nothing new, no second announcement, and the cached

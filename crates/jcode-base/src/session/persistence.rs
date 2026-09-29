@@ -386,6 +386,13 @@ impl Session {
     }
 
     fn save_inner(&mut self, force: bool) -> Result<()> {
+        // A session that migrated to another machine (or whose on-disk copy was
+        // replaced by a newer returned transcript) must not be overwritten by
+        // this stale in-memory copy.
+        if let Some(block) = self.migration_lease_block() {
+            crate::logging::warn(&format!("Session {} not persisted: {}", self.id, block));
+            return Ok(());
+        }
         self.updated_at = Utc::now();
         let path = session_path(&self.id)?;
         let journal_path = session_journal_path_from_snapshot(&path);

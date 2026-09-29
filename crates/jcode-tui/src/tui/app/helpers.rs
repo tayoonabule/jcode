@@ -1511,7 +1511,12 @@ pub(crate) fn gather_git_info_in(dir: Option<&std::path::Path>) -> Option<GitInf
     let mut added_total = 0usize;
     let mut removed_total = 0usize;
     for file in &mut all_files {
-        let key = file.path.rsplit(" -> ").next().unwrap_or(&file.path).trim_matches('"');
+        let key = file
+            .path
+            .rsplit(" -> ")
+            .next()
+            .unwrap_or(&file.path)
+            .trim_matches('"');
         let abs = repo_root.as_ref().map(|root| root.join(key));
         if file.status == '?' {
             file.added = abs.as_deref().and_then(count_text_lines);
@@ -1555,6 +1560,20 @@ pub(crate) fn gather_git_info_in(dir: Option<&std::path::Path>) -> Option<GitInf
         })
         .unwrap_or((0, 0));
 
+    let recent_commits = git()
+        .args([
+            "log",
+            "-n",
+            "8",
+            "--shortstat",
+            "--format=%x1e%h%x1f%ct%x1f%s",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_recent_commits(&String::from_utf8_lossy(&o.stdout), ahead))
+        .unwrap_or_default();
+
     Some(GitInfo {
         branch,
         modified,
@@ -1567,7 +1586,49 @@ pub(crate) fn gather_git_info_in(dir: Option<&std::path::Path>) -> Option<GitInf
         added_total,
         removed_total,
         repo_root,
+        recent_commits,
     })
+}
+
+/// Parse `git log --shortstat --format=%x1e%h%x1f%ct%x1f%s`. The first
+/// `ahead` commits are the ones not yet on the upstream.
+pub(crate) fn parse_recent_commits(
+    text: &str,
+    ahead: usize,
+) -> Vec<crate::tui::info_widget::RecentCommit> {
+    text.split('\x1e')
+        .filter(|record| !record.trim().is_empty())
+        .enumerate()
+        .filter_map(|(index, record)| {
+            let mut lines = record.lines();
+            let mut fields = lines.next()?.splitn(3, '\x1f');
+            let hash = fields.next()?.trim().to_string();
+            let timestamp = fields.next()?.trim().parse().ok()?;
+            let subject = fields.next().unwrap_or("").trim().to_string();
+            let (mut added, mut removed) = (None, None);
+            // " 3 files changed, 12 insertions(+), 4 deletions(-)"
+            for part in lines.flat_map(|l| l.split(',')) {
+                let part = part.trim();
+                let n = part.split_whitespace().next().and_then(|n| n.parse().ok());
+                if part.contains("insertion") {
+                    added = n;
+                } else if part.contains("deletion") {
+                    removed = n;
+                } else if part.contains("changed") {
+                    added = added.or(Some(0));
+                    removed = removed.or(Some(0));
+                }
+            }
+            Some(crate::tui::info_widget::RecentCommit {
+                hash,
+                subject,
+                timestamp,
+                unpushed: index < ahead,
+                added,
+                removed,
+            })
+        })
+        .collect()
 }
 
 /// Parse `git diff --numstat` into path -> (added, removed). Binary files
@@ -1607,7 +1668,11 @@ fn count_text_lines(path: &std::path::Path) -> Option<usize> {
         return None;
     }
     let lines = bytes.iter().filter(|&&b| b == b'\n').count();
-    Some(if bytes.last().is_some_and(|&b| b != b'\n') { lines + 1 } else { lines })
+    Some(if bytes.last().is_some_and(|&b| b != b'\n') {
+        lines + 1
+    } else {
+        lines
+    })
 }
 
 /// Collapse a porcelain `XY` pair into the single letter the Changes widget

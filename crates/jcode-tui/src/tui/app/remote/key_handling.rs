@@ -486,6 +486,15 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    if app
+        .toggle_keys
+        .diagram_pane_visibility
+        .matches(code, modifiers)
+    {
+        app.toggle_diagram_pane();
+        return Ok(());
+    }
+
     if app.toggle_keys.side_panel.matches(code, modifiers) {
         app.toggle_side_panel();
         return Ok(());
@@ -969,6 +978,25 @@ async fn handle_remote_key_internal(
             if !app.input.is_empty() {
                 let prepared = input::take_prepared_input(app);
                 let trimmed = prepared.expanded.trim();
+
+                // Before the SSH gate: `/local` must work from a client attached
+                // to the cloud copy, because the return is coordinated locally.
+                if app_mod::commands_cloud::parse_cloud_command(trimmed).is_some() {
+                    let session_id = app_mod::commands::active_session_id(app);
+                    if crate::tui::is_ssh_remote()
+                        && matches!(
+                            app_mod::commands_cloud::parse_cloud_command(trimmed),
+                            Some(app_mod::commands_cloud::CloudCommand::Move { .. })
+                        )
+                    {
+                        app.push_display_message(DisplayMessage::error(
+                            "This session already runs on a remote host. Use /local to bring it back first.".to_string(),
+                        ));
+                        return Ok(());
+                    }
+                    app_mod::commands_cloud::handle_cloud_command(app, trimmed, &session_id);
+                    return Ok(());
+                }
 
                 if app_mod::commands_dispatch::handle_ssh_unsupported_command(app, trimmed) {
                     return Ok(());

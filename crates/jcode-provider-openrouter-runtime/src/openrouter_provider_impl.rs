@@ -914,14 +914,13 @@ impl OpenRouterProvider {
         if !self.supports_model_catalog {
             return false;
         }
-        if let Ok(cache) = self.models_cache.try_read() {
-            if let Some(model) = cache
+        if let Ok(cache) = self.models_cache.try_read()
+            && let Some(model) = cache
                 .models
                 .iter()
                 .find(|model| model.id.trim().eq_ignore_ascii_case(model_id))
-            {
-                return declares_image_input(model);
-            }
+        {
+            return declares_image_input(model);
         }
         self.load_usable_model_disk_cache_entry()
             .is_some_and(|entry| {

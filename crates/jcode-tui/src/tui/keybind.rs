@@ -359,6 +359,20 @@ impl ToggleBinding {
         {
             return true;
         }
+        // Legacy terminals report Alt+Shift+<letter> as an uppercase char with
+        // only ALT set. Treat that as the explicit Shift chord.
+        if let Some(binding) = &self.binding
+            && binding.modifiers.contains(KeyModifiers::SHIFT)
+            && !modifiers.contains(KeyModifiers::SHIFT)
+            && let KeyCode::Char(c) = code
+            && c.is_ascii_uppercase()
+            && binding.matches(
+                KeyCode::Char(c.to_ascii_lowercase()),
+                modifiers | KeyModifiers::SHIFT,
+            )
+        {
+            return true;
+        }
         if let Some(letter) = self.macos_option_letter
             && shortcut_char_for_macos_option_key(code, modifiers) == Some(letter)
         {
@@ -380,6 +394,7 @@ pub struct ToggleKeys {
     pub side_panel: ToggleBinding,
     pub copy_selection: ToggleBinding,
     pub diagram_pane: ToggleBinding,
+    pub diagram_pane_visibility: ToggleBinding,
     pub typing_scroll_lock: ToggleBinding,
     pub diff_mode_cycle: ToggleBinding,
     pub info_widget: ToggleBinding,
@@ -400,6 +415,13 @@ pub fn load_toggle_keys() -> ToggleKeys {
         side_panel: ToggleBinding::load(&cfg.keybindings.side_panel_toggle, 'm'),
         copy_selection: ToggleBinding::load(&cfg.keybindings.copy_selection_toggle, 'y'),
         diagram_pane: ToggleBinding::load(&cfg.keybindings.diagram_pane_toggle, 't'),
+        diagram_pane_visibility: ToggleBinding::load_with_default(
+            &cfg.keybindings.diagram_pane_visibility_toggle,
+            KeyBinding {
+                code: KeyCode::Char('m'),
+                modifiers: KeyModifiers::ALT | KeyModifiers::SHIFT,
+            },
+        ),
         typing_scroll_lock: ToggleBinding::load(&cfg.keybindings.typing_scroll_lock_toggle, 's'),
         diff_mode_cycle: ToggleBinding::load(&cfg.keybindings.diff_mode_cycle, 'g'),
         info_widget: ToggleBinding::load(&cfg.keybindings.info_widget_toggle, 'i'),
@@ -427,6 +449,14 @@ fn swarm_panel_focus_default() -> KeyBinding {
 
 pub(crate) fn side_panel_toggle_key_label() -> String {
     jcode_tui_core::keybind::alt_chord("M")
+}
+
+pub(crate) fn diagram_pane_visibility_key_label() -> String {
+    load_toggle_keys()
+        .diagram_pane_visibility
+        .binding()
+        .map(format_binding)
+        .unwrap_or_else(|| jcode_tui_core::keybind::alt_chord("Shift+M"))
 }
 
 /// Status-line hint shown when the inline swarm controls open.

@@ -536,6 +536,8 @@ mod buffer_tests {
         }
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = Restore;
+        // The assertions compare exact truecolor output; never depend on the runner's COLORTERM.
+        crate::color::pin_truecolor_for_tests();
         set_palette(palette);
         body();
     }

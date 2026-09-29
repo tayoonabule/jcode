@@ -176,6 +176,12 @@ pub async fn run_tui_client(
         // No local exec/reload may escape the SSH lifetime guard or inherit
         // remote session IDs as if they referred to laptop session files.
         tui_runtime.finish(true);
+        if let Some(handoff) = run_result.cloud_handoff.clone() {
+            // `/local` from a cloud attach: the SSH guard in `ssh.rs` must
+            // close before we exec, so hand the target back to it.
+            super::cloud_move::stash_handoff(handoff);
+            return Ok(());
+        }
         if has_requested_action(&run_result) {
             anyhow::bail!(
                 "local reload/update actions are unavailable during SSH attach; reconnect after updating explicitly"
@@ -193,10 +199,14 @@ pub async fn run_tui_client(
         return Ok(());
     }
 
-    tui_runtime.finish_for_run_result(&run_result, false);
+    tui_runtime.finish_for_run_result(&run_result, run_result.cloud_handoff.is_some());
 
     if let Some(code) = run_result.exit_code {
         std::process::exit(code);
+    }
+
+    if let Some(handoff) = run_result.cloud_handoff.clone() {
+        return super::cloud_move::exec_handoff(handoff);
     }
 
     execute_requested_action(&run_result)?;
