@@ -218,8 +218,7 @@ pub struct McpOAuthConfig {
 /// MCP server configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
-    /// Command for stdio servers. Empty for HTTP/SSE servers, which jcode does
-    /// not yet support (such entries are skipped at load time).
+    /// Command for stdio servers. Empty for HTTP/SSE servers.
     #[serde(default)]
     pub command: String,
     #[serde(default)]
@@ -231,15 +230,13 @@ pub struct McpServerConfig {
     /// Stateful servers (Playwright browser) should not be shared.
     #[serde(default = "default_shared")]
     pub shared: bool,
-    /// Transport type from Claude Code configs ("stdio", "http", "sse"). Used
-    /// only to recognize and skip non-stdio servers; defaults to stdio.
+    /// Transport type from Claude Code configs ("stdio", "http", "sse").
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
-    /// URL for HTTP/SSE servers (Claude Code compat). Unused by jcode today.
+    /// URL for HTTP/SSE servers (Claude Code compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Headers for HTTP/SSE servers (Claude Code compat). Unused by jcode today,
-    /// but retained so environment expansion is ready when those transports are.
+    /// Headers for HTTP/SSE servers (Claude Code compat).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub headers: std::collections::HashMap<String, String>,
     /// Optional static OAuth client configuration for remote HTTP/SSE servers.
@@ -274,6 +271,14 @@ impl McpServerConfig {
             }
         }
         !self.command.trim().is_empty()
+    }
+
+    pub fn is_runnable(&self) -> bool {
+        self.is_stdio()
+            || self
+                .url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty())
     }
 
     /// Whether this server should be spawned/connected automatically.
@@ -731,16 +736,15 @@ impl McpConfig {
         // support receives already-expanded URLs and headers as well.
         merged.expand_environment_variables();
 
-        // jcode only supports stdio servers today. Drop HTTP/SSE entries (common
-        // in Claude Code configs) so they don't fail to spawn, but log them so
-        // the omission is visible.
+        // Retain configured HTTP/SSE servers with a URL. The client supports
+        // these transports; the old stdio-only filter silently hid Granola and
+        // other valid native sources even though manual URL connect worked.
         merged.servers.retain(|name, cfg| {
-            let keep = cfg.is_stdio();
+            let keep = cfg.is_runnable();
             if !keep {
                 crate::logging::info(&format!(
-                    "MCP: Skipping non-stdio server '{}' ({}); HTTP/SSE transports are not yet supported",
-                    name,
-                    cfg.transport.as_deref().unwrap_or("http")
+                    "MCP: Skipping server '{}' without a command or URL",
+                    name
                 ));
             }
             keep
@@ -749,12 +753,13 @@ impl McpConfig {
         merged
     }
 
-    /// Merge `incoming` over `existing`, except that an entry jcode cannot run
-    /// (HTTP/SSE) never displaces a working stdio entry for the same name.
+    /// Merge `incoming` over `existing`, except that a remote HTTP/SSE entry
+    /// does not displace an existing working stdio entry of the same name.
     ///
     /// Without this, a `type: http` entry in `~/.claude.json` would overwrite a
-    /// working stdio server from `~/.jcode/mcp.json` and then be dropped by the
-    /// non-stdio filter, silently losing the server (issue #653).
+    /// working stdio server from `~/.jcode/mcp.json`, silently losing the
+    /// local definition (issue #653). Preserve that precedence after enabling
+    /// configured remote transports.
     fn merge_servers_preferring_runnable(
         existing: &mut std::collections::HashMap<String, McpServerConfig>,
         incoming: std::collections::HashMap<String, McpServerConfig>,

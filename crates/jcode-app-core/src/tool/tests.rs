@@ -89,6 +89,53 @@ async fn register_empty_mcp_tools(registry: &Registry, working_dir: &std::path::
 }
 
 #[tokio::test]
+async fn fresh_registry_sees_configured_http_granola_before_browser_fallback() {
+    let _env_lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("isolated Jcode home");
+    let _home_guard = TestHomeGuard::new(home.path());
+    let working_dir = tempfile::tempdir().expect("isolated working directory");
+    std::fs::write(
+        home.path().join("mcp.json"),
+        r#"{"mcpServers":{"granola":{"type":"http","url":"https://example.invalid/mcp","enabled":false}}}"#,
+    )
+    .expect("write configured remote server");
+
+    let registry = Registry::empty();
+    registry
+        .register_mcp_tools_for_dir(None, None, None, Some(working_dir.path().to_path_buf()))
+        .await;
+    let listed = registry
+        .execute(
+            "mcp",
+            serde_json::json!({"action":"list"}),
+            mcp_test_context(working_dir.path()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        listed
+            .output
+            .contains("granola (disabled in config; connect on demand"),
+        "{}",
+        listed.output
+    );
+    let found = registry
+        .execute(
+            "mcp_search",
+            serde_json::json!({"query":"Granola transcript"}),
+            mcp_test_context(working_dir.path()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        found.output.contains("\"server\":\"granola\""),
+        "{}",
+        found.output
+    );
+    assert!(found.output.contains("before falling back to a browser"));
+}
+
+#[tokio::test]
 async fn mcp_list_remains_available_while_background_connect_is_handshaking() {
     let _env_lock = crate::storage::lock_test_env();
     let home = tempfile::tempdir().expect("create isolated JCODE_HOME");

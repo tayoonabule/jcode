@@ -581,6 +581,35 @@ fn http_entry_does_not_displace_a_working_stdio_server_of_the_same_name() {
 }
 
 #[test]
+fn configured_http_server_survives_global_load_and_invalid_remote_is_skipped() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let home = tempfile::tempdir().expect("isolated home");
+    crate::env::set_var("JCODE_HOME", home.path());
+    std::fs::write(
+        home.path().join("mcp.json"),
+        r#"{"mcpServers":{"granola":{"type":"http","url":"https://example.invalid/mcp","headers":{"Authorization":"secret"}},"broken":{"type":"http"}}}"#,
+    ).expect("write native MCP config");
+
+    let config = McpConfig::load_for_dir(None);
+    assert_eq!(
+        config
+            .servers
+            .get("granola")
+            .and_then(|server| server.url.as_deref()),
+        Some("https://example.invalid/mcp")
+    );
+    assert!(config.servers.get("granola").unwrap().is_runnable());
+    assert!(!config.servers.contains_key("broken"));
+
+    if let Some(value) = previous_home {
+        crate::env::set_var("JCODE_HOME", value);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
 fn stdio_entry_still_overrides_an_existing_http_entry() {
     // The precedence guard is one-directional: a runnable stdio definition must
     // still win over a non-runnable http one from an earlier config.

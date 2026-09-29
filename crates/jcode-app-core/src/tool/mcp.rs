@@ -49,6 +49,13 @@ struct McpSearchResult {
 /// tool references, so an empty or broad query cannot pull in a whole catalog.
 const MAX_SEARCH_TOOL_REFERENCES: usize = 32;
 
+fn matches_mcp_query(query: &str, server: &str, name: &str, tool: &str, description: &str) -> bool {
+    let searchable = format!("{} {} {} {}", name, server, tool, description).to_ascii_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| searchable.contains(word))
+}
+
 /// Fixed MCP discovery surface used when individual server definitions are deferred.
 pub struct McpSearchTool {
     manager: Arc<RwLock<McpManager>>,
@@ -149,11 +156,7 @@ impl Tool for McpSearchTool {
                 }
                 if let Some(query) = &query {
                     let description = tool.description.as_deref().unwrap_or_default();
-                    if !name.to_ascii_lowercase().contains(query)
-                        && !server.to_ascii_lowercase().contains(query)
-                        && !tool.name.to_ascii_lowercase().contains(query)
-                        && !description.to_ascii_lowercase().contains(query)
-                    {
+                    if !matches_mcp_query(query, &server, &name, &tool.name, description) {
                         return None;
                     }
                 }
@@ -176,7 +179,35 @@ impl Tool for McpSearchTool {
             .take(MAX_SEARCH_TOOL_REFERENCES)
             .map(|m| m.name.as_str())
             .collect();
-        Ok(ToolOutput::new(serde_json::to_string_pretty(&matches)?)
+        let mut output = serde_json::to_string_pretty(&matches)?;
+        if matches.is_empty() {
+            // A search miss does not prove a native source is unavailable. A
+            // server may be configured after this session started, or its
+            // connection/schema cache may have failed. Show only its name and
+            // the safe reconnect action, never its URL, headers, or env.
+            let manager = self.manager.read().await;
+            let fresh = manager.load_fresh_config();
+            let mut candidates: Vec<_> = fresh
+                .servers
+                .keys()
+                .chain(manager.config().servers.keys())
+                .filter(|name| {
+                    server_filter.is_some_and(|filter| filter == name.as_str())
+                        || query
+                            .as_ref()
+                            .is_some_and(|q| q.contains(&name.to_ascii_lowercase()))
+                })
+                .collect();
+            candidates.sort();
+            candidates.dedup();
+            for name in candidates {
+                output.push_str(&format!(
+                    "\nConfigured MCP server '{}' has no searchable tools yet. Try mcp {{\"action\":\"connect\",\"server\":\"{}\"}} before falling back to a browser.",
+                    name, name
+                ));
+            }
+        }
+        Ok(ToolOutput::new(output)
             .with_title(format!("MCP tools ({})", matches.len()))
             .with_metadata(json!({ "tool_references": references })))
     }
@@ -506,14 +537,13 @@ impl McpManagementTool {
         let all_tools = manager.all_tools().await;
         // Configured-but-not-connected servers, including disabled ones
         // (issue #436), so the full config state is visible.
-        let mut configured: Vec<(String, bool)> = manager
+        let configured: std::collections::BTreeMap<String, bool> = manager
             .config()
             .servers
             .iter()
             .filter(|(name, _)| !servers.contains(name))
             .map(|(name, cfg)| (name.clone(), cfg.is_enabled()))
             .collect();
-        configured.sort();
 
         if servers.is_empty() && configured.is_empty() {
             return Ok(ToolOutput::new(
@@ -910,6 +940,24 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    #[test]
+    fn multiword_query_matches_across_server_and_tool_description() {
+        assert!(matches_mcp_query(
+            "granola transcript",
+            "granola",
+            "mcp__granola__get_meeting_transcript",
+            "get_meeting_transcript",
+            "Get the full transcript by meeting ID"
+        ));
+        assert!(!matches_mcp_query(
+            "granola invoice",
+            "granola",
+            "mcp__granola__get_meeting_transcript",
+            "get_meeting_transcript",
+            "Get the full transcript by meeting ID"
+        ));
+    }
+
     fn create_test_tool() -> McpManagementTool {
         // Use an explicit empty config so tests are hermetic: McpManager::new()
         // would load the developer's real ~/.jcode/mcp.json, and list output
@@ -1091,6 +1139,51 @@ mod tests {
             "disabled state must be visible: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn search_miss_points_to_configured_granola_before_browser() {
+        let mut config = crate::mcp::McpConfig::default();
+        config.servers.insert(
+            "granola".to_string(),
+            McpServerConfig {
+                command: String::new(),
+                args: vec![],
+                env: HashMap::new(),
+                shared: true,
+                transport: Some("http".to_string()),
+                url: Some("https://example.invalid/secret-url".to_string()),
+                headers: HashMap::from([("Authorization".to_string(), "secret-token".to_string())]),
+                oauth: None,
+                enabled: None,
+                disabled: None,
+                timeout_secs: None,
+            },
+        );
+        let manager = Arc::new(RwLock::new(McpManager::with_config(config)));
+        let search = McpSearchTool::new(Arc::clone(&manager));
+        let result = search
+            .execute(
+                json!({"query": "Granola transcript"}),
+                create_test_context(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("\"server\":\"granola\""),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("before falling back to a browser"));
+        assert!(!result.output.contains("secret-token"));
+        assert!(!result.output.contains("secret-url"));
+
+        let listed = McpManagementTool::new(manager)
+            .execute(json!({"action": "list"}), create_test_context())
+            .await
+            .unwrap();
+        assert!(listed.output.contains("granola (enabled; connect with"));
+        assert!(!listed.output.contains("secret-token"));
     }
 
     #[tokio::test]
