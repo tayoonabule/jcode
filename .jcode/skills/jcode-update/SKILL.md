@@ -17,7 +17,9 @@ Use this skill when the user asks to finish, ship, sync, install, or update the 
 - Never merge or copy commits from another agent's branch without explicit user authorization. If another worktree or agent is active, stop and report it.
 - Do not merge a feature branch into `main` if the working tree is dirty, tests fail, the branch has unresolved conflicts, or the user did not authorize integration for this run.
 - Treat `upstream` as the original jcode repository (`https://github.com/1jehuang/jcode.git`) and `origin` as the user's fork. Verify remotes before syncing.
-- Do not push unless the user explicitly asks. Local integration and local installation are separate from publishing.
+- Push the integrated `main` to `origin` (the user's fork) at the end of every update.
+  The owner gave standing approval for this on 2026-09-29. Never push to `upstream`
+  and never force-push.
 - Keep the fork history compact when requested: preserve the old tip in a backup
   ref, then create one local commit on top of `upstream/master` containing the
   surviving fork changes. Never force-push automatically.
