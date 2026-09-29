@@ -214,6 +214,9 @@ fn append_tool_capability_reminder(
         "The following capabilities are active in this session. Use the exact tool names in the tool definitions; this list is a compact reminder and updates with the current tool surface.".to_string(),
     ];
     append_capability_line(&mut lines, "MCP", &mcp);
+    if mcp.contains(&"mcp_search") {
+        lines.push("- An empty MCP search does not mean the service is unavailable: use `mcp` list to find configured but disconnected servers, then connect by server name before considering browser fallback.".to_string());
+    }
     append_capability_line(&mut lines, "Subagents and orchestration", &orchestration);
     if orchestration.contains(&"swarm") {
         lines.push(
@@ -223,11 +226,41 @@ fn append_tool_capability_reminder(
     if !other.is_empty() {
         lines.push(format!("- Other tools available: {}", other.join(", ")));
     }
+    let installed = installed_cli_names(std::env::var_os("PATH").as_deref());
+    if !installed.is_empty() {
+        lines.push(format!("- Installed CLIs on PATH: {}. Use `gws` for Google Workspace; `playwright` is available for local testing, not as a substitute for a connected service's native integration.", installed.join(", ")));
+    }
 
     if !split.dynamic_part.is_empty() {
         split.dynamic_part.push_str("\n\n");
     }
     split.dynamic_part.push_str(&lines.join("\n"));
+}
+
+fn installed_cli_names(path: Option<&std::ffi::OsStr>) -> Vec<&'static str> {
+    let Some(path) = path else { return Vec::new() };
+    ["gws", "playwright"]
+        .into_iter()
+        .filter(|name| {
+            std::env::split_paths(path).any(|dir| {
+                let candidate = dir.join(name);
+                std::fs::metadata(candidate).is_ok_and(|metadata| {
+                    if !metadata.is_file() {
+                        return false;
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        metadata.permissions().mode() & 0o111 != 0
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        true
+                    }
+                })
+            })
+        })
+        .collect()
 }
 
 fn append_capability_line(lines: &mut Vec<String>, label: &str, names: &[&str]) {
@@ -238,7 +271,7 @@ fn append_capability_line(lines: &mut Vec<String>, label: &str, names: &[&str]) 
 
 #[cfg(test)]
 mod capability_reminder_tests {
-    use super::append_tool_capability_reminder;
+    use super::{append_tool_capability_reminder, installed_cli_names};
     use crate::message::ToolDefinition;
 
     fn tool(name: &str) -> ToolDefinition {
@@ -285,5 +318,28 @@ mod capability_reminder_tests {
         append_tool_capability_reminder(&mut prompt, &[]);
 
         assert!(prompt.dynamic_part.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_reminder_detects_only_executable_installed_clis() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gws = dir.path().join("gws");
+        let playwright = dir.path().join("playwright");
+        std::fs::write(&gws, "#!/bin/sh\n").unwrap();
+        std::fs::write(&playwright, "not executable").unwrap();
+        std::fs::set_permissions(&gws, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&playwright, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            installed_cli_names(Some(dir.path().as_os_str())),
+            vec!["gws"]
+        );
+        std::fs::set_permissions(&playwright, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            installed_cli_names(Some(dir.path().as_os_str())),
+            vec!["gws", "playwright"]
+        );
+        assert!(installed_cli_names(None).is_empty());
     }
 }
