@@ -110,6 +110,15 @@ enum AuthProbeMode {
     Fast,
 }
 
+/// Explicit-only suppression for tools that launch the OS opener directly
+/// (e.g. the `open` tool): honors NO_BROWSER/JCODE_NO_BROWSER and the test
+/// harness, but NOT the TTY/browser environment probe. That probe exists to
+/// pick an OAuth login flow (loopback vs device code); a headless `serve`
+/// process has no TTY yet can still run macOS `open` on the user's desktop.
+pub fn opener_suppressed() -> bool {
+    env_truthy("NO_BROWSER") || env_truthy("JCODE_NO_BROWSER") || running_in_test_harness()
+}
+
 pub fn browser_suppressed(cli_no_browser: bool) -> bool {
     cli_no_browser
         || env_truthy("NO_BROWSER")
