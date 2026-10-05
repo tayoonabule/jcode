@@ -32,12 +32,13 @@ pub use jcode_compaction_core::{
     EMERGENCY_IMAGE_MAX_CHARS, EMERGENCY_TOOL_RESULT_MAX_CHARS, MANUAL_COMPACT_MIN_THRESHOLD,
     MIN_TURNS_TO_KEEP, PAYLOAD_IMAGE_CHAR_BUDGET, RECENT_TURNS_TO_KEEP,
     SEMANTIC_EMBED_CACHE_CAPACITY, SUMMARY_PROMPT, SYSTEM_OVERHEAD_TOKENS, Summary,
-    TOKEN_HISTORY_WINDOW, build_compaction_prompt, build_emergency_summary_text,
-    compacted_summary_text_block, content_char_count, effective_context_tokens_from_usage,
-    emergency_strip_large_images, emergency_truncate_large_payloads, estimate_compaction_tokens,
-    is_image_rejection_error, is_request_payload_too_large_error, mean_embedding,
-    message_char_count, safe_compaction_cutoff, semantic_cache_key, semantic_goal_text,
-    semantic_message_text, strip_large_images_in_contents, summary_payload_char_count,
+    TOKEN_HISTORY_WINDOW, build_compaction_prompt, build_compaction_prompt_with_context,
+    build_emergency_summary_text, compacted_summary_text_block, content_char_count,
+    effective_context_tokens_from_usage, emergency_strip_large_images,
+    emergency_truncate_large_payloads, estimate_compaction_tokens, is_image_rejection_error,
+    is_request_payload_too_large_error, mean_embedding, message_char_count, safe_compaction_cutoff,
+    semantic_cache_key, semantic_goal_text, semantic_message_text, strip_large_images_in_contents,
+    summary_payload_char_count,
 };
 
 const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 15_000;
@@ -125,6 +126,11 @@ impl ActiveCharEstimate {
     }
 }
 
+/// Builds the durable-state snapshot that must survive compaction.
+///
+/// Invoked only when a compaction task is about to spawn.
+pub type DurableStateContextFn = std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// Manages background compaction of conversation context.
 ///
 /// Does NOT own message data. The caller owns the messages and passes
@@ -138,6 +144,16 @@ pub struct CompactionManager {
 
     /// Active summary (if we've compacted before)
     active_summary: Option<Summary>,
+
+    /// Durable session state that must survive transcript compaction, such as
+    /// the current todo list and plan. Refreshed by the session owner before a
+    /// compaction trigger is evaluated.
+    ///
+    /// Held as a callback rather than a value because it is refreshed on every
+    /// turn but read only when a compaction task actually spawns; building it
+    /// eagerly meant reading and serializing several state files per turn and
+    /// discarding the result.
+    durable_state_context: Option<DurableStateContextFn>,
 
     /// Rolling char estimate for the active (non-compacted) message suffix.
     ///
@@ -215,6 +231,7 @@ impl CompactionManager {
         Self {
             compacted_count: 0,
             active_summary: None,
+            durable_state_context: None,
             active_chars: ActiveCharEstimate::default(),
             pending_task: None,
             pending_trigger: None,
@@ -265,6 +282,12 @@ impl CompactionManager {
         } else {
             budget
         }
+    }
+
+    /// Set how the next compaction task should build its durable state
+    /// snapshot. The callback runs only if a compaction actually starts.
+    pub fn set_durable_state_context(&mut self, context: Option<DurableStateContextFn>) {
+        self.durable_state_context = context;
     }
 
     /// Get current token budget
@@ -910,6 +933,12 @@ impl CompactionManager {
         let messages_to_summarize: Vec<Message> = active[..cutoff].to_vec();
         let msg_count = messages_to_summarize.len();
         let existing_summary = self.active_summary.clone();
+        // Built here, at the point of use, so turns that never compact pay
+        // nothing for it.
+        let durable_state_context = self
+            .durable_state_context
+            .as_ref()
+            .and_then(|build| build());
         let mode_label = self.mode_trigger_label().to_string();
         let estimated_tokens = self.effective_token_count_with(all_messages);
         crate::logging::info(&format!(
@@ -927,9 +956,13 @@ impl CompactionManager {
         // Spawn background task that notifies via Bus when done
         self.pending_task = Some(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result =
-                generate_compaction_artifact(provider, messages_to_summarize, existing_summary)
-                    .await;
+            let result = generate_compaction_artifact(
+                provider,
+                messages_to_summarize,
+                existing_summary,
+                durable_state_context,
+            )
+            .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             crate::logging::info(&format!(
                 "Compaction ({}) finished in {:.2}s ({} messages summarized)",
@@ -1135,15 +1168,25 @@ impl CompactionManager {
         let messages_to_summarize: Vec<Message> = active[..cutoff].to_vec();
         let msg_count = messages_to_summarize.len();
         let existing_summary = self.active_summary.clone();
+        // Built here, at the point of use, so turns that never compact pay
+        // nothing for it.
+        let durable_state_context = self
+            .durable_state_context
+            .as_ref()
+            .and_then(|build| build());
 
         self.pending_cutoff = cutoff;
         self.pending_trigger = Some("manual".to_string());
 
         self.pending_task = Some(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result =
-                generate_compaction_artifact(provider, messages_to_summarize, existing_summary)
-                    .await;
+            let result = generate_compaction_artifact(
+                provider,
+                messages_to_summarize,
+                existing_summary,
+                durable_state_context,
+            )
+            .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             crate::logging::info(&format!(
                 "Compaction finished in {:.2}s ({} messages summarized)",
@@ -1699,6 +1742,7 @@ async fn generate_compaction_artifact(
     provider: Arc<dyn Provider>,
     messages: Vec<Message>,
     mut existing_summary: Option<Summary>,
+    durable_state_context: Option<String>,
 ) -> Result<CompactionResult> {
     let start = Instant::now();
     if let Some(summary) = existing_summary.as_mut()
@@ -1754,7 +1798,12 @@ async fn generate_compaction_artifact(
     }
 
     let max_prompt_chars = provider.context_window().saturating_sub(4000) * CHARS_PER_TOKEN;
-    let prompt = build_compaction_prompt(&messages, existing_summary.as_ref(), max_prompt_chars);
+    let prompt = build_compaction_prompt_with_context(
+        &messages,
+        existing_summary.as_ref(),
+        max_prompt_chars,
+        durable_state_context.as_deref(),
+    );
 
     // Generate summary using simple completion
     let (summary, usage) = provider
@@ -1803,7 +1852,8 @@ pub async fn build_transfer_compaction_state(
         .as_ref()
         .map(|state| state.original_turn_count.max(state.covers_up_to_turn))
         .unwrap_or(0);
-    let result = generate_compaction_artifact(provider, messages.clone(), existing_summary).await?;
+    let result =
+        generate_compaction_artifact(provider, messages.clone(), existing_summary, None).await?;
     let total_turns = prior_turns + messages.len();
 
     Ok(Some(crate::session::StoredCompactionState {

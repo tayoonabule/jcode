@@ -2,8 +2,18 @@ use super::{Tool, ToolContext, ToolOutput};
 use crate::config::WebSearchEngine;
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::{
+    Engine as _,
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::time::Duration;
+
+/// A search provider must fail quickly enough for the configured fallback to
+/// be useful. Public HTML endpoints can accept a connection and then stall
+/// while presenting a bot challenge, so a connect timeout is not enough.
+const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Web search using DuckDuckGo or Bing (HTML scraping, with optional Bing API)
 pub struct WebSearchTool {
@@ -85,8 +95,9 @@ impl Tool for WebSearchTool {
         let num_results = params.num_results.unwrap_or(8).min(20);
 
         let config = crate::config::config();
+        let primary_engine = params.engine.unwrap_or(config.websearch.engine);
         let engines = local_engine_order(
-            params.engine.unwrap_or(config.websearch.engine),
+            primary_engine,
             &config.websearch.fallback_engines,
         );
 
@@ -95,7 +106,6 @@ impl Tool for WebSearchTool {
             .as_deref()
             .unwrap_or(&config.websearch.bing_market);
         let mut last_error = None;
-        let mut results = Vec::new();
         for (index, engine) in engines.into_iter().enumerate() {
             let allow_bing_api = index == 0;
             match self
@@ -114,47 +124,74 @@ impl Tool for WebSearchTool {
             {
                 Ok(found) => {
                     if !found.is_empty() {
-                        results = found;
-                        break;
+                        return Ok(ToolOutput::new(format_search_results(
+                            &params.query,
+                            &found,
+                            primary_engine,
+                            engine,
+                        )));
                     }
                 }
                 Err(err) => last_error = Some(err),
             }
         }
 
-        if results.is_empty()
-            && let Some(err) = last_error
-        {
+        if let Some(err) = last_error {
             return Err(err);
         }
 
-        if results.is_empty() {
-            return Ok(ToolOutput::new(format!(
-                "No results found for: {}\n\n\
+        Ok(ToolOutput::new(format!(
+            "No results found for: {}\n\n\
                  If results are consistently empty on this machine, the default \
                  DuckDuckGo/Bing engines may be blocked here by TLS fingerprinting \
                  or IP reputation (common on Linux/servers). Workarounds:\n\
                  - Point at a SearXNG instance: set `websearch.searxng_url` (or \
                  JCODE_SEARXNG_URL) and use engine \"searxng\".\n\
                  - Or provide a Bing Search API key via JCODE_BING_API_KEY.",
-                params.query
-            )));
-        }
-
-        let mut output = format!("Search results for: {}\n\n", params.query);
-
-        for (i, result) in results.iter().enumerate() {
-            output.push_str(&format!(
-                "{}. **{}**\n   {}\n   {}\n\n",
-                i + 1,
-                result.title,
-                result.url,
-                result.snippet
-            ));
-        }
-
-        Ok(ToolOutput::new(output))
+            params.query
+        )))
     }
+}
+
+fn format_search_results(
+    query: &str,
+    results: &[SearchResult],
+    primary_engine: WebSearchEngine,
+    used_engine: WebSearchEngine,
+) -> String {
+    let provenance = if used_engine == primary_engine {
+        format!("Engine: {} (primary)", used_engine.as_str())
+    } else {
+        format!(
+            "Engine: {} (fallback from {})",
+            used_engine.as_str(),
+            primary_engine.as_str()
+        )
+    };
+    let mut output = format!("Search results for: {query}\n{provenance}\n\n");
+    for (i, result) in results.iter().enumerate() {
+        output.push_str(&format!(
+            "{}. **{}**\n   {}\n   {}\n\n",
+            i + 1,
+            result.title,
+            result.url,
+            result.snippet
+        ));
+    }
+    output
+}
+
+fn search_engine_order(
+    primary: WebSearchEngine,
+    fallbacks: &[WebSearchEngine],
+) -> Vec<WebSearchEngine> {
+    let mut engines = vec![primary];
+    for &engine in fallbacks {
+        if !engines.contains(&engine) {
+            engines.push(engine);
+        }
+    }
+    engines
 }
 
 impl WebSearchTool {
@@ -202,6 +239,7 @@ impl WebSearchTool {
                 "application/x-www-form-urlencoded",
             )
             .form(&[("q", query), ("kl", "us-en")])
+            .timeout(ENGINE_REQUEST_TIMEOUT)
             .send()
             .await?;
 
@@ -252,8 +290,62 @@ impl WebSearchTool {
             }
         }
 
-        self.search_bing_html(query, num_results, options.market)
+        // Bing's HTML SERP is frequently reshaped and can require JavaScript
+        // or redirect decoding. Its RSS endpoint is intentionally small and
+        // has remained stable, so prefer it for the keyless path and retain
+        // HTML as a compatibility fallback for instances that disable RSS.
+        match self
+            .search_bing_rss(query, num_results, options.market)
             .await
+        {
+            Ok(results) if !results.is_empty() => Ok(results),
+            Ok(_) => {
+                self.search_bing_html(query, num_results, options.market)
+                    .await
+            }
+            Err(rss_err) => match self
+                .search_bing_html(query, num_results, options.market)
+                .await
+            {
+                Ok(results) => Ok(results),
+                Err(html_err) => Err(anyhow::anyhow!(
+                    "Bing search failed via RSS ({rss_err}) and HTML ({html_err})"
+                )),
+            },
+        }
+    }
+
+    async fn search_bing_rss(
+        &self,
+        query: &str,
+        num_results: usize,
+        market: &str,
+    ) -> Result<Vec<SearchResult>> {
+        let response = self
+            .client
+            .get("https://www.bing.com/search")
+            .query(&[("format", "rss"), ("q", query), ("mkt", market)])
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            )
+            .header(
+                reqwest::header::ACCEPT,
+                "application/rss+xml, application/xml",
+            )
+            .timeout(ENGINE_REQUEST_TIMEOUT)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Bing RSS search failed with status: {}",
+                response.status()
+            ));
+        }
+
+        let body = response.text().await?;
+        Ok(parse_bing_rss_results(&body, num_results))
     }
 
     async fn search_bing_api(
@@ -266,12 +358,16 @@ impl WebSearchTool {
         let response = self
             .client
             .get("https://api.bing.microsoft.com/v7.0/search")
+            // `responseFilter=Webpages` keeps the result budget on the one
+            // answer type this tool presents; Bing otherwise mixes in others.
             .query(&[
                 ("q", query),
                 ("count", &num_results.to_string()),
                 ("mkt", market),
+                ("responseFilter", "Webpages"),
             ])
             .header("Ocp-Apim-Subscription-Key", api_key)
+            .timeout(ENGINE_REQUEST_TIMEOUT)
             .send()
             .await?;
 
@@ -285,27 +381,28 @@ impl WebSearchTool {
         Ok(parse_bing_api_results(response.json().await?, num_results))
     }
 
+    fn bing_html_request(&self, query: &str, market: &str) -> reqwest::RequestBuilder {
+        let url = format!(
+            "https://www.bing.com/search?q={}&mkt={}",
+            urlencoding::encode(query),
+            urlencoding::encode(market)
+        );
+        self.client
+            .get(&url)
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            )
+            .timeout(ENGINE_REQUEST_TIMEOUT)
+    }
+
     async fn search_bing_html(
         &self,
         query: &str,
         num_results: usize,
         market: &str,
     ) -> Result<Vec<SearchResult>> {
-        let url = format!(
-            "https://www.bing.com/search?q={}&mkt={}",
-            urlencoding::encode(query),
-            urlencoding::encode(market)
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .header(
-                reqwest::header::USER_AGENT,
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-            )
-            .send()
-            .await?;
+        let response = self.bing_html_request(query, market).send().await?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
@@ -364,6 +461,7 @@ impl WebSearchTool {
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             )
             .header(reqwest::header::ACCEPT, "application/json")
+            .timeout(ENGINE_REQUEST_TIMEOUT)
             .send()
             .await?;
 
@@ -392,7 +490,7 @@ fn parse_searxng_results(response: SearxngResponse, num_results: usize) -> Vec<S
     response
         .results
         .into_iter()
-        .filter(|r| !r.url.trim().is_empty())
+        .filter(|r| is_http_url(&r.url))
         .take(num_results)
         .map(|r| SearchResult {
             title: if r.title.trim().is_empty() {
@@ -454,6 +552,13 @@ mod search_regex {
         bing_caption,
         r#"(?s)<div[^>]*class="[^"]*\bb_caption\b[^"]*"[^>]*>.*?<p[^>]*>(.*?)</p>"#
     );
+    static_regex!(rss_item, r#"(?s)<item\b[^>]*>(.*?)</item>"#);
+    static_regex!(rss_title, r#"(?s)<title\b[^>]*>(.*?)</title>"#);
+    static_regex!(rss_link, r#"(?s)<link\b[^>]*>(.*?)</link>"#);
+    static_regex!(
+        rss_description,
+        r#"(?s)<description\b[^>]*>(.*?)</description>"#
+    );
 }
 
 #[derive(Deserialize)]
@@ -498,6 +603,7 @@ fn parse_bing_api_results(response: BingApiResponse, max_results: usize) -> Vec<
             pages
                 .value
                 .into_iter()
+                .filter(|page| is_http_url(&page.url))
                 .take(max_results)
                 .map(|page| SearchResult {
                     title: page.name,
@@ -527,8 +633,8 @@ fn parse_bing_html_results(html: &str, max_results: usize) -> Vec<SearchResult> 
         let Some(link) = link_re.captures(&block[1]) else {
             continue;
         };
-        let url = html_decode(&link[1]);
-        if !url.starts_with("http") || url.contains("bing.com") {
+        let url = decode_bing_url(&link[1]);
+        if !is_external_http_url(&url, "bing.com") {
             continue;
         }
         let title = html_decode(&tag_re.replace_all(&link[2], ""));
@@ -544,6 +650,42 @@ fn parse_bing_html_results(html: &str, max_results: usize) -> Vec<SearchResult> 
     }
 
     results
+}
+
+fn parse_bing_rss_results(xml: &str, max_results: usize) -> Vec<SearchResult> {
+    let (Some(item_re), Some(title_re), Some(link_re), Some(description_re)) = (
+        search_regex::rss_item(),
+        search_regex::rss_title(),
+        search_regex::rss_link(),
+        search_regex::rss_description(),
+    ) else {
+        return Vec::new();
+    };
+
+    item_re
+        .captures_iter(xml)
+        .filter_map(|item| {
+            let title = title_re
+                .captures(&item[1])
+                .map(|capture| html_decode(&capture[1]))?;
+            let url = link_re
+                .captures(&item[1])
+                .map(|capture| html_decode(&capture[1]))?;
+            if !is_external_http_url(&url, "bing.com") {
+                return None;
+            }
+            let snippet = description_re
+                .captures(&item[1])
+                .map(|capture| html_decode(&capture[1]))
+                .unwrap_or_default();
+            Some(SearchResult {
+                title,
+                url,
+                snippet,
+            })
+        })
+        .take(max_results)
+        .collect()
 }
 
 fn parse_ddg_results(html: &str, max_results: usize) -> Vec<SearchResult> {
@@ -568,7 +710,7 @@ fn parse_ddg_results(html: &str, max_results: usize) -> Vec<SearchResult> {
         let url = decode_ddg_url(&link_cap[1]);
         let title = html_decode(&tag.replace_all(&link_cap[2], ""));
 
-        if !url.starts_with("http") || url.contains("duckduckgo.com") {
+        if !is_external_http_url(&url, "duckduckgo.com") {
             continue;
         }
 
@@ -616,6 +758,28 @@ fn detect_anti_bot_page(html: &str) -> Option<&'static str> {
     None
 }
 
+fn is_provider_host(url: &url::Url, domain: &str) -> bool {
+    url.host_str().is_some_and(|host| {
+        host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn is_external_http_url(value: &str, provider_domain: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && !is_provider_host(&url, provider_domain)
+    })
+}
+
+fn is_http_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
 fn decode_ddg_url(url: &str) -> String {
     // DDG wraps URLs like //duckduckgo.com/l/?uddg=ACTUAL_URL&...
     if let Some(uddg_start) = url.find("uddg=") {
@@ -631,6 +795,46 @@ fn decode_ddg_url(url: &str) -> String {
     } else {
         url.to_string()
     }
+}
+
+/// Bing's public HTML results increasingly link through `bing.com/ck/a` and put
+/// the destination in a URL-safe base64 `u=a1…` query value.  Treating every
+/// Bing-owned URL as an ad used to discard all organic results on current SERPs.
+fn decode_bing_url(url: &str) -> String {
+    let decoded = html_decode(url);
+    let redirect_url = if decoded.starts_with("//") {
+        format!("https:{decoded}")
+    } else {
+        decoded.clone()
+    };
+    let Ok(redirect) = url::Url::parse(&redirect_url) else {
+        return decoded;
+    };
+    if !matches!(redirect.scheme(), "http" | "https")
+        || !is_provider_host(&redirect, "bing.com")
+        || !redirect.path().starts_with("/ck/")
+    {
+        return decoded;
+    }
+
+    let Some(encoded) = redirect
+        .query_pairs()
+        .find_map(|(key, value)| (key == "u").then_some(value))
+    else {
+        return decoded;
+    };
+    let encoded = encoded.strip_prefix("a1").unwrap_or(&encoded);
+
+    for engine in [&URL_SAFE_NO_PAD, &URL_SAFE] {
+        if let Ok(bytes) = engine.decode(encoded)
+            && let Ok(destination) = String::from_utf8(bytes)
+            && is_external_http_url(&destination, "bing.com")
+        {
+            return destination;
+        }
+    }
+
+    decoded
 }
 
 fn html_decode(s: &str) -> String {
@@ -690,6 +894,200 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bing_html_request_preserves_all_query_terms() {
+        let tool = WebSearchTool {
+            client: reqwest::Client::new(),
+        };
+        for query in [
+            "rust async await",
+            "rust async/await & tokio + 中文 #examples",
+        ] {
+            let request = tool.bing_html_request(query, "en-US").build().unwrap();
+            assert_eq!(request.url().host_str(), Some("www.bing.com"));
+            assert_eq!(request.url().path(), "/search");
+            assert_eq!(
+                request.url().query_pairs().collect::<Vec<_>>(),
+                vec![("q".into(), query.into()), ("mkt".into(), "en-US".into())]
+            );
+            assert_eq!(request.timeout(), Some(&ENGINE_REQUEST_TIMEOUT));
+        }
+    }
+
+    #[test]
+    fn parses_bing_rss_results_and_ignores_channel_metadata() {
+        let xml = r#"<?xml version="1.0"?>
+            <rss><channel>
+              <title>Bing: rust async await</title>
+              <link>https://www.bing.com/search?q=rust</link>
+              <item>
+                <title>Rust &amp; Tokio</title>
+                <link>https://tokio.rs/</link>
+                <description>Async Rust runtime &amp; tools.</description>
+              </item>
+              <item>
+                <title>Internal</title>
+                <link>https://www.bing.com/search</link>
+                <description>Not a result.</description>
+              </item>
+            </channel></rss>"#;
+
+        let results = parse_bing_rss_results(xml, 8);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Rust & Tokio");
+        assert_eq!(results[0].url, "https://tokio.rs/");
+        assert_eq!(results[0].snippet, "Async Rust runtime & tools.");
+    }
+
+    #[test]
+    fn bing_rss_results_respect_limit() {
+        let xml = (1..=3)
+            .map(|i| {
+                format!(
+                    "<item><title>Result {i}</title><link>https://example{i}.com/</link><description>Snippet</description></item>"
+                )
+            })
+            .collect::<String>();
+        assert_eq!(parse_bing_rss_results(&xml, 2).len(), 2);
+    }
+
+    #[test]
+    fn search_output_attributes_the_successful_engine_without_claiming_relevance() {
+        use WebSearchEngine::{Bing, Duckduckgo, Searxng};
+        let results = vec![SearchResult {
+            title: "Rust on Steam".to_string(),
+            url: "https://store.steampowered.com/app/252490/Rust/".to_string(),
+            snippet: "A survival game.".to_string(),
+        }];
+        for (primary, used, provenance) in [
+            (Bing, Bing, "Engine: bing (primary)"),
+            (Duckduckgo, Bing, "Engine: bing (fallback from duckduckgo)"),
+            (Bing, Searxng, "Engine: searxng (fallback from bing)"),
+        ] {
+            assert_eq!(
+                format_search_results("rust async await", &results, primary, used),
+                format!(
+                    "Search results for: rust async await\n{provenance}\n\n\
+                     1. **Rust on Steam**\n   https://store.steampowered.com/app/252490/Rust/\n   A survival game.\n\n"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_order_does_not_retry_non_adjacent_engines() {
+        use WebSearchEngine::{Bing, Duckduckgo, Searxng};
+        assert_eq!(
+            search_engine_order(Bing, &[Duckduckgo, Bing, Searxng, Duckduckgo]),
+            vec![Bing, Duckduckgo, Searxng]
+        );
+    }
+
+    #[test]
+    fn engine_order_honors_the_configured_set_exactly() {
+        use WebSearchEngine::{Bing, Duckduckgo, Searxng};
+        // A self-hosted SearXNG user who removed Bing must not have Bing
+        // silently appended: that would leak the query to an engine they
+        // deliberately excluded and mask their own engine's errors.
+        assert_eq!(
+            search_engine_order(Searxng, &[Duckduckgo]),
+            vec![Searxng, Duckduckgo]
+        );
+        assert_eq!(search_engine_order(Searxng, &[]), vec![Searxng]);
+        assert!(!search_engine_order(Searxng, &[Duckduckgo]).contains(&Bing));
+    }
+
+    #[test]
+    fn html_results_filter_provider_hosts_not_url_substrings() {
+        for (domain, parser) in [
+            (
+                "bing.com",
+                parse_bing_html_results as fn(&str, usize) -> Vec<SearchResult>,
+            ),
+            (
+                "duckduckgo.com",
+                parse_ddg_results as fn(&str, usize) -> Vec<SearchResult>,
+            ),
+        ] {
+            let urls = [
+                format!("https://example.org/review/{domain}"),
+                format!("https://example.org/?source={domain}"),
+                format!("https://not{domain}/"),
+                format!("https://{domain}.example.org/"),
+            ];
+            for url in urls {
+                let html = format!(
+                    r#"<li class="b_algo"><h2><a class="result__a" href="{url}">Result</a></h2></li>"#
+                );
+                let results = parser(&html, 1);
+                assert_eq!(results.len(), 1, "valid destination: {url}");
+                assert_eq!(results[0].url, url);
+            }
+            for url in [
+                format!("https://{domain}/ad"),
+                format!("https://WWW.{}/ad", domain.to_ascii_uppercase()),
+                "http-not-a-url".to_string(),
+                "javascript:alert(1)".to_string(),
+            ] {
+                let html = format!(
+                    r#"<li class="b_algo"><h2><a class="result__a" href="{url}">Result</a></h2></li>"#
+                );
+                assert!(parser(&html, 1).is_empty(), "invalid destination: {url}");
+            }
+        }
+    }
+
+    #[test]
+    fn bing_redirect_decoding_requires_a_bing_host() {
+        let encoded = URL_SAFE_NO_PAD.encode("https://destination.example/");
+        let url = format!("https://example.org/bing.com/ck/a?u=a1{encoded}");
+        assert_eq!(decode_bing_url(&url), url);
+    }
+
+    #[test]
+    fn bing_redirect_variants_decode_to_external_http_urls() {
+        let destination = "https://example.org/?q=bing.com&lang=en";
+        for engine in [&URL_SAFE, &URL_SAFE_NO_PAD] {
+            let encoded = engine.encode(destination);
+            let encoded = urlencoding::encode(&encoded);
+            for origin in [
+                "https://www.bing.com",
+                "https://WWW.BING.COM",
+                "//www.bing.com",
+            ] {
+                let redirect = format!("{origin}/ck/a?ptn=3&amp;u=a1{encoded}#fragment");
+                assert_eq!(decode_bing_url(&redirect), destination);
+                let html =
+                    format!(r#"<li class="b_algo"><h2><a href="{redirect}">Result</a></h2></li>"#);
+                assert_eq!(parse_bing_html_results(&html, 1)[0].url, destination);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_bing_redirects_are_not_results() {
+        let mut redirects = vec![
+            "https://www.bing.com/ck/a?u=%%%".to_string(),
+            "https://www.bing.com/ck/a?missing=1".to_string(),
+        ];
+        for destination in [
+            "http-not-a-url",
+            "javascript:alert(1)",
+            "https://www.bing.com/ad",
+        ] {
+            redirects.push(format!(
+                "https://www.bing.com/ck/a?u=a1{}",
+                URL_SAFE_NO_PAD.encode(destination)
+            ));
+        }
+        for redirect in redirects {
+            assert_eq!(decode_bing_url(&redirect), redirect);
+            let html =
+                format!(r#"<li class="b_algo"><h2><a href="{redirect}">Result</a></h2></li>"#);
+            assert!(parse_bing_html_results(&html, 1).is_empty());
+        }
+    }
+
+    #[test]
     fn parses_bing_html_results() {
         let html = r#"
             <li class="b_algo">
@@ -712,10 +1110,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_current_bing_redirect_results() {
+        // Current Bing HTML wraps organic links in `bing.com/ck/a` and carries
+        // the real destination as `u=a1` plus URL-safe base64 without padding.
+        let html = r#"
+            <li class="b_algo" data-id iid=SERP.100>
+              <h2 class=""><a target="_blank" href="https://www.bing.com/ck/a?ptn=3&amp;u=a1aHR0cHM6Ly9wbGF5d3JpZ2h0LmRldi9kb2NzL3Rlc3Qtc25hcHNob3Rz&amp;ntb=1">Visual comparisons | Playwright</a></h2>
+              <div class="b_caption"><p>Compare screenshots in Playwright.</p></div>
+            </li>
+        "#;
+
+        let results = parse_bing_html_results(html, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://playwright.dev/docs/test-snapshots");
+        assert_eq!(results[0].title, "Visual comparisons | Playwright");
+    }
+
+    #[test]
     fn parses_bing_api_results() {
         let response: BingApiResponse = serde_json::from_value(json!({
             "webPages": {
                 "value": [
+                    {"name": "Internal", "url": "file:///private/data", "snippet": "not a result"},
                     {"name": "One", "url": "https://one.test", "snippet": "first"},
                     {"name": "Two", "url": "https://two.test", "snippet": "second"}
                 ]
@@ -839,12 +1255,13 @@ mod tests {
                 },
                 // Entry with empty url is dropped; missing content tolerated.
                 { "url": "", "title": "junk" },
+                { "url": "javascript:alert(1)", "title": "junk" },
                 { "url": "https://crates.io", "title": "" }
             ]
         });
         let parsed: SearxngResponse = serde_json::from_value(body).unwrap();
         let results = parse_searxng_results(parsed, 10);
-        assert_eq!(results.len(), 3, "empty-url entry should be dropped");
+        assert_eq!(results.len(), 3, "non-HTTP destinations should be dropped");
         assert_eq!(results[0].url, "https://www.rust-lang.org/");
         assert_eq!(results[0].title, "Rust Programming Language");
         assert_eq!(results[0].snippet, "A language empowering everyone.");
