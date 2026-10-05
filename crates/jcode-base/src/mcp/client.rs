@@ -1,15 +1,36 @@
 //! MCP Client - handles communication with a single MCP server
 
+use super::pending::{self, PendingMap};
 use super::protocol::*;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::mpsc;
+
+/// How a handle talks to its server.
+///
+/// Kept as an enum rather than a boxed trait object so the stdio path stays
+/// allocation-free per message and an HTTP server costs one `Arc`.
+#[derive(Clone)]
+enum Transport {
+    Stdio {
+        pending: PendingMap,
+        writer_tx: mpsc::Sender<String>,
+        /// Set by the reader on stdout EOF: no reply can arrive, so requests fail fast.
+        closed: Arc<AtomicBool>,
+    },
+    Http(Arc<super::http::HttpTransport>),
+    Sse(Arc<super::sse::SseTransport>),
+    /// A shared stdio server owned by the machine-wide broker process.
+    #[cfg(unix)]
+    Broker(Arc<super::broker::BrokerTransport>),
+}
 
 /// Shared communication handle for an MCP server.
 /// Multiple sessions can hold clones of this and send concurrent requests.
@@ -18,10 +39,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 pub struct McpHandle {
     pub(crate) name: String,
     request_id: Arc<AtomicU64>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
-    /// Set by the reader on stdout EOF: no reply can arrive, so requests fail fast.
-    closed: Arc<AtomicBool>,
-    writer_tx: mpsc::Sender<String>,
+    transport: Transport,
     server_info: Arc<std::sync::RwLock<Option<ServerInfo>>>,
     capabilities: Arc<std::sync::RwLock<ServerCapabilities>>,
     tools: Arc<std::sync::RwLock<Vec<McpToolDef>>>,
@@ -41,43 +59,129 @@ pub fn request_timeout_for(config: &McpServerConfig) -> std::time::Duration {
         .unwrap_or(DEFAULT_MCP_REQUEST_TIMEOUT)
 }
 
+/// Whether a successful tool result is really an authentication failure.
+///
+/// Some first-party gateways (Google's, notably) answer HTTP 200 with an
+/// `isError` result whose text says the credential is missing or expired,
+/// instead of returning a 401 the transport could act on.
+fn is_auth_error_result(result: &ToolCallResult) -> bool {
+    result.is_error
+        && result.content.iter().any(|content| {
+            matches!(content, ContentBlock::Text { text } if super::http::is_auth_error_text(text))
+        })
+}
+
 impl McpHandle {
     /// Send a request and wait for response
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcResponse> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
         let request = JsonRpcRequest::new(id, method, params);
+        let body = serde_json::to_string(&request)?;
 
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().await;
-            if self.closed.load(Ordering::SeqCst) {
-                anyhow::bail!("MCP server '{}' exited (stdout closed)", self.name);
+        // Every transport gets the same reply deadline. Remote transports used
+        // to rely on their own hardcoded constant (SSE) or none at all (HTTP),
+        // which meant a hung remote server could block the calling tool forever
+        // and silently ignored the server's configured `timeout_secs`.
+        let exchange = async {
+            match &self.transport {
+                Transport::Http(http) => http
+                    .send(&body, true)
+                    .await?
+                    .context("MCP server returned no JSON-RPC response"),
+                Transport::Sse(sse) => sse
+                    .send(&body, id, true)
+                    .await?
+                    .context("MCP server returned no JSON-RPC response"),
+                #[cfg(unix)]
+                Transport::Broker(broker) => broker
+                    .send(&body, id, true)
+                    .await?
+                    .context("MCP server returned no JSON-RPC response"),
+                Transport::Stdio {
+                    pending,
+                    writer_tx,
+                    closed,
+                } => {
+                    // Register before sending so a reply that arrives while we
+                    // are still awaiting the writer still finds its waiter, and
+                    // so the deadline below cannot leave the slot behind: the
+                    // registration is released when this future is dropped.
+                    let waiter = pending::PendingRequest::register(pending, id).await;
+                    // Checked after registering: the reader sets `closed` before
+                    // failing every waiter, so a request registered after that
+                    // sweep still sees the flag instead of waiting out its deadline.
+                    if closed.load(Ordering::SeqCst) {
+                        waiter.cancel().await;
+                        anyhow::bail!("MCP server '{}' exited (stdout closed)", self.name);
+                    }
+                    if let Err(error) = writer_tx.send(body + "\n").await {
+                        waiter.cancel().await;
+                        return Err(error).context("Failed to send request");
+                    }
+                    waiter.recv().await.with_context(|| {
+                        format!("MCP server '{}' exited (stdout closed)", self.name)
+                    })
+                }
             }
-            pending.insert(id, tx);
-        }
+        };
 
-        let msg = serde_json::to_string(&request)? + "\n";
-        self.writer_tx
-            .send(msg)
-            .await
-            .context("Failed to send request")?;
-
-        let response = tokio::time::timeout(self.request_timeout, rx)
-            .await
-            .with_context(|| {
-                format!(
-                    "Request timeout after {}s (raise `timeout_secs` for MCP server '{}' if its tools legitimately run longer)",
-                    self.request_timeout.as_secs(),
-                    self.name
-                )
-            })?
-            .with_context(|| format!("MCP server '{}' exited (stdout closed)", self.name))?;
+        let response = self.await_reply(exchange).await?;
 
         if let Some(err) = &response.error {
             anyhow::bail!("MCP error {}: {}", err.code, err.message);
         }
 
         Ok(response)
+    }
+
+    /// Await one exchange under this server's reply deadline.
+    ///
+    /// The deadline is suspended while a remote transport is waiting on the
+    /// user to finish a browser sign-in. That wait is triggered from inside a
+    /// request but is bounded by a person, not the server, so counting it would
+    /// make the first call to an unauthorized remote server fail after 30s no
+    /// matter how promptly the server itself responds.
+    async fn await_reply(
+        &self,
+        exchange: impl Future<Output = Result<JsonRpcResponse>>,
+    ) -> Result<JsonRpcResponse> {
+        let mut exchange = std::pin::pin!(exchange);
+        loop {
+            match tokio::time::timeout(self.request_timeout, &mut exchange).await {
+                Ok(response) => return response,
+                Err(_) if super::http::interactive_auth_in_progress(&self.name) => continue,
+                Err(elapsed) => {
+                    return Err(elapsed).with_context(|| {
+                        format!(
+                            "Request timeout after {}s (raise `timeout_secs` for MCP server '{}' if its tools legitimately run longer)",
+                            self.request_timeout.as_secs(),
+                            self.name
+                        )
+                    });
+                }
+            }
+        }
+    }
+
+    /// Send a notification (no response expected).
+    async fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
+        let body = serde_json::to_string(&JsonRpcNotification::new(method, params))?;
+        match &self.transport {
+            Transport::Http(http) => {
+                http.send(&body, false).await?;
+            }
+            Transport::Sse(sse) => {
+                sse.notify(&body).await?;
+            }
+            #[cfg(unix)]
+            Transport::Broker(broker) => {
+                broker.notify(&body).await?;
+            }
+            Transport::Stdio { writer_tx, .. } => {
+                writer_tx.send(body + "\n").await?;
+            }
+        }
+        Ok(())
     }
 
     /// Call a tool
@@ -92,14 +196,35 @@ impl McpHandle {
             arguments,
         };
 
-        let response = self
-            .request("tools/call", Some(serde_json::to_value(params)?))
-            .await?;
+        // Some first-party gateways report an expired credential as a normal
+        // `isError` tool result rather than a 401, so one retry is allowed
+        // after refreshing the remote transport's credentials.
+        let mut may_reauthenticate = true;
+        loop {
+            let response = self
+                .request("tools/call", Some(serde_json::to_value(&params)?))
+                .await?;
 
-        let result = response.result.context("No result from tool call")?;
-        let tool_result: ToolCallResult = serde_json::from_value(result)?;
-
-        Ok(tool_result)
+            let result = response.result.context("No result from tool call")?;
+            let tool_result: ToolCallResult = serde_json::from_value(result)?;
+            if may_reauthenticate && is_auth_error_result(&tool_result) {
+                may_reauthenticate = false;
+                match &self.transport {
+                    Transport::Http(http) => {
+                        http.reauthenticate().await?;
+                        continue;
+                    }
+                    Transport::Sse(sse) => {
+                        sse.reauthenticate().await?;
+                        continue;
+                    }
+                    Transport::Stdio { .. } => {}
+                    #[cfg(unix)]
+                    Transport::Broker(_) => {}
+                }
+            }
+            return Ok(tool_result);
+        }
     }
 
     /// Get the server name
@@ -144,13 +269,88 @@ impl McpHandle {
 /// clones can be distributed to different sessions.
 pub struct McpClient {
     handle: McpHandle,
-    child: Child,
+    /// `None` for remote (HTTP) servers, which have no child process.
+    child: Option<Child>,
 }
 
 impl McpClient {
     /// Connect to an MCP server, inheriting the current process working directory
     pub async fn connect(name: String, config: &McpServerConfig) -> Result<Self> {
         Self::connect_in_dir(name, config, None).await
+    }
+
+    /// Connect a server that every jcode daemon on this machine may share.
+    ///
+    /// Stdio servers are routed through the machine-wide broker so all
+    /// daemons reuse one child process. If the broker cannot be reached or
+    /// started, the server is spawned directly as before, so a broker problem
+    /// can cost memory but never MCP availability.
+    pub async fn connect_shared(name: String, config: &McpServerConfig) -> Result<Self> {
+        #[cfg(unix)]
+        if config.is_stdio() && super::broker::broker_available() {
+            match super::broker::socket_path() {
+                Ok(socket) => {
+                    match Self::connect_via_broker(name.clone(), config, socket, true).await {
+                        Ok(client) => return Ok(client),
+                        Err(super::broker::BrokerConnectError::Upstream(error)) => {
+                            return Err(error)
+                                .with_context(|| format!("MCP server '{name}' failed to start"));
+                        }
+                        Err(error) => crate::logging::warn(&format!(
+                            "MCP: {error}; spawning '{name}' directly"
+                        )),
+                    }
+                }
+                Err(error) => crate::logging::warn(&format!(
+                    "MCP: no broker socket path ({error:#}); spawning '{name}' directly"
+                )),
+            }
+        }
+        Self::connect_in_dir(name, config, None).await
+    }
+
+    /// Attach to `name` through the broker listening at `socket`.
+    #[cfg(unix)]
+    pub async fn connect_via_broker(
+        name: String,
+        config: &McpServerConfig,
+        socket: std::path::PathBuf,
+        autostart: bool,
+    ) -> std::result::Result<Self, super::broker::BrokerConnectError> {
+        use super::broker::{BrokerConnectError, BrokerTransport};
+        let transport = BrokerTransport::connect(name.clone(), config, socket, autostart).await?;
+        let handle = McpHandle {
+            name: name.clone(),
+            request_id: Arc::new(AtomicU64::new(1)),
+            transport: Transport::Broker(Arc::new(transport)),
+            server_info: Arc::new(std::sync::RwLock::new(None)),
+            capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
+            tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+            request_timeout: request_timeout_for(config),
+        };
+        let mut client = Self {
+            handle,
+            child: None,
+        };
+        // The broker is up and the upstream answered its own handshake, so a
+        // failure from here on is the server's, not the broker's.
+        client
+            .initialize()
+            .await
+            .with_context(|| format!("MCP server '{name}' failed to initialize"))
+            .map_err(BrokerConnectError::Upstream)?;
+        client
+            .handle
+            .refresh_tools()
+            .await
+            .with_context(|| format!("MCP server '{name}' failed to list tools"))
+            .map_err(BrokerConnectError::Upstream)?;
+        crate::logging::info(&format!(
+            "MCP: Connected to '{}' via broker with {} tools",
+            name,
+            client.handle.tools().len()
+        ));
+        Ok(client)
     }
 
     /// Connect to an MCP server, optionally running it in `working_dir`.
@@ -162,6 +362,16 @@ impl McpClient {
         config: &McpServerConfig,
         working_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
+        if !config.is_stdio() {
+            if config
+                .transport
+                .as_deref()
+                .is_some_and(|transport| transport.eq_ignore_ascii_case("sse"))
+            {
+                return Self::connect_sse(name, config).await;
+            }
+            return Self::connect_http(name, config).await;
+        }
         let working_dir = working_dir.filter(|dir| dir.is_dir());
         crate::logging::info(&format!(
             "MCP: Connecting to '{}' ({} {:?}) cwd={:?}",
@@ -217,8 +427,7 @@ impl McpClient {
         });
 
         // Setup channels
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending = pending::new_pending();
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(32);
 
         // Spawn writer task
@@ -251,12 +460,7 @@ impl McpClient {
                     }
                     Ok(_) => {
                         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
-                            if let Some(id) = response.id {
-                                let mut pending = pending_clone.lock().await;
-                                if let Some(tx) = pending.remove(&id) {
-                                    let _ = tx.send(response);
-                                }
-                            }
+                            pending::resolve(&pending_clone, response).await;
                         } else {
                             let trimmed = line.trim();
                             if !trimmed.is_empty() {
@@ -273,25 +477,31 @@ impl McpClient {
                     }
                 }
             }
-            // Server can never reply now: drop in-flight senders, fail later requests fast.
-            let mut pending = pending_clone.lock().await;
+            // Nothing will answer the outstanding requests now that the child's
+            // stdout is gone, so wake their callers instead of making each one
+            // sit out its full reply deadline.
             closed_clone.store(true, Ordering::SeqCst);
-            pending.clear();
+            pending::fail_all(&pending_clone).await;
         });
 
         let handle = McpHandle {
             name: name.clone(),
             request_id: Arc::new(AtomicU64::new(1)),
-            pending,
-            closed,
-            writer_tx,
+            transport: Transport::Stdio {
+                pending,
+                writer_tx,
+                closed,
+            },
             server_info: Arc::new(std::sync::RwLock::new(None)),
             capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
             tools: Arc::new(std::sync::RwLock::new(Vec::new())),
             request_timeout: request_timeout_for(config),
         };
 
-        let mut client = Self { handle, child };
+        let mut client = Self {
+            handle,
+            child: Some(child),
+        };
 
         client
             .initialize()
@@ -310,6 +520,69 @@ impl McpClient {
             client.handle.tools().len()
         ));
 
+        Ok(client)
+    }
+
+    /// Connect to a remote MCP server over Streamable HTTP.
+    async fn connect_http(name: String, config: &McpServerConfig) -> Result<Self> {
+        let url = config.url.as_deref().unwrap_or_default();
+        crate::logging::info(&format!("MCP: Connecting to '{name}' over HTTP ({url})"));
+
+        let transport = super::http::HttpTransport::new(name.clone(), config)?;
+        Self::start_remote(name, config, "HTTP", Transport::Http(Arc::new(transport))).await
+    }
+
+    /// Connect to a legacy MCP server using a long-lived SSE GET stream and
+    /// the POST endpoint announced by its initial `endpoint` event.
+    async fn connect_sse(name: String, config: &McpServerConfig) -> Result<Self> {
+        let url = config.url.as_deref().unwrap_or_default();
+        crate::logging::info(&format!("MCP: Connecting to '{name}' over SSE ({url})"));
+
+        let transport = super::sse::SseTransport::new(name.clone(), config)?;
+        transport.connect().await?;
+        Self::start_remote(name, config, "SSE", Transport::Sse(Arc::new(transport))).await
+    }
+
+    /// Bring up a remote server: handshake, then load its tools.
+    ///
+    /// Remote transports differ only in how they carry bytes, so both share
+    /// this to avoid the two paths drifting apart in what they initialize.
+    async fn start_remote(
+        name: String,
+        config: &McpServerConfig,
+        label: &str,
+        transport: Transport,
+    ) -> Result<Self> {
+        let handle = McpHandle {
+            name: name.clone(),
+            request_id: Arc::new(AtomicU64::new(1)),
+            transport,
+            server_info: Arc::new(std::sync::RwLock::new(None)),
+            capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
+            tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+            request_timeout: request_timeout_for(config),
+        };
+
+        let mut client = Self {
+            handle,
+            child: None,
+        };
+        client
+            .initialize()
+            .await
+            .with_context(|| format!("MCP server '{name}' failed to initialize"))?;
+        client
+            .handle
+            .refresh_tools()
+            .await
+            .with_context(|| format!("MCP server '{name}' failed to list tools"))?;
+
+        crate::logging::info(&format!(
+            "MCP: Connected to '{}' over {} with {} tools",
+            name,
+            label,
+            client.handle.tools().len()
+        ));
         Ok(client)
     }
 
@@ -349,16 +622,21 @@ impl McpClient {
         }
 
         // Send initialized notification
-        let notif = JsonRpcNotification::new("notifications/initialized", None);
-        let msg = serde_json::to_string(&notif)? + "\n";
-        self.handle.writer_tx.send(msg).await?;
+        self.handle
+            .notify("notifications/initialized", None)
+            .await?;
 
         Ok(())
     }
 
     /// Check if server is still running
     pub fn is_running(&mut self) -> bool {
-        match self.child.try_wait() {
+        let Some(child) = self.child.as_mut() else {
+            // Remote servers are stateless from our side; liveness is checked
+            // per request instead of by process status.
+            return true;
+        };
+        match child.try_wait() {
             Ok(None) => true,
             Ok(Some(_)) => false,
             Err(_) => false,
@@ -367,15 +645,11 @@ impl McpClient {
 
     /// Shutdown the server
     pub async fn shutdown(&mut self) {
-        let _ = self
-            .handle
-            .writer_tx
-            .send("{\"jsonrpc\":\"2.0\",\"method\":\"shutdown\"}\n".to_string())
-            .await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let _ = self.child.kill().await;
+        let _ = self.handle.notify("shutdown", None).await;
+        if let Some(child) = self.child.as_mut() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = child.kill().await;
+        }
     }
 
     // === Legacy compatibility methods that delegate to handle ===
@@ -420,7 +694,7 @@ fn is_sensitive_inherited_env_key(key: &str) -> bool {
         )
 }
 
-fn mcp_child_env(
+pub(super) fn mcp_child_env(
     mut inherited: HashMap<String, String>,
     explicit: &HashMap<String, String>,
 ) -> HashMap<String, String> {
@@ -431,12 +705,15 @@ fn mcp_child_env(
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
+    use super::super::http::is_auth_error_text;
     use super::{McpClient, is_sensitive_inherited_env_key, mcp_child_env};
     use crate::mcp::protocol::McpServerConfig;
     use std::collections::HashMap;
@@ -477,6 +754,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recognizes_google_style_application_auth_errors_only() {
+        assert!(is_auth_error_text(
+            "Request is missing required authentication credential. Expected OAuth 2 access token"
+        ));
+        assert!(is_auth_error_text(
+            "Expected OAuth 2 access token or login cookie"
+        ));
+        assert!(is_auth_error_text(
+            "Method doesn't allow unregistered callers without established identity"
+        ));
+        assert!(!is_auth_error_text("The requested message was not found"));
+    }
+
     /// A minimal fake stdio MCP server (shell script) that reports its own
     /// process cwd as the serverInfo name.
     fn fake_server_config() -> McpServerConfig {
@@ -500,6 +791,7 @@ done
             transport: None,
             url: None,
             headers: std::collections::HashMap::new(),
+            oauth: None,
             enabled: None,
             disabled: None,
             timeout_secs: None,
