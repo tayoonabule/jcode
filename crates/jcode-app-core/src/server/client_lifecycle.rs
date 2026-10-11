@@ -206,6 +206,23 @@ struct SwarmStatusRefs<'a> {
     event_tx: &'a broadcast::Sender<SwarmEvent>,
 }
 
+/// Tell the client that a soft interrupt it queued was taken by an idle session and is
+/// being run as a normal turn. Without this the client's queued bubble never gets a
+/// delivery event and sits pending until Escape, which then resends it (duplicate).
+fn announce_idle_soft_interrupt_started(
+    id: u64,
+    content: &str,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let _ = client_event_tx.send(ServerEvent::Ack { id });
+    let _ = client_event_tx.send(ServerEvent::SoftInterruptInjected {
+        content: content.to_string(),
+        display_role: None,
+        point: "idle".to_string(),
+        tools_skipped: None,
+    });
+}
+
 fn should_start_idle_soft_interrupt(
     client_is_processing: bool,
     active_turn_registered: bool,
@@ -1365,6 +1382,9 @@ pub(super) async fn handle_client(
                     start
                 };
                 if start_idle_turn {
+                    if !server_reload_starting() {
+                        announce_idle_soft_interrupt_started(id, &content, &client_event_tx);
+                    }
                     start_processing_message(
                         ProcessingMessage {
                             id,

@@ -2146,3 +2146,23 @@ async fn system_prompt_socket_creation_attach_resume_fork_and_no_leaking() {
         .unwrap()
         .unwrap();
 }
+
+#[test]
+fn idle_soft_interrupt_is_acked_and_reported_injected_so_client_bubble_clears() {
+    // A soft interrupt that lands on an idle session is started as a normal turn.
+    // The client tracked it as a pending queued bubble, so it must be told the
+    // message was accepted AND delivered, or the bubble waits until Escape and the
+    // recovered copy is then sent a second time.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    announce_idle_soft_interrupt_started(42, "hello while idle", &tx);
+    let first = rx.try_recv().expect("ack event");
+    assert!(matches!(first, ServerEvent::Ack { id: 42 }), "{first:?}");
+    match rx.try_recv().expect("injected event") {
+        ServerEvent::SoftInterruptInjected { content, point, .. } => {
+            assert_eq!(content, "hello while idle");
+            assert_eq!(point, "idle");
+        }
+        other => panic!("expected SoftInterruptInjected, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err());
+}
