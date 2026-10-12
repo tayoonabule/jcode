@@ -876,6 +876,7 @@ done
                 enabled: None,
                 disabled: None,
                 timeout_secs: Some(10),
+                oauth: None,
             },
         );
         let config = config

@@ -508,8 +508,19 @@ pub fn release_retained_heap(reason: &str) {
         ));
     }
 
+    #[cfg(all(target_os = "macos", not(feature = "jemalloc")))]
+    {
+        // macOS system malloc keeps freed pages resident until pressure relief
+        // is requested; this is the equivalent of glibc malloc_trim(0).
+        let freed = macos_malloc_pressure_relief();
+        logging::debug(&format!(
+            "malloc_zone_pressure_relief ({reason}): released {freed} bytes"
+        ));
+    }
+
     #[cfg(all(
         not(all(target_os = "linux", target_env = "gnu")),
+        not(target_os = "macos"),
         not(feature = "jemalloc")
     ))]
     {
@@ -520,6 +531,17 @@ pub fn release_retained_heap(reason: &str) {
     // unrecoverable floor (fragmentation residual); measure future growth
     // from it so retention-triggered callers stay quiet at steady state.
     record_post_trim_retention_baseline();
+}
+
+/// Ask the macOS system allocator to return all freed-but-resident pages to
+/// the OS (`malloc_zone_pressure_relief(NULL, 0)` covers every zone).
+/// Returns the number of bytes released.
+#[cfg(all(target_os = "macos", not(feature = "jemalloc")))]
+pub fn macos_malloc_pressure_relief() -> usize {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) }
 }
 
 static LAST_HEAP_RELEASE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -614,10 +636,14 @@ pub fn release_retained_heap_if_excessive(
         // No OS-side metric available (non-Linux, or allocator stats missing):
         // fall back to the allocator-reported retained counter as an absolute
         // threshold. Coarse, but better than never trimming.
-        let retained = allocator_info()
-            .stats
-            .and_then(|stats| stats.retained_bytes)
-            .unwrap_or(0);
+        let stats_retained = allocator_info().stats.and_then(|stats| stats.retained_bytes);
+        #[cfg(target_os = "macos")]
+        if stats_retained.is_none() {
+            // macOS system malloc exposes no retained counter; pressure relief
+            // is cheap and debounced, so run it on the watchdog cadence.
+            return release_retained_heap_debounced(reason, min_interval);
+        }
+        let retained = stats_retained.unwrap_or(0);
         if retained < threshold_bytes {
             return false;
         }
@@ -959,6 +985,21 @@ mod tests {
         }
 
         assert_eq!(estimate_json_bytes(&FailingSerialize), 0);
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "jemalloc")))]
+    #[test]
+    fn macos_pressure_relief_returns_freed_pages() {
+        let mut keep = Vec::new();
+        for _ in 0..64 {
+            let mut chunk = vec![1u8; 1024 * 1024];
+            chunk[0] = 2;
+            keep.push(chunk);
+        }
+        drop(keep);
+        // Must not crash; releasing after a large transient allocation is the
+        // exact leak pattern (history loads) this exists for.
+        let _ = macos_malloc_pressure_relief();
     }
 
     #[test]
