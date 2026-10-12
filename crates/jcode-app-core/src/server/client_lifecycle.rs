@@ -1777,6 +1777,10 @@ pub(super) async fn handle_client(
                             if let Some(snapshot) = try_available_models_snapshot(&agent) {
                                 last_available_models_snapshot = Some(snapshot);
                             }
+                            crate::process_memory::release_retained_heap_debounced(
+                                "server_target_subscribe_resumed",
+                                std::time::Duration::from_secs(5),
+                            );
                         } else {
                             crate::logging::warn(&format!(
                                 "Target-aware subscribe failed to bind {} from temporary {}; closing temporary client connection {}",
@@ -1881,6 +1885,12 @@ pub(super) async fn handle_client(
                 if let Some(snapshot) = try_available_models_snapshot(&agent) {
                     last_available_models_snapshot = Some(snapshot);
                 }
+                // Replaying a long history spikes the heap; hand the freed pages
+                // back now instead of waiting for the next watchdog tick.
+                crate::process_memory::release_retained_heap_debounced(
+                    "server_session_resumed",
+                    std::time::Duration::from_secs(5),
+                );
             }
 
             Request::GetModelCatalog { id, subscribe_usage_updates } => {

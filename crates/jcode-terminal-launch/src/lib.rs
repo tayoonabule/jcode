@@ -130,6 +130,22 @@ pub const CLIENT_TERMINAL_ENV_VARS: &[&str] = &[
     // Display / window manager
     "DISPLAY",
     "WAYLAND_DISPLAY",
+    // OpenRig seat identity. One shared server hosts many seats, so who is
+    // sending (`rig send` From:) must follow the connecting client, never the
+    // environment the server process happened to be started with.
+    "OPENRIG_SESSION_NAME",
+    "OPENRIG_NODE_ID",
+    "OPENRIG_OCCUPANT_GENERATION",
+    "OPENRIG_RUNTIME",
+    "OPENRIG_HOME",
+    "OPENRIG_URL",
+    "OPENRIG_PORT",
+    "OPENRIG_DB",
+    "OPENRIG_ACTIVITY_HOOK_TOKEN",
+    "OPENRIG_TRANSCRIPTS_ENABLED",
+    "OPENRIG_TRANSCRIPTS_PATH",
+    "OPENRIG_TRANSCRIPTS_LINES",
+    "OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS",
 ];
 
 /// Snapshot the current process's terminal-identifying env vars (see
@@ -982,6 +998,28 @@ mod tests {
         assert_eq!(env["TMUX_PANE"], None);
         assert!(!env.contains_key("UNTRUSTED_CLIENT_VAR"));
         assert!(!env.contains_key("JCODE_CLIENT_UNTRUSTED_CLIENT_VAR"));
+    }
+
+    #[test]
+    fn client_openrig_seat_identity_replaces_server_identity() {
+        let mut command = Command::new("tool");
+        command.env("OPENRIG_SESSION_NAME", "rust-core-core@blip");
+        command.env("OPENRIG_NODE_ID", "stale-node");
+        apply_client_terminal_env(
+            &mut command,
+            &[("OPENRIG_SESSION_NAME".to_string(), "main-lead@provineer".to_string())],
+        );
+        let env = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(env["OPENRIG_SESSION_NAME"].as_deref(), Some("main-lead@provineer"));
+        assert_eq!(env["OPENRIG_NODE_ID"], None, "server's node id must not leak");
     }
 
     #[test]
