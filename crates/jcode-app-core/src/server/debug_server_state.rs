@@ -57,6 +57,24 @@ fn count_live_spawned_swarm_agents<'a>(
         .count()
 }
 
+/// OpenRig seat (`OPENRIG_SESSION_NAME`) each connected session's client
+/// reported. One shared server hosts many seats, so consumers (OpenRig) use
+/// this to scope the shared listing to a seat.
+pub(super) fn openrig_seat_for_session(
+    connections: &HashMap<String, ClientConnectionInfo>,
+    session_id: &str,
+) -> Option<String> {
+    connections
+        .values()
+        .filter(|c| c.session_id == session_id)
+        .find_map(|c| {
+            c.terminal_env
+                .iter()
+                .find(|(k, _)| k == "OPENRIG_SESSION_NAME")
+                .map(|(_, v)| v.clone())
+        })
+}
+
 async fn connected_session_snapshot(
     sessions: &SessionAgents,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
@@ -112,8 +130,10 @@ pub(super) async fn maybe_handle_server_state_command(
         let (connected_agents, members) =
             connected_session_snapshot(sessions, client_connections, swarm_members).await;
         let mut out: Vec<serde_json::Value> = Vec::new();
+        let seat_connections = client_connections.read().await;
         for (sid, agent_arc) in &connected_agents {
             let member_info = members.get(sid);
+            let openrig_seat = openrig_seat_for_session(&seat_connections, sid);
             let member_status = member_info.map(|m| m.status.as_str());
             let (provider, model, is_processing, working_dir_str, token_usage): (
                 Option<String>,
@@ -147,6 +167,7 @@ pub(super) async fn maybe_handle_server_state_command(
             });
             out.push(serde_json::json!({
                 "session_id": sid,
+                "openrig_seat": openrig_seat,
                 "friendly_name": member_info.and_then(|m| m.friendly_name.clone()),
                 "provider": provider,
                 "model": model,
@@ -1253,5 +1274,36 @@ mod tests {
 
         assert_eq!(decision.severity, "healthy");
         assert_eq!(decision.primary_cause, "within_normal_operating_range");
+    }
+}
+
+#[cfg(test)]
+mod openrig_seat_tests {
+    use super::*;
+
+    #[test]
+    fn seat_comes_from_the_connected_clients_env() {
+        let mut connections: HashMap<String, ClientConnectionInfo> = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        connections.insert(
+            "c1".into(),
+            ClientConnectionInfo {
+                client_id: "c1".into(),
+                session_id: "session_a".into(),
+                client_instance_id: None,
+                debug_client_id: None,
+                connected_at: Instant::now(),
+                last_seen: Instant::now(),
+                is_processing: false,
+                current_tool_name: None,
+                terminal_env: vec![("OPENRIG_SESSION_NAME".into(), "seat-a@test".into())],
+                disconnect_tx: tx,
+            },
+        );
+        assert_eq!(
+            openrig_seat_for_session(&connections, "session_a").as_deref(),
+            Some("seat-a@test")
+        );
+        assert_eq!(openrig_seat_for_session(&connections, "session_b"), None);
     }
 }
