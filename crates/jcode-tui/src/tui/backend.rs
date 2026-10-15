@@ -320,6 +320,25 @@ impl RemoteConnection {
         allow_session_takeover: bool,
         remote_working_dir: Option<&str>,
     ) -> Result<Self> {
+        Self::connect_with_session_and_model_override(
+            resume_session,
+            client_instance_id,
+            client_has_local_history,
+            allow_session_takeover,
+            remote_working_dir,
+            None,
+        )
+        .await
+    }
+
+    pub async fn connect_with_session_and_model_override(
+        resume_session: Option<&str>,
+        client_instance_id: Option<&str>,
+        client_has_local_history: bool,
+        allow_session_takeover: bool,
+        remote_working_dir: Option<&str>,
+        restore_model_override: Option<&str>,
+    ) -> Result<Self> {
         let connect_start = Instant::now();
         let socket_connect_start = Instant::now();
         let stream = Stream::connect(server::socket_path()).await?;
@@ -361,6 +380,7 @@ impl RemoteConnection {
             working_dir,
             selfdev,
             target_session_id: resume_target.clone(),
+            restore_model_override: restore_model_override.map(str::to_string),
             client_instance_id: conn.client_instance_id.clone(),
             client_has_local_history: client_has_local_history && !super::is_ssh_remote(),
             allow_session_takeover,

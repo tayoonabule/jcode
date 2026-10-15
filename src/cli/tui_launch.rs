@@ -83,6 +83,7 @@ pub async fn run_client() -> Result<()> {
 
 pub async fn run_tui_client(
     resume_session: Option<String>,
+    resume_model_override: Option<String>,
     startup_hints: Option<setup_hints::StartupHints>,
     server_spawning: bool,
     fresh_spawn: bool,
@@ -144,7 +145,11 @@ pub async fn run_tui_client(
     }
     startup_profile::mark("terminal_title");
 
-    let mut app = tui::App::new_for_remote_with_options(resume_session.clone(), fresh_spawn);
+    let mut app = tui::App::new_for_remote_with_model_override(
+        resume_session.clone(),
+        fresh_spawn,
+        resume_model_override,
+    );
     if should_show_server_spawning(server_spawning).await {
         app.set_server_spawning();
     }

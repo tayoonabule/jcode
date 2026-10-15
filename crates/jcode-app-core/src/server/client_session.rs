@@ -1311,6 +1311,84 @@ pub(super) async fn handle_resume_session(
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
     supports_pdf_panels: bool,
 ) -> Result<Arc<Mutex<Agent>>> {
+    handle_resume_session_with_model_override(
+        id,
+        session_id,
+        working_dir_override,
+        None,
+        client_instance_id,
+        client_has_local_history,
+        allow_session_takeover,
+        client_selfdev,
+        client_session_id,
+        client_connection_id,
+        agent,
+        provider,
+        registry,
+        sessions,
+        shutdown_signals,
+        soft_interrupt_queues,
+        client_connections,
+        client_debug_state,
+        swarm_members,
+        swarms_by_id,
+        file_touch,
+        channel_subscriptions,
+        channel_subscriptions_by_session,
+        swarm_plans,
+        swarm_coordinators,
+        client_count,
+        writer,
+        server_name,
+        server_icon,
+        client_event_tx,
+        mcp_pool,
+        event_history,
+        event_counter,
+        swarm_event_tx,
+        supports_pdf_panels,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_resume_session_with_model_override(
+    id: u64,
+    session_id: String,
+    working_dir_override: Option<&str>,
+    restore_model_override: Option<&str>,
+    client_instance_id: Option<&str>,
+    client_has_local_history: bool,
+    allow_session_takeover: bool,
+    client_selfdev: &mut bool,
+    client_session_id: &mut String,
+    client_connection_id: &str,
+    agent: &Arc<Mutex<Agent>>,
+    provider: &Arc<dyn Provider>,
+    registry: &Registry,
+    sessions: &SessionAgents,
+    shutdown_signals: &Arc<RwLock<HashMap<String, InterruptSignal>>>,
+    soft_interrupt_queues: &SessionInterruptQueues,
+    client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
+    client_debug_state: &Arc<RwLock<ClientDebugState>>,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    file_touch: &FileTouchService,
+    channel_subscriptions: &ChannelSubscriptions,
+    channel_subscriptions_by_session: &ChannelSubscriptions,
+    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
+    client_count: &Arc<RwLock<usize>>,
+    writer: &Arc<Mutex<WriteHalf>>,
+    server_name: &str,
+    server_icon: &str,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    mcp_pool: &Arc<crate::mcp::SharedMcpPool>,
+    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
+    event_counter: &Arc<std::sync::atomic::AtomicU64>,
+    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    supports_pdf_panels: bool,
+) -> Result<Arc<Mutex<Agent>>> {
     let resume_start = Instant::now();
     let incoming_client_instance_id = client_instance_id.map(str::to_string);
     crate::logging::event_info(
@@ -1663,8 +1741,11 @@ pub(super) async fn handle_resume_session(
 
     let (result, is_canary) = {
         let mut agent_guard = agent.lock().await;
-        let result =
-            agent_guard.restore_session_with_working_dir(&session_id, working_dir_override);
+        let result = agent_guard.restore_session_with_model_override(
+            &session_id,
+            working_dir_override,
+            restore_model_override,
+        );
         if *client_selfdev {
             agent_guard.set_canary("self-dev");
         }

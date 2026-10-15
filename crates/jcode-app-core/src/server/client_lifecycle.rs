@@ -20,7 +20,8 @@ use super::client_lightweight_control::{
     LightweightControlContext, handle_lightweight_control_request, parse_swarm_spawn_mode,
 };
 use super::client_session::{
-    handle_clear_session, handle_reload, handle_resume_session, handle_subscribe,
+    handle_clear_session, handle_reload, handle_resume_session,
+    handle_resume_session_with_model_override, handle_subscribe,
 };
 use super::client_state::{
     handle_get_compacted_history, handle_get_history, handle_get_model_catalog, handle_get_state,
@@ -1647,6 +1648,7 @@ pub(super) async fn handle_client(
                 working_dir: subscribe_working_dir,
                 selfdev,
                 target_session_id,
+                restore_model_override,
                 client_instance_id,
                 client_has_local_history,
                 allow_session_takeover,
@@ -1703,10 +1705,11 @@ pub(super) async fn handle_client(
                         let pre_resume_session_id = client_session_id.clone();
                         agent = crate::hooks::with_client_terminal_env(
                             active_terminal_env.clone(),
-                            handle_resume_session(
+                            handle_resume_session_with_model_override(
                                 id,
                                 target_session_id.clone(),
                                 subscribe_working_dir.as_deref(),
+                                restore_model_override.as_deref(),
                                 client_instance_id.as_deref(),
                                 client_has_local_history,
                                 allow_session_takeover,

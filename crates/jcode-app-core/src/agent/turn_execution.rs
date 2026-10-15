@@ -1080,9 +1080,21 @@ impl Agent {
         session_id: &str,
         working_dir: Option<&str>,
     ) -> Result<SessionStatus> {
+        self.restore_session_with_model_override(session_id, working_dir, None)
+    }
+
+    pub(crate) fn restore_session_with_model_override(
+        &mut self,
+        session_id: &str,
+        working_dir: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Result<SessionStatus> {
         let restore_start = Instant::now();
         let load_start = Instant::now();
         let mut session = Session::load(session_id)?;
+        if let Some(model) = model_override {
+            session.model = Some(model.to_string());
+        }
         if let Some(working_dir) = working_dir {
             session.working_dir = Some(working_dir.to_string());
             session.refresh_initial_session_context_message();
@@ -1096,6 +1108,33 @@ impl Agent {
             session.status.display()
         ));
         let previous_status = session.status.clone();
+
+        let model_start = Instant::now();
+        let model_set_result = if let Some(model) = session.model.clone() {
+            let model_request =
+                crate::provider::MultiProvider::model_switch_request_for_session_route(
+                    &model,
+                    session.provider_key.as_deref(),
+                    session.route_api_method.as_deref(),
+                );
+            match crate::provider::set_model_with_auth_refresh(
+                self.provider.as_ref(),
+                &model_request,
+            ) {
+                Ok(()) => Some(Ok((model, model_request))),
+                Err(error) if model_override.is_some() => {
+                    anyhow::bail!(
+                        "Failed to apply requested resume model '{}' via '{}': {}",
+                        model,
+                        model_request,
+                        error
+                    );
+                }
+                Err(error) => Some(Err((model, model_request, error.to_string()))),
+            }
+        } else {
+            None
+        };
 
         let assign_start = Instant::now();
         // A failed load must leave the current Agent and its concurrency lease
@@ -1117,26 +1156,15 @@ impl Agent {
         let restored_soft_interrupts = self.restore_persisted_soft_interrupts();
         let reset_ms = reset_start.elapsed().as_millis();
 
-        let model_start = Instant::now();
-        if let Some(model) = self.session.model.clone() {
-            let model_request =
-                crate::provider::MultiProvider::model_switch_request_for_session_route(
-                    &model,
-                    self.session.provider_key.as_deref(),
-                    self.session.route_api_method.as_deref(),
-                );
-            if let Err(e) =
-                crate::provider::set_model_with_auth_refresh(self.provider.as_ref(), &model_request)
-            {
-                logging::error(&format!(
-                    "Failed to restore session model '{}' via '{}': {}",
-                    model, model_request, e
-                ));
-            } else {
-                self.reconcile_explicit_provider_pin_route();
+        match model_set_result {
+            Some(Ok((_model, _model_request))) => self.reconcile_explicit_provider_pin_route(),
+            Some(Err((model, model_request, error))) => logging::error(&format!(
+                "Failed to restore session model '{}' via '{}': {}",
+                model, model_request, error
+            )),
+            None => {
+                self.session.model = Some(self.provider_model());
             }
-        } else {
-            self.session.model = Some(self.provider_model());
         }
         self.restore_reasoning_effort_from_session();
         let model_ms = model_start.elapsed().as_millis();

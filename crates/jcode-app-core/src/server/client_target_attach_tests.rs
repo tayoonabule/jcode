@@ -54,6 +54,7 @@ fn subscribe(target: &str) -> Request {
         working_dir: None,
         target_session_id: Some(target.into()),
         selfdev: None,
+        restore_model_override: None,
         client_instance_id: None,
         client_has_local_history: false,
         allow_session_takeover: false,
