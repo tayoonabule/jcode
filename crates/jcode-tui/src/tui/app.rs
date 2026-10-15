@@ -1222,6 +1222,9 @@ pub struct App {
     debug_tx: Option<tokio::sync::broadcast::Sender<super::backend::DebugEvent>>,
     // Remote provider info (set when running in remote mode)
     remote_client_instance_id: String,
+    /// Explicit `--model` supplied for a disk-backed `--resume`. Sent only in
+    /// the initial target Subscribe; the server ignores it for live attaches.
+    resume_model_override: Option<String>,
     remote_provider_name: Option<String>,
     remote_provider_model: Option<String>,
     /// Monotonic counter bumped each time the server pushes a fresh remote model

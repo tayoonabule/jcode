@@ -1292,6 +1292,74 @@ async fn explicit_provider_pin_is_persisted_and_reapplied_on_restore() {
 }
 
 #[tokio::test]
+async fn disk_restore_uses_explicit_model_override_but_preserves_saved_model_by_default() {
+    let _guard = crate::storage::lock_test_env();
+
+    let mut overridden_session = crate::session::Session::create_with_id(
+        "session_restore_model_override".to_string(),
+        None,
+        None,
+    );
+    overridden_session.model = Some("old/saved-model".to_string());
+    overridden_session.save_prepared().expect("save session");
+
+    let override_provider = Arc::new(ExplicitPinProvider::new("old/saved-model"));
+    let override_provider_dyn: Arc<dyn Provider> = override_provider.clone();
+    let override_registry = Registry::new(override_provider_dyn.clone()).await;
+    let mut override_agent = Agent::new(override_provider_dyn, override_registry);
+    override_agent
+        .restore_session_with_model_override(
+            &overridden_session.id,
+            None,
+            Some("current/policy-model"),
+        )
+        .expect("restore with explicit model");
+
+    assert_eq!(override_agent.provider_model(), "current/policy-model");
+    assert_eq!(
+        crate::session::Session::load(&overridden_session.id)
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("current/policy-model")
+    );
+    assert_eq!(
+        override_provider
+            .set_model_requests
+            .lock()
+            .unwrap()
+            .as_slice(),
+        ["current/policy-model"]
+    );
+
+    let mut default_session = crate::session::Session::create_with_id(
+        "session_restore_model_default".to_string(),
+        None,
+        None,
+    );
+    default_session.model = Some("old/saved-model".to_string());
+    default_session.save_prepared().expect("save session");
+
+    let default_provider = Arc::new(ExplicitPinProvider::new("different/default"));
+    let default_provider_dyn: Arc<dyn Provider> = default_provider.clone();
+    let default_registry = Registry::new(default_provider_dyn.clone()).await;
+    let mut default_agent = Agent::new(default_provider_dyn, default_registry);
+    default_agent
+        .restore_session_with_working_dir(&default_session.id, None)
+        .expect("restore without explicit model");
+
+    assert_eq!(default_agent.provider_model(), "old/saved-model");
+    assert_eq!(
+        default_provider
+            .set_model_requests
+            .lock()
+            .unwrap()
+            .as_slice(),
+        ["old/saved-model"]
+    );
+}
+
+#[tokio::test]
 async fn restore_session_rehydrates_injected_memory_ids() {
     let _guard = crate::storage::lock_test_env();
     crate::memory::clear_all_pending_memory();

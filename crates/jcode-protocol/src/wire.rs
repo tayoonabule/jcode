@@ -163,6 +163,11 @@ pub enum Request {
         selfdev: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_session_id: Option<String>,
+        /// Explicit model requested by the client for a disk-backed resume.
+        /// Ignored when attaching to an already-live session. When absent, the
+        /// model persisted in the saved session remains authoritative.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_model_override: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_instance_id: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]

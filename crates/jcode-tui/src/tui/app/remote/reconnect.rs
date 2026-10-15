@@ -388,12 +388,14 @@ pub(in crate::tui::app) async fn connect_with_retry(
         && !app.display_messages().is_empty();
     let client_instance_id = app.remote_client_instance_id.clone();
     let allow_session_takeover = should_allow_reconnect_takeover(app, state, session_to_resume);
-    let connect = RemoteConnection::connect_with_session(
+    let resume_model_override = app.resume_model_override.clone();
+    let connect = RemoteConnection::connect_with_session_and_model_override(
         session_to_resume,
         Some(client_instance_id.as_str()),
         client_has_local_history,
         allow_session_takeover,
         remote_working_dir,
+        resume_model_override.as_deref(),
     );
     crate::logging::info(&format!(
         "Remote reconnect attempt: resume={:?}, reconnect_attempts={}, client_instance_id={}, local_history={}, allow_takeover={}",

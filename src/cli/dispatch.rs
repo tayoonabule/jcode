@@ -1028,17 +1028,23 @@ async fn run_default_command(args: Args) -> Result<()> {
     }
 
     if server_running && explicit_provider_or_model {
-        output::stderr_info(
-            "Server already running; provider/model flags only apply when starting a new server.",
-        );
-        output::stderr_info(format!(
-            "Current server settings control `/model`. Restart server to apply: --provider {}{}",
-            args.provider.as_arg_value(),
-            args.model
-                .as_ref()
-                .map(|m| format!(" --model {}", m))
-                .unwrap_or_default()
-        ));
+        if args.resume.is_some() && args.model.is_some() {
+            output::stderr_info(
+                "Applying --model to the disk-backed resumed session; live-session attachments are not changed.",
+            );
+        } else {
+            output::stderr_info(
+                "Server already running; provider/model flags only apply when starting a new server.",
+            );
+            output::stderr_info(format!(
+                "Current server settings control `/model`. Restart server to apply: --provider {}{}",
+                args.provider.as_arg_value(),
+                args.model
+                    .as_ref()
+                    .map(|m| format!(" --model {}", m))
+                    .unwrap_or_default()
+            ));
+        }
     }
 
     if server_running && explicit_tool_options {
@@ -1073,6 +1079,7 @@ async fn run_default_command(args: Args) -> Result<()> {
     }
     tui_launch::run_tui_client(
         args.resume,
+        args.model,
         startup_hints,
         !server_running,
         args.fresh_spawn,

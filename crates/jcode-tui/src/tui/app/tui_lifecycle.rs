@@ -532,6 +532,7 @@ impl App {
             copy_selection_edge_autoscroll: None,
             debug_tx: None,
             remote_client_instance_id: crate::id::new_id("client"),
+            resume_model_override: None,
             remote_provider_name: None,
             remote_provider_model: None,
             remote_model_catalog_generation: 0,
@@ -993,6 +994,7 @@ impl App {
             copy_selection_edge_autoscroll: None,
             debug_tx: None,
             remote_client_instance_id: crate::id::new_id("client"),
+            resume_model_override: None,
             remote_provider_name: None,
             remote_provider_model: None,
             remote_model_catalog_generation: 0,
@@ -1418,6 +1420,16 @@ impl App {
         }
 
         app.resume_session_id = resume_session;
+        app
+    }
+
+    pub fn new_for_remote_with_model_override(
+        resume_session: Option<String>,
+        fresh_spawn: bool,
+        model_override: Option<String>,
+    ) -> Self {
+        let mut app = Self::new_for_remote_with_options(resume_session, fresh_spawn);
+        app.resume_model_override = model_override;
         app
     }
 
