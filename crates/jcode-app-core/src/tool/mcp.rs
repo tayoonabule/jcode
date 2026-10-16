@@ -59,7 +59,13 @@ fn matches_mcp_query(query: &str, server: &str, name: &str, tool: &str, descript
 /// Fallback when no tool matches every word: agents often list several tool
 /// names in one query (`conversations_search_messages list_meetings`), which
 /// can never all match one tool.
-fn matches_any_mcp_query_word(query: &str, server: &str, name: &str, tool: &str, description: &str) -> bool {
+fn matches_any_mcp_query_word(
+    query: &str,
+    server: &str,
+    name: &str,
+    tool: &str,
+    description: &str,
+) -> bool {
     let searchable = format!("{} {} {} {}", name, server, tool, description).to_ascii_lowercase();
     query
         .split_whitespace()
@@ -177,7 +183,13 @@ impl Tool for McpSearchTool {
                 if let Some(query) = &query {
                     let description = tool.description.as_deref().unwrap_or_default();
                     if !matches_mcp_query(query, &server, &name, &tool.name, description) {
-                        if matches_any_mcp_query_word(query, &server, &name, &tool.name, description) {
+                        if matches_any_mcp_query_word(
+                            query,
+                            &server,
+                            &name,
+                            &tool.name,
+                            description,
+                        ) {
                             any_word.push(result(tool));
                         }
                         return None;
@@ -981,10 +993,25 @@ mod tests {
     #[test]
     fn several_tool_names_in_one_query_match_each_tool() {
         let query = "conversations_search_messages list_meetings";
-        let slack = ("slack", "mcp__slack__conversations_search_messages", "conversations_search_messages", "Search messages");
-        assert!(!matches_mcp_query(query, slack.0, slack.1, slack.2, slack.3));
-        assert!(matches_any_mcp_query_word(query, slack.0, slack.1, slack.2, slack.3));
-        assert!(!matches_any_mcp_query_word(query, "slack", "mcp__slack__users_list", "users_list", "List users"));
+        let slack = (
+            "slack",
+            "mcp__slack__conversations_search_messages",
+            "conversations_search_messages",
+            "Search messages",
+        );
+        assert!(!matches_mcp_query(
+            query, slack.0, slack.1, slack.2, slack.3
+        ));
+        assert!(matches_any_mcp_query_word(
+            query, slack.0, slack.1, slack.2, slack.3
+        ));
+        assert!(!matches_any_mcp_query_word(
+            query,
+            "slack",
+            "mcp__slack__users_list",
+            "users_list",
+            "List users"
+        ));
     }
 
     fn create_test_tool() -> McpManagementTool {
@@ -1197,8 +1224,20 @@ mod tests {
         let mut config = crate::mcp::McpConfig::default();
         let mut cache = crate::mcp::McpSchemaCache::default();
         for (name, tools) in [
-            ("slack", vec![tool("conversations_search_messages", "Search messages"), tool("users_list", "List users")]),
-            ("granola", vec![tool("list_meetings", "List meeting notes"), tool("get_meetings", "Read notes")]),
+            (
+                "slack",
+                vec![
+                    tool("conversations_search_messages", "Search messages"),
+                    tool("users_list", "List users"),
+                ],
+            ),
+            (
+                "granola",
+                vec![
+                    tool("list_meetings", "List meeting notes"),
+                    tool("get_meetings", "Read notes"),
+                ],
+            ),
         ] {
             let cfg = server(&format!("https://example.invalid/{name}"));
             cache.update(name, &cfg, tools);
@@ -1214,22 +1253,47 @@ mod tests {
         let (manager, _tmp) = cached_slack_granola();
         let search = McpSearchTool::new(manager);
         let all = search
-            .execute(json!({"query": "conversations_search_messages list_meetings"}), create_test_context())
+            .execute(
+                json!({"query": "conversations_search_messages list_meetings"}),
+                create_test_context(),
+            )
             .await
             .unwrap();
         let slack = search
-            .execute(json!({"server": "slack", "query": "conversations_search_messages list_meetings"}), create_test_context())
+            .execute(
+                json!({"server": "slack", "query": "conversations_search_messages list_meetings"}),
+                create_test_context(),
+            )
             .await
             .unwrap();
         unsafe {
             std::env::remove_var("JCODE_HOME");
         }
-        assert!(all.output.contains("\"tool\": \"conversations_search_messages\""), "{}", all.output);
-        assert!(all.output.contains("\"tool\": \"list_meetings\""), "{}", all.output);
+        assert!(
+            all.output
+                .contains("\"tool\": \"conversations_search_messages\""),
+            "{}",
+            all.output
+        );
+        assert!(
+            all.output.contains("\"tool\": \"list_meetings\""),
+            "{}",
+            all.output
+        );
         assert!(!all.output.contains("users_list"), "{}", all.output);
-        assert!(slack.output.contains("\"tool\": \"conversations_search_messages\""), "{}", slack.output);
+        assert!(
+            slack
+                .output
+                .contains("\"tool\": \"conversations_search_messages\""),
+            "{}",
+            slack.output
+        );
         assert!(!slack.output.contains("list_meetings"), "{}", slack.output);
-        assert!(!slack.output.contains("no searchable tools"), "{}", slack.output);
+        assert!(
+            !slack.output.contains("no searchable tools"),
+            "{}",
+            slack.output
+        );
     }
 
     #[tokio::test]
@@ -1237,7 +1301,10 @@ mod tests {
         let _guard = crate::storage::lock_test_env();
         let (manager, _tmp) = cached_slack_granola();
         let result = McpSearchTool::new(manager)
-            .execute(json!({"server": "slack", "query": "invoice"}), create_test_context())
+            .execute(
+                json!({"server": "slack", "query": "invoice"}),
+                create_test_context(),
+            )
             .await
             .unwrap();
         unsafe {
