@@ -1170,6 +1170,83 @@ mod tests {
         );
     }
 
+    /// Slack and Granola with cached tools, under a temp JCODE_HOME.
+    fn cached_slack_granola() -> (Arc<RwLock<McpManager>>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("JCODE_HOME", tmp.path());
+        }
+        let server = |url: &str| McpServerConfig {
+            command: String::new(),
+            args: vec![],
+            env: HashMap::new(),
+            shared: true,
+            transport: Some("http".to_string()),
+            url: Some(url.to_string()),
+            headers: HashMap::new(),
+            oauth: None,
+            enabled: None,
+            disabled: None,
+            timeout_secs: None,
+        };
+        let tool = |name: &str, description: &str| crate::mcp::McpToolDef {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            input_schema: json!({"type": "object"}),
+        };
+        let mut config = crate::mcp::McpConfig::default();
+        let mut cache = crate::mcp::McpSchemaCache::default();
+        for (name, tools) in [
+            ("slack", vec![tool("conversations_search_messages", "Search messages"), tool("users_list", "List users")]),
+            ("granola", vec![tool("list_meetings", "List meeting notes"), tool("get_meetings", "Read notes")]),
+        ] {
+            let cfg = server(&format!("https://example.invalid/{name}"));
+            cache.update(name, &cfg, tools);
+            config.servers.insert(name.to_string(), cfg);
+        }
+        cache.save();
+        (Arc::new(RwLock::new(McpManager::with_config(config))), tmp)
+    }
+
+    #[tokio::test]
+    async fn search_with_several_tool_names_returns_each_tool() {
+        let _guard = crate::storage::lock_test_env();
+        let (manager, _tmp) = cached_slack_granola();
+        let search = McpSearchTool::new(manager);
+        let all = search
+            .execute(json!({"query": "conversations_search_messages list_meetings"}), create_test_context())
+            .await
+            .unwrap();
+        let slack = search
+            .execute(json!({"server": "slack", "query": "conversations_search_messages list_meetings"}), create_test_context())
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("JCODE_HOME");
+        }
+        assert!(all.output.contains("\"tool\": \"conversations_search_messages\""), "{}", all.output);
+        assert!(all.output.contains("\"tool\": \"list_meetings\""), "{}", all.output);
+        assert!(!all.output.contains("users_list"), "{}", all.output);
+        assert!(slack.output.contains("\"tool\": \"conversations_search_messages\""), "{}", slack.output);
+        assert!(!slack.output.contains("list_meetings"), "{}", slack.output);
+        assert!(!slack.output.contains("no searchable tools"), "{}", slack.output);
+    }
+
+    #[tokio::test]
+    async fn no_match_on_a_server_with_tools_does_not_claim_it_has_none() {
+        let _guard = crate::storage::lock_test_env();
+        let (manager, _tmp) = cached_slack_granola();
+        let result = McpSearchTool::new(manager)
+            .execute(json!({"server": "slack", "query": "invoice"}), create_test_context())
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("JCODE_HOME");
+        }
+        assert_eq!(result.output.trim(), "[]");
+        assert!(!result.output.contains("no searchable tools"));
+    }
+
     #[tokio::test]
     async fn search_miss_points_to_configured_granola_before_browser() {
         let mut config = crate::mcp::McpConfig::default();
