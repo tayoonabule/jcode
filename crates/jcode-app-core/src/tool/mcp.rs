@@ -56,6 +56,16 @@ fn matches_mcp_query(query: &str, server: &str, name: &str, tool: &str, descript
         .all(|word| searchable.contains(word))
 }
 
+/// Fallback when no tool matches every word: agents often list several tool
+/// names in one query (`conversations_search_messages list_meetings`), which
+/// can never all match one tool.
+fn matches_any_mcp_query_word(query: &str, server: &str, name: &str, tool: &str, description: &str) -> bool {
+    let searchable = format!("{} {} {} {}", name, server, tool, description).to_ascii_lowercase();
+    query
+        .split_whitespace()
+        .any(|word| searchable.contains(word))
+}
+
 /// Fixed MCP discovery surface used when individual server definitions are deferred.
 pub struct McpSearchTool {
     manager: Arc<RwLock<McpManager>>,
@@ -120,7 +130,9 @@ impl Tool for McpSearchTool {
         drop(manager);
 
         let names = crate::mcp::dispatch_names(&catalog);
-        let matches: Vec<McpSearchResult> = catalog
+        let mut server_has_tools = false;
+        let mut any_word: Vec<McpSearchResult> = Vec::new();
+        let mut matches: Vec<McpSearchResult> = catalog
             .into_iter()
             .zip(names)
             .filter_map(|((server, tool), name)| {
@@ -154,21 +166,29 @@ impl Tool for McpSearchTool {
                 if !allowed {
                     return None;
                 }
-                if let Some(query) = &query {
-                    let description = tool.description.as_deref().unwrap_or_default();
-                    if !matches_mcp_query(query, &server, &name, &tool.name, description) {
-                        return None;
-                    }
-                }
-                Some(McpSearchResult {
-                    name,
-                    server,
+                server_has_tools = true;
+                let result = |tool: crate::mcp::McpToolDef| McpSearchResult {
+                    name: name.clone(),
+                    server: server.clone(),
                     tool: tool.name,
                     description: tool.description.unwrap_or_else(|| "MCP tool".to_string()),
                     input_schema: tool.input_schema,
-                })
+                };
+                if let Some(query) = &query {
+                    let description = tool.description.as_deref().unwrap_or_default();
+                    if !matches_mcp_query(query, &server, &name, &tool.name, description) {
+                        if matches_any_mcp_query_word(query, &server, &name, &tool.name, description) {
+                            any_word.push(result(tool));
+                        }
+                        return None;
+                    }
+                }
+                Some(result(tool))
             })
             .collect();
+        if matches.is_empty() {
+            matches = any_word;
+        }
 
         // Ask the agent to load the matched definitions natively. With
         // provider-native deferred loading these become directly callable
@@ -180,7 +200,7 @@ impl Tool for McpSearchTool {
             .map(|m| m.name.as_str())
             .collect();
         let mut output = serde_json::to_string_pretty(&matches)?;
-        if matches.is_empty() {
+        if matches.is_empty() && !server_has_tools {
             // A search miss does not prove a native source is unavailable. A
             // server may be configured after this session started, or its
             // connection/schema cache may have failed. Show only its name and
@@ -956,6 +976,15 @@ mod tests {
             "get_meeting_transcript",
             "Get the full transcript by meeting ID"
         ));
+    }
+
+    #[test]
+    fn several_tool_names_in_one_query_match_each_tool() {
+        let query = "conversations_search_messages list_meetings";
+        let slack = ("slack", "mcp__slack__conversations_search_messages", "conversations_search_messages", "Search messages");
+        assert!(!matches_mcp_query(query, slack.0, slack.1, slack.2, slack.3));
+        assert!(matches_any_mcp_query_word(query, slack.0, slack.1, slack.2, slack.3));
+        assert!(!matches_any_mcp_query_word(query, "slack", "mcp__slack__users_list", "users_list", "List users"));
     }
 
     fn create_test_tool() -> McpManagementTool {
