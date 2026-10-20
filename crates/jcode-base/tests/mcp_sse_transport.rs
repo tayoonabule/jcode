@@ -15,7 +15,6 @@ fn sse_config(url: String) -> McpServerConfig {
         transport: Some("sse".to_string()),
         url: Some(url),
         headers: HashMap::new(),
-        oauth: None,
         timeout_secs: None,
         enabled: None,
         disabled: None,

@@ -19,6 +19,8 @@ pub(crate) fn initial_title(args: &Args) -> String {
         Some(Command::Run { .. }) => "jcode run".to_string(),
         Some(Command::Login { .. }) => "jcode login".to_string(),
         Some(Command::Account { .. }) => "jcode account".to_string(),
+        Some(Command::Browser { .. }) => "jcode browser".to_string(),
+        Some(Command::Mcp { .. }) => "jcode mcp".to_string(),
         Some(Command::Repl) => "jcode repl".to_string(),
         Some(Command::Update) => "jcode update".to_string(),
         Some(Command::Version { .. }) => "jcode version".to_string(),
@@ -38,6 +40,7 @@ pub(crate) fn initial_title(args: &Args) -> String {
         Some(Command::Pair { .. }) => "jcode pair".to_string(),
         Some(Command::Permissions) => "jcode permissions".to_string(),
         Some(Command::Transcript { .. }) => "jcode transcript".to_string(),
+        Some(Command::Companion { .. }) => "jcode companion".to_string(),
         Some(Command::Dictate { .. }) => "jcode dictate".to_string(),
         Some(Command::SetupHotkey {
             listen_macos_hotkey,
@@ -55,7 +58,6 @@ pub(crate) fn initial_title(args: &Args) -> String {
                 "jcode hotkey setup".to_string()
             }
         }
-        Some(Command::Browser { .. }) => "jcode browser".to_string(),
         Some(Command::Replay { .. }) => "jcode replay".to_string(),
         Some(Command::Model(_)) => "jcode model".to_string(),
         Some(Command::ProviderTestCoverage { .. }) => "jcode provider-test-coverage".to_string(),

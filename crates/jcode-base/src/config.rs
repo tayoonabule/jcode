@@ -5,13 +5,14 @@
 
 pub use jcode_config_types::{
     AgentsConfig, AmbientConfig, AuthConfig, AutoJudgeConfig, AutoReviewConfig, CompactionConfig,
-    CompactionMode, CrossProviderFailoverMode, DiagramDisplayMode, DiagramPanePosition,
-    DiffDisplayMode, DisplayConfig, FeatureConfig, GatewayConfig, HookCommands, HooksConfig,
-    KeybindingsConfig, LatexRenderingMode, LaunchHotkeyEntry, LaunchHotkeysConfig,
-    MarkdownSpacingMode, NamedProviderAuth, NamedProviderConfig, NamedProviderModelConfig,
-    NamedProviderType, NativeScrollbarConfig, NotificationsConfig, PowerConfig, ProviderConfig,
-    ReasoningDisplayMode, SafetyConfig, SessionPickerResumeAction, SponsorsConfig, SwarmSpawnMode,
-    SwarmStripLayout, TerminalConfig, UpdateChannel, WebSearchConfig, WebSearchEngine,
+    CompactionMode, CrossProviderFailoverMode, CustomWebSearchConfig, CustomWebSearchMethod,
+    DiagramDisplayMode, DiagramPanePosition, DiffDisplayMode, DisplayConfig, FeatureConfig,
+    GatewayConfig, HookCommands, HooksConfig, KeybindingsConfig, LatexRenderingMode,
+    LaunchHotkeyEntry, LaunchHotkeysConfig, MarkdownSpacingMode, MenubarConfig, NamedProviderAuth,
+    NamedProviderConfig, NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig,
+    NotificationsConfig, PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
+    SessionConfig, SessionPickerResumeAction, SponsorsConfig, SwarmSpawnMode, SwarmStripLayout,
+    TerminalConfig, UpdateChannel, WebSearchConfig, WebSearchEngine,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -26,8 +27,58 @@ const CONFIG_CACHE_CHECK_INTERVAL: Duration = if cfg!(test) {
     Duration::from_millis(500)
 };
 
+#[cfg(test)]
+#[test]
+fn custom_websearch_config_toml_roundtrip() {
+    let input = r#"
+engine = "custom"
+prefer_native = false
+fallback_engines = []
+[custom]
+endpoint = "https://search.example.test/api"
+method = "POST"
+query_param = "search"
+count_param = "limit"
+params = { format = "json" }
+body = { options = { safe = true } }
+headers = { Accept = "application/json" }
+header_env = { Authorization = "SEARCH_AUTH" }
+results_pointer = "/data/hits"
+title_pointer = "/name"
+url_pointer = "/link"
+snippet_pointer = "/summary"
+"#;
+    let config: WebSearchConfig = toml::from_str(input).unwrap();
+    assert_eq!(config.engine, WebSearchEngine::Custom);
+    assert!(!config.native_enabled());
+    assert_eq!(
+        WebSearchEngine::parse("custom"),
+        Some(WebSearchEngine::Custom)
+    );
+    assert!(WebSearchEngine::Custom.is_local());
+    assert_eq!(WebSearchEngine::Custom.as_str(), "custom");
+    let encoded = toml::to_string(&config).unwrap();
+    let decoded: WebSearchConfig = toml::from_str(&encoded).unwrap();
+    assert_eq!(
+        serde_json::to_value(config).unwrap(),
+        serde_json::to_value(decoded).unwrap()
+    );
+    let no_count: CustomWebSearchConfig =
+        toml::from_str("endpoint = 'https://example.test'").unwrap();
+    assert!(no_count.count_param.is_none());
+    assert_eq!(no_count.method, CustomWebSearchMethod::Get);
+    assert!(WebSearchConfig::default().custom.is_none());
+}
+
 const CONFIG_ENV_KEYS: &[&str] = &[
+    "JCODE_HIBERNATION_IDLE_SECS",
+    "JCODE_HIBERNATION_MODE",
     "HOME",
+    "JCODE_COMMIT_LOG_KEY",
+    "JCODE_RESUME_PROJECT_SCOPE",
+    "JCODE_REQUEST_COMPRESSION",
+    "JCODE_SWARM_STALL_AFTER_SECS",
+    "JCODE_SWARM_STALL_NUDGE",
     "JCODE_ACP_PROFILE",
     "JCODE_ACP_TOOL_PROFILE",
     "JCODE_ACTIVE_SESSIONS_MANAGER",
@@ -85,6 +136,8 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_DISPLAY_CENTERED",
     "JCODE_EFFORT_DECREASE_KEY",
     "JCODE_EFFORT_INCREASE_KEY",
+    "JCODE_SPEED_DECREASE_KEY",
+    "JCODE_SPEED_INCREASE_KEY",
     "JCODE_EMAIL_REPLY_ENABLED",
     "JCODE_EMAIL_TO",
     "JCODE_FOCUS_HOOK",
@@ -97,6 +150,8 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_HOOK_PRE_TOOL_TRANSFORM_TIMEOUT_MS",
     "JCODE_HOOK_PRE_TOOL_TIMEOUT_MS",
     "JCODE_HOOK_POST_TOOL",
+    "JCODE_HOOK_POST_TOOL_FEEDBACK",
+    "JCODE_HOOK_POST_TOOL_FEEDBACK_TIMEOUT_MS",
     "JCODE_HOOK_SESSION_END",
     "JCODE_HOOK_SESSION_START",
     "JCODE_HOOK_TURN_END",
@@ -174,11 +229,11 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_MAX_RETRIES",
     "JCODE_MCP_TOOLS",
     "JCODE_MCP_TOOLS_TOKEN_THRESHOLD",
+    "JCODE_CODEMODE",
     "JCODE_RETRY_BACKOFF_CAP_SECS",
     "JCODE_SWARM_ENABLED",
     "JCODE_SWARM_EFFORT",
     "JCODE_SWARM_ROOT_EFFORT",
-    "JCODE_SWARM_DEEP_ROOT_EFFORT",
     "JCODE_SWARM_MODEL",
     "JCODE_SWARM_MAX_CONCURRENT_AGENTS",
     "JCODE_SWARM_SPAWN_MODE",
@@ -484,6 +539,9 @@ pub fn on_config_reloaded(listener: fn()) {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
+    /// Idle session memory hibernation policy.
+    pub session: SessionConfig,
+
     /// Daemon behavior for autonomous wake requests.
     pub server: ServerConfig,
 
@@ -549,6 +607,9 @@ pub struct Config {
 
     /// Power-management configuration (prevent sleep while streaming)
     pub power: PowerConfig,
+
+    /// macOS menu bar session indicator
+    pub menubar: MenubarConfig,
 
     /// Auto-review configuration
     pub autoreview: AutoReviewConfig,
@@ -679,6 +740,10 @@ pub struct ToolConfig {
         alias = "mcp_tools_auto_threshold_tokens"
     )]
     pub mcp_tools_token_threshold: usize,
+    /// Opt-in Codemode: expose a `codemode` tool that runs model-written
+    /// JavaScript in an embedded QuickJS sandbox able to call every other
+    /// tool (including MCP tools). Off by default.
+    pub codemode: bool,
 }
 
 impl Default for ToolConfig {
@@ -690,6 +755,7 @@ impl Default for ToolConfig {
             disable_base_tools: false,
             mcp_tools: McpToolsMode::Auto,
             mcp_tools_token_threshold: 8_000,
+            codemode: false,
         }
     }
 }
@@ -831,6 +897,10 @@ pub struct DictationConfig {
     /// microphone and prints raw mono 16 kHz s16le PCM to stdout. Empty means
     /// auto-detect (pw-record, parecord, arecord, rec, ffmpeg).
     pub recorder: String,
+    /// Keyboards `jcode companion` watches for Copilot-key push-to-talk
+    /// (Linux evdev nodes, preferably stable `/dev/input/by-id/...` paths).
+    /// Empty disables the companion's global voice listener.
+    pub global_devices: Vec<std::path::PathBuf>,
 }
 
 impl Default for DictationConfig {
@@ -842,6 +912,7 @@ impl Default for DictationConfig {
             timeout_secs: 90,
             vocabulary: Vec::new(),
             recorder: String::new(),
+            global_devices: Vec::new(),
         }
     }
 }

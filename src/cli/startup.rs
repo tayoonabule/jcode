@@ -19,12 +19,17 @@ pub async fn run() -> Result<()> {
     // Parse once, before startup side effects. Invalid arguments and --help
     // must not harden credential files or create configuration/telemetry state.
     let args = Args::parse();
-    // Credential import must refuse existing stores without normal startup
-    // hardening, migrations, telemetry, or provider discovery touching them.
+    // Interactive login prompts (masked secrets, QR codes) are a terminal
+    // concern. The shared auth flows reach them through this presenter.
+    super::login::install_terminal_login_presenter();
+    // Snapshot user-supplied provider env before provider init rewrites it.
+    super::provider_init::capture_user_openrouter_model_env();
+    // Credential import and explicit MCP management do not need normal agent
+    // startup hardening, migrations, telemetry, or provider discovery.
     if args.ssh.is_none()
         && matches!(
             args.command,
-            Some(Command::Auth(super::args::AuthCommand::Import { .. }))
+            Some(Command::Auth(super::args::AuthCommand::Import { .. }) | Command::Mcp { .. })
         )
     {
         if let Some(cwd) = &args.cwd {
@@ -258,8 +263,8 @@ pub fn register_external_provider_runtimes() {
         jcode_provider_openrouter_runtime::maybe_schedule_standard_openrouter_catalog_refresh,
     );
     // API-backed OpenAI routes use Codex/platform credentials. The runtime is
-    // still registered without them so browser-backed ChatGPT models remain
-    // usable through the logged-in Firefox session.
+    // still registered without them so browser-backed ChatGPT models can report
+    // their own authentication requirement when selected.
     crate::provider::external::register_external_provider_fallible(
         crate::provider::external::OPENAI_RUNTIME,
         || {

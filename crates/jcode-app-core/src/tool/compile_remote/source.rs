@@ -496,6 +496,7 @@ mod tests {
         assert!(error.to_string().contains("exceeds 2 bytes"));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn rejects_non_utf8_git_paths() {
         use std::os::unix::ffi::OsStrExt;

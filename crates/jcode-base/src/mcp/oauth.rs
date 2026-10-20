@@ -1,627 +1,1167 @@
-//! OAuth 2.0 (PKCE + dynamic client registration) for remote MCP servers.
+//! OAuth 2.1 for remote MCP servers (MCP authorization spec 2025-06-18).
 //!
-//! Implements the MCP authorization flow: a 401 from the server points at
-//! protected-resource metadata, which points at an authorization server, which
-//! we register with dynamically and then drive through a loopback PKCE flow.
+//! Protected-resource metadata binds discovery to the requested MCP resource.
+//! Validated RFC 8414 metadata (or OpenID discovery) supplies endpoints. Login
+//! uses public dynamic registration, an ephemeral loopback callback, state and
+//! PKCE S256. Only explicit `login` opens a browser. Background access merely
+//! reads or refreshes credentials, including tokens rejected before expiry.
 //!
-//! Memory notes: nothing here is cached in process beyond the small token
-//! struct held by the owning transport. Metadata documents are parsed into
-//! `Option<String>` fields and dropped immediately.
+//! All network requests refuse redirects. HTTPS is required, with a development
+//! exception for loopback HTTP when the MCP resource itself is loopback. Remote
+//! metadata cannot opt into that exception. Credentials live in an atomically
+//! replaced owner-only file, without backups, with a separate cross-process lock.
 
-use super::protocol::McpOAuthConfig;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Persisted credentials for one remote MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpOAuthTokens {
-    pub access_token: String,
+const STORE_FILE: &str = "mcp-oauth.json";
+const STORE_VERSION: u32 = 1;
+const EXPIRY_SKEW_SECS: i64 = 60;
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_JSON_BYTES: usize = 1024 * 1024;
+const MAX_CALLBACK_BYTES: usize = 16 * 1024;
+
+/// One server's OAuth state. `Debug` deliberately does not expose credentials.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredOAuth {
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    pub token_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
-    /// Unix seconds. 0 means "no known expiry".
+    /// Unix seconds; `None` means the server did not report an expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+}
+
+impl std::fmt::Debug for StoredOAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredOAuth")
+            .field("has_access_token", &self.access_token.is_some())
+            .field("has_refresh_token", &self.refresh_token.is_some())
+            .field("has_client_secret", &self.client_secret.is_some())
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Secret-free state suitable for CLI/tool status output. No network requests.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OAuthStatus {
+    pub logged_in: bool,
+    pub access_token_fresh: bool,
+    pub can_refresh: bool,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Store {
+    version: u32,
     #[serde(default)]
-    pub expires_at: i64,
-    /// Client id issued by dynamic registration, reused across refreshes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_endpoint: Option<String>,
-    /// Redirect URI registered with the dynamic OAuth client.
-    ///
-    /// Dynamic clients are bound to their redirect URI. Reusing a stored
-    /// client id with a newly allocated loopback port makes Atlassian reject
-    /// the authorization request, often as an opaque internal server error.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub redirect_uri: Option<String>,
+    servers: BTreeMap<String, StoredOAuth>,
+    /// Logout tombstones prevent in-flight login/refresh from resurrecting tokens.
+    #[serde(default)]
+    generations: BTreeMap<String, u64>,
 }
 
-impl McpOAuthTokens {
-    pub fn is_expired(&self) -> bool {
-        self.expires_at > 0 && chrono::Utc::now().timestamp() >= self.expires_at - 60
-    }
+fn generation(store: &Store, key: &str) -> u64 {
+    store.generations.get(key).copied().unwrap_or(0)
 }
 
-/// Credentials live under `$JCODE_HOME` when set (tests and sandboxed runs),
-/// otherwise `~/.jcode`, matching the rest of jcode's credential storage.
-fn auth_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("JCODE_HOME") {
-        return PathBuf::from(home).join("mcp-auth");
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".jcode")
-        .join("mcp-auth")
-}
-
-/// File name is derived from the server name so several servers on one host
-/// keep separate credentials.
-fn token_path(server: &str) -> PathBuf {
-    let safe: String = server
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    auth_dir().join(format!("{safe}.json"))
-}
-
-pub fn load_tokens(server: &str) -> Option<McpOAuthTokens> {
-    let data = std::fs::read_to_string(token_path(server)).ok()?;
-    serde_json::from_str(&data).ok()
-}
-
-pub fn save_tokens(server: &str, tokens: &McpOAuthTokens) -> Result<()> {
-    let path = token_path(server);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string(tokens)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+fn advance_generation(store: &mut Store, key: &str) -> Result<()> {
+    let next = generation(store, key)
+        .checked_add(1)
+        .context("OAuth credential revision overflow")?;
+    store.generations.insert(key.to_string(), next);
     Ok(())
 }
 
-pub fn clear_tokens(server: &str) {
-    let _ = std::fs::remove_file(token_path(server));
+/// Canonical storage/resource key, without query, fragment or userinfo.
+/// Invalid URLs have no key. Public credential APIs additionally validate URLs.
+pub fn canonical_resource(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url.trim()) else {
+        return String::new();
+    };
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    if parsed.set_username("").is_err() || parsed.set_password(None).is_err() {
+        // Opaque URLs cannot be safely canonicalized as an HTTP resource.
+        return String::new();
+    }
+    parsed.to_string().trim_end_matches('/').to_string()
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct ProtectedResourceMetadata {
-    #[serde(default)]
-    authorization_servers: Vec<String>,
-    /// The resource server may advertise the scopes its authorization request
-    /// must include. Atlassian's authv2 endpoint publishes the Jira work
-    /// scopes here, while its authorization-server metadata omits
-    /// `scopes_supported`. Ignoring this field causes Atlassian to mint the
-    /// narrower agent-interface grant, which then fails Jira data tools with
-    /// "Unauthorized; scope does not match".
-    #[serde(default)]
-    scopes_supported: Vec<String>,
+fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct AuthServerMetadata {
-    #[serde(default)]
-    authorization_endpoint: Option<String>,
-    #[serde(default)]
-    token_endpoint: Option<String>,
-    #[serde(default)]
-    registration_endpoint: Option<String>,
-    /// Scopes the server advertises. Some servers (Semrush) reject or
-    /// downgrade requests that ask for no scope at all.
-    #[serde(default)]
-    scopes_supported: Vec<String>,
+fn checked_url(value: &str, allow_loopback: bool) -> Result<url::Url> {
+    // Never include the supplied URL in errors: its query may be a credential.
+    let parsed = url::Url::parse(value).map_err(|_| anyhow::anyhow!("invalid OAuth URL"))?;
+    if parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("OAuth URLs must be absolute and must not contain userinfo or fragments");
+    }
+    if is_loopback(&parsed) && !allow_loopback {
+        bail!("remote OAuth metadata must not target loopback endpoints");
+    }
+    if parsed.scheme() != "https"
+        && !(allow_loopback && parsed.scheme() == "http" && is_loopback(&parsed))
+    {
+        bail!("OAuth requires HTTPS, except for explicitly configured loopback resources");
+    }
+    Ok(parsed)
 }
 
-#[derive(Debug, Deserialize)]
-struct RegistrationResponse {
-    client_id: String,
+/// Validate an MCP OAuth resource before login or credential access. HTTP is
+/// accepted only for literal loopback addresses or `localhost`, not LAN hosts.
+pub fn validate_mcp_url(url: &str) -> Result<()> {
+    checked_url(url, true).map(|_| ())
 }
 
-#[derive(Debug, Deserialize)]
+fn allow_loopback(url: &str) -> Result<bool> {
+    Ok(is_loopback(&checked_url(url, true)?))
+}
+
+fn store_path() -> Result<PathBuf> {
+    Ok(crate::storage::jcode_dir()?.join(STORE_FILE))
+}
+
+fn private_directory(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path).context("could not create OAuth credential directory")?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("OAuth credential directory must be a real directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("OAuth credential directory is not owned by the current user");
+        }
+    }
+    jcode_core::fs::set_directory_permissions_owner_only(path)
+        .context("could not secure OAuth credential directory")
+}
+
+fn secure_file(file: &File, _path: &Path) -> Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        bail!("OAuth credential path must be a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+            bail!("OAuth credential file must be owned by this user and not hard-linked");
+        }
+        // Repair legacy permissive files through the already-open descriptor.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    jcode_core::fs::set_permissions_owner_only(_path)?;
+    Ok(())
+}
+
+fn secret_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    options
+}
+
+fn load_store_at(path: &Path) -> Result<Store> {
+    // Windows has no O_NOFOLLOW. Reject obvious symlinks before opening there.
+    #[cfg(not(unix))]
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        bail!("OAuth credential file must not be a symlink");
+    }
+    let mut file = match secret_options().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Store {
+                version: STORE_VERSION,
+                ..Default::default()
+            });
+        }
+        Err(_) => bail!("could not open OAuth credential store"),
+    };
+    secure_file(&file, path)?;
+    if file.metadata()?.len() > MAX_JSON_BYTES as u64 {
+        bail!("OAuth credential store is too large");
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_JSON_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_JSON_BYTES {
+        bail!("OAuth credential store is too large");
+    }
+    let store: Store = serde_json::from_slice(&bytes).map_err(|_| {
+        anyhow::anyhow!("OAuth credential store is invalid; refusing to overwrite it")
+    })?;
+    if store.version != STORE_VERSION {
+        bail!("unsupported OAuth credential store version");
+    }
+    Ok(store)
+}
+
+fn load_store() -> Result<Store> {
+    load_store_at(&store_path()?)
+}
+
+fn save_store_at(path: &Path, store: &Store) -> Result<()> {
+    let parent = path.parent().context("OAuth store has no directory")?;
+    private_directory(parent)?;
+    // The general storage writer keeps .bak copies. OAuth must not leave old
+    // refresh tokens or logged-out credentials in such a backup.
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    jcode_core::fs::set_permissions_owner_only(temp.path())?;
+    let bytes = serde_json::to_vec(store)?;
+    if bytes.len() > MAX_JSON_BYTES {
+        bail!("OAuth credential store is too large");
+    }
+    temp.write_all(&bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map_err(|_| anyhow::anyhow!("could not replace OAuth credential store"))?;
+    let backup = path.with_extension("bak");
+    match std::fs::remove_file(backup) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => bail!("could not remove legacy OAuth credential backup"),
+    }
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn open_store_lock(path: &Path) -> Result<File> {
+    open_lock_file(&path.with_extension("lock"))
+}
+
+fn open_lock_file(lock_path: &Path) -> Result<File> {
+    private_directory(lock_path.parent().context("OAuth lock has no directory")?)?;
+    #[cfg(not(unix))]
+    if let Ok(meta) = std::fs::symlink_metadata(lock_path)
+        && meta.file_type().is_symlink()
+    {
+        bail!("OAuth lock must not be a symlink");
+    }
+    let lock = secret_options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(lock_path)
+        .context("could not open OAuth credential lock")?;
+    secure_file(&lock, lock_path)?;
+    Ok(lock)
+}
+
+async fn lock_store(path: &Path) -> Result<File> {
+    wait_lock(open_store_lock(path)?).await
+}
+
+async fn lock_refresh(path: &Path, resource: &str) -> Result<File> {
+    let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(resource.as_bytes()));
+    let lock_path = path.with_file_name(format!("mcp-oauth-refresh-{digest}.lock"));
+    wait_lock(open_lock_file(&lock_path)?).await
+}
+
+async fn wait_lock(file: File) -> Result<File> {
+    tokio::time::timeout(STORE_LOCK_TIMEOUT, async {
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(()),
+                Err(TryLockError::WouldBlock) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                Err(TryLockError::Error(_)) => bail!("could not lock OAuth credential store"),
+            }
+        }
+    })
+    .await
+    .context("timed out locking OAuth credential store")??;
+    // Dropping the handle releases the lock, including on future cancellation.
+    Ok(file)
+}
+
+fn checked_stored(url: &str) -> Result<Option<StoredOAuth>> {
+    validate_mcp_url(url)?;
+    Ok(load_store()?.servers.get(&canonical_resource(url)).cloned())
+}
+
+/// Compatibility accessor. Use `status` when a malformed/unreadable store must
+/// be distinguished from being logged out. Never print this object's fields.
+pub fn stored(url: &str) -> Option<StoredOAuth> {
+    match checked_stored(url) {
+        Ok(entry) => entry,
+        Err(_) => {
+            // Do not log URL or store contents, both may contain credentials.
+            crate::logging::warn(
+                "Cannot read stored MCP OAuth credentials; use OAuth status for details",
+            );
+            None
+        }
+    }
+}
+
+pub fn status(url: &str) -> Result<OAuthStatus> {
+    let Some(entry) = checked_stored(url)? else {
+        return Ok(OAuthStatus::default());
+    };
+    Ok(OAuthStatus {
+        logged_in: entry.access_token.is_some() || entry.refresh_token.is_some(),
+        access_token_fresh: is_fresh(&entry),
+        can_refresh: entry.refresh_token.is_some(),
+        expires_at: entry.expires_at,
+    })
+}
+
+/// Forget stored credentials. Local deletion does not revoke provider tokens.
+/// A concurrent refresh/login causes a retryable error, never credential
+/// resurrection or blocking a single-threaded async runtime on its own refresh.
+pub fn logout(url: &str) -> Result<bool> {
+    validate_mcp_url(url)?;
+    let path = store_path()?;
+    let file = open_store_lock(&path)?;
+    file.try_lock()
+        .map_err(|_| anyhow::anyhow!("OAuth credential store is busy; retry logout"))?;
+    let mut store = load_store_at(&path)?;
+    let key = canonical_resource(url);
+    let removed = store.servers.remove(&key).is_some();
+    advance_generation(&mut store, &key)?;
+    // Also removes a legacy backup even when the primary has no such entry.
+    save_store_at(&path, &store)?;
+    Ok(removed)
+}
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn is_fresh(entry: &StoredOAuth) -> bool {
+    entry
+        .access_token
+        .as_deref()
+        .is_some_and(|token| !token.is_empty())
+        && entry
+            .expires_at
+            .is_none_or(|exp| exp.saturating_sub(EXPIRY_SKEW_SECS) > now_secs())
+}
+
+/// Current token, refreshing when near expiry. Known-expired credentials are
+/// never returned without a successful refresh. Never opens a browser.
+pub async fn access_token(url: &str) -> Result<Option<String>> {
+    let Some(entry) = checked_stored(url)? else {
+        return Ok(None);
+    };
+    if is_fresh(&entry) {
+        return Ok(entry.access_token);
+    }
+    if entry.refresh_token.is_some() {
+        return refresh(url, RefreshReason::Expired).await;
+    }
+    Ok(entry
+        .access_token
+        .filter(|token| !token.is_empty() && entry.expires_at.is_none_or(|exp| exp > now_secs())))
+}
+
+/// A 401 overrides the expiry hint. Under the cross-process lock, reuse a token
+/// only if it differs from the rejected one and is fresh, otherwise force a
+/// refresh. `Ok(None)` means login is needed. Never retries the rejected token.
+pub async fn token_after_unauthorized(url: &str, failed: Option<&str>) -> Result<Option<String>> {
+    refresh(url, RefreshReason::Rejected(failed.map(str::to_owned))).await
+}
+
+enum RefreshReason {
+    Expired,
+    Rejected(Option<String>),
+}
+
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
+    token_type: String,
     #[serde(default)]
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
-/// Build the `scope` value to request from the advertised list.
-///
-/// Returns `None` when the server advertises nothing, so servers that reject an
-/// explicit scope keep working unchanged.
-fn requested_scope(supported: &[String]) -> Option<String> {
-    if supported.is_empty() {
-        return None;
+fn apply_token(entry: &mut StoredOAuth, token: TokenResponse) -> Result<()> {
+    if !token.token_type.eq_ignore_ascii_case("Bearer")
+        || token.access_token.is_empty()
+        || token
+            .access_token
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || token.refresh_token.as_deref().is_some_and(str::is_empty)
+        || token.expires_in.is_some_and(|secs| secs < 0)
+    {
+        bail!("token endpoint returned invalid bearer credentials");
     }
-    // `offline` and `offline_access` are synonyms across providers; asking for
-    // both can be rejected, so take whichever this server lists first.
-    let mut scopes: Vec<&str> = Vec::new();
-    let mut has_offline = false;
-    for scope in supported {
-        let is_offline = scope == "offline" || scope == "offline_access";
-        if is_offline {
-            if has_offline {
-                continue;
-            }
-            has_offline = true;
-        }
-        scopes.push(scope.as_str());
+    let expires_at = token
+        .expires_in
+        .map(|secs| {
+            now_secs()
+                .checked_add(secs)
+                .context("token endpoint returned invalid expiry")
+        })
+        .transpose()?;
+    entry.access_token = Some(token.access_token);
+    if token.refresh_token.is_some() {
+        entry.refresh_token = token.refresh_token;
     }
-    Some(scopes.join(" "))
-}
-
-/// Parse `resource_metadata="..."` out of a `WWW-Authenticate` header.
-pub fn resource_metadata_from_challenge(header: &str) -> Option<String> {
-    let idx = header.find("resource_metadata=")?;
-    let rest = &header[idx + "resource_metadata=".len()..];
-    let rest = rest.trim_start_matches('"');
-    let end = rest.find('"').unwrap_or(rest.len());
-    let value = rest[..end].trim_end_matches(',').trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
+    entry.expires_at = expires_at;
+    if token.scope.is_some() {
+        entry.scope = token.scope;
     }
+    Ok(())
 }
 
-fn well_known(base: &url::Url, suffix: &str) -> String {
-    let mut u = base.clone();
-    // OAuth issuers are allowed to include a tenant or authorization-server
-    // path. Atlassian uses exactly that shape, for example
-    // `/VCeDsk8ZHncYF1g234fKtc4lNipbBhu3`. Replacing the path with the
-    // well-known suffix silently queries the provider root and makes a valid
-    // server look like it has no dynamic registration support.
-    let base_path = u.path().trim_end_matches('/');
-    let suffix = suffix.trim_start_matches('/');
-    let path = if base_path.is_empty() {
-        format!("/{suffix}")
-    } else {
-        format!("{base_path}/{suffix}")
-    };
-    u.set_path(&path);
-    u.set_query(None);
-    u.to_string()
-}
-
-async fn fetch_json<T: serde::de::DeserializeOwned>(
-    client: &reqwest::Client,
-    url: &str,
-) -> Option<T> {
-    let resp = client.get(url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
+async fn response_bytes(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_JSON_BYTES as u64)
+    {
+        bail!("OAuth response is too large");
     }
-    resp.json::<T>().await.ok()
-}
-
-/// Discover the authorization endpoints for a server URL, optionally guided by
-/// the `WWW-Authenticate` challenge the server returned.
-async fn discover(
-    client: &reqwest::Client,
-    server_url: &str,
-    challenge: Option<&str>,
-) -> Result<AuthServerMetadata> {
-    let base = url::Url::parse(server_url).context("Invalid MCP server URL")?;
-
-    let resource_metadata_url = challenge
-        .and_then(resource_metadata_from_challenge)
-        .unwrap_or_else(|| well_known(&base, "/.well-known/oauth-protected-resource"));
-
-    let resource_meta = fetch_json::<ProtectedResourceMetadata>(client, &resource_metadata_url)
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .unwrap_or_default();
-    let issuer = resource_meta
-        .authorization_servers
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| base.origin().ascii_serialization());
-    let resource_scopes = resource_meta.scopes_supported.clone();
+        .map_err(|_| anyhow::anyhow!("could not read OAuth response"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_JSON_BYTES {
+            bail!("OAuth response is too large");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
 
-    let issuer_url = url::Url::parse(&issuer).unwrap_or(base.clone());
+async fn post_token(
+    entry: &StoredOAuth,
+    resource: &str,
+    mut form: Vec<(&'static str, String)>,
+) -> Result<TokenResponse> {
+    let endpoint = checked_url(&entry.token_endpoint, allow_loopback(resource)?)?;
+    if entry
+        .resource
+        .as_deref()
+        .is_some_and(|stored| canonical_resource(stored) != canonical_resource(resource))
+    {
+        bail!("stored OAuth credentials belong to a different resource");
+    }
+    if entry.client_id.is_empty() {
+        bail!("stored OAuth client identifier is empty");
+    }
+    form.push(("client_id", entry.client_id.clone()));
+    // Legacy stored registrations may have used client_secret_post. New login
+    // explicitly registers a public client and never stores a returned secret.
+    if let Some(secret) = &entry.client_secret {
+        form.push(("client_secret", secret.clone()));
+    }
+    form.push((
+        "resource",
+        entry
+            .resource
+            .clone()
+            .unwrap_or_else(|| canonical_resource(resource)),
+    ));
+    let response = http_for(&endpoint)?
+        .post(endpoint)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("OAuth token request failed"))?;
+    let status = response.status();
+    if !status.is_success() {
+        // Do not echo a body, redirect Location, error_description or reqwest
+        // URL. Providers can reflect any of our secret form fields there.
+        bail!("OAuth token endpoint returned HTTP {status}; login may be required");
+    }
+    serde_json::from_slice(&response_bytes(response).await?)
+        .map_err(|_| anyhow::anyhow!("OAuth token endpoint returned invalid JSON"))
+}
 
-    for candidate in [
-        well_known(&issuer_url, "/.well-known/oauth-authorization-server"),
-        well_known(&issuer_url, "/.well-known/openid-configuration"),
-    ] {
-        if let Some(meta) = fetch_json::<AuthServerMetadata>(client, &candidate).await
-            && meta.authorization_endpoint.is_some()
-            && meta.token_endpoint.is_some()
-        {
-            return Ok(AuthServerMetadata {
-                scopes_supported: if meta.scopes_supported.is_empty() {
-                    resource_scopes.clone()
-                } else {
-                    meta.scopes_supported
-                },
-                ..meta
-            });
+async fn refresh(url: &str, reason: RefreshReason) -> Result<Option<String>> {
+    validate_mcp_url(url)?;
+    if checked_stored(url)?.is_none() {
+        return Ok(None);
+    }
+    let path = store_path()?;
+    let key = canonical_resource(url);
+    // Only async refreshers take this per-resource lock. Sync logout never
+    // waits on it, and the transaction lock is not held over network I/O.
+    let _refresh_guard = lock_refresh(&path, &key).await?;
+    let (mut entry, revision) = {
+        let _transaction = lock_store(&path).await?;
+        let store = load_store_at(&path)?;
+        let Some(entry) = store.servers.get(&key).cloned() else {
+            return Ok(None);
+        };
+        let reuse = match &reason {
+            RefreshReason::Expired => is_fresh(&entry),
+            RefreshReason::Rejected(failed) => entry.access_token != *failed && is_fresh(&entry),
+        };
+        if reuse {
+            return Ok(entry.access_token);
+        }
+        (entry, generation(&store, &key))
+    };
+    let Some(refresh_token) = entry.refresh_token.clone() else {
+        return Ok(None);
+    };
+    let snapshot = entry.clone();
+    let token = post_token(
+        &entry,
+        url,
+        vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token),
+        ],
+    )
+    .await?;
+    apply_token(&mut entry, token)?;
+    let _transaction = lock_store(&path).await?;
+    let mut store = load_store_at(&path)?;
+    if generation(&store, &key) != revision || store.servers.get(&key) != Some(&snapshot) {
+        // Logout or a newer login won while the grant was in flight.
+        return Ok(store
+            .servers
+            .get(&key)
+            .filter(|current| is_fresh(current))
+            .and_then(|current| current.access_token.clone())
+            .filter(|current| match &reason {
+                RefreshReason::Rejected(failed) => Some(current) != failed.as_ref(),
+                RefreshReason::Expired => true,
+            }));
+    }
+    let access_token = entry
+        .access_token
+        .clone()
+        .filter(|_| entry.expires_at.is_none_or(|expiry| expiry > now_secs()));
+    store.servers.insert(key.clone(), entry);
+    advance_generation(&mut store, &key)?;
+    save_store_at(&path, &store)?;
+    if let RefreshReason::Rejected(failed) = reason
+        && access_token == failed
+    {
+        return Ok(None);
+    }
+    Ok(access_token)
+}
+
+fn http_for(endpoint: &url::Url) -> Result<reqwest::Client> {
+    if is_loopback(endpoint) {
+        return http();
+    }
+    static REMOTE_HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = REMOTE_HTTP.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(DISCOVERY_TIMEOUT)
+        .build()
+        .context("could not configure OAuth HTTP client")?;
+    Ok(REMOTE_HTTP.get_or_init(|| client).clone())
+}
+
+fn http() -> Result<reqwest::Client> {
+    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = HTTP.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        // Never proxy plaintext loopback credentials via environment proxies.
+        .no_proxy()
+        // Pin localhost rather than trusting a DNS lookup for this exception.
+        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .timeout(DISCOVERY_TIMEOUT)
+        .build()
+        .context("could not configure loopback OAuth HTTP client")?;
+    Ok(HTTP.get_or_init(|| client).clone())
+}
+
+// Discovery -----------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ProtectedResourceMetadata {
+    authorization_servers: Vec<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
+    resource: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthServerMetadata {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    #[serde(default)]
+    pub registration_endpoint: Option<String>,
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
+    #[serde(default)]
+    pub code_challenge_methods_supported: Option<Vec<String>>,
+    #[serde(default)]
+    pub authorization_response_iss_parameter_supported: bool,
+    #[serde(default)]
+    pub token_endpoint_auth_methods_supported: Option<Vec<String>>,
+}
+
+/// Parse parameters only from a Bearer challenge, respecting quoted commas and
+/// quoted-pair escaping, optional whitespace, and case-insensitive names. A
+/// duplicate requested parameter is ambiguous and is deliberately rejected.
+pub(crate) fn www_authenticate_param(header: &str, key: &str) -> Option<String> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in header.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if byte == b'"' {
+            quoted = !quoted;
+        }
+        if byte == b',' && !quoted {
+            chunks.push(&header[start..index]);
+            start = index + 1;
         }
     }
+    if quoted || escaped {
+        return None;
+    }
+    chunks.push(&header[start..]);
+    let mut bearer = false;
+    let mut found = None;
+    for chunk in chunks {
+        let mut item = chunk.trim();
+        let first_end = item
+            .find(|ch: char| ch.is_ascii_whitespace() || ch == '=')
+            .unwrap_or(item.len());
+        let first = &item[..first_end];
+        let rest = item[first_end..].trim_start();
+        if !rest.starts_with('=') {
+            bearer = first.eq_ignore_ascii_case("Bearer");
+            item = rest;
+        }
+        if !bearer {
+            continue;
+        }
+        let Some((name, value)) = item.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case(key) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        let value = value.trim();
+        let decoded = if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+        {
+            let mut decoded = String::new();
+            let mut chars = inner.chars();
+            while let Some(ch) = chars.next() {
+                decoded.push(if ch == '\\' { chars.next()? } else { ch });
+            }
+            decoded
+        } else {
+            if value.is_empty()
+                || value
+                    .chars()
+                    .any(|ch| ch.is_ascii_whitespace() || ch == '"')
+            {
+                return None;
+            }
+            value.to_string()
+        };
+        found = Some(decoded);
+    }
+    found
+}
 
-    // Fall back to the conventional endpoint layout.
-    Ok(AuthServerMetadata {
-        authorization_endpoint: Some(well_known(&issuer_url, "/authorize")),
-        token_endpoint: Some(well_known(&issuer_url, "/token")),
-        registration_endpoint: Some(well_known(&issuer_url, "/register")),
-        scopes_supported: resource_scopes,
+/// Protected-resource metadata tries path-specific discovery, then the origin.
+fn well_known(base: &url::Url, suffix: &str) -> Vec<String> {
+    let origin = base.origin().ascii_serialization();
+    let path = base.path().trim_end_matches('/');
+    let mut urls = Vec::new();
+    if !path.is_empty() {
+        urls.push(format!("{origin}/.well-known/{suffix}{path}"));
+    }
+    urls.push(format!("{origin}/.well-known/{suffix}"));
+    urls
+}
+
+fn auth_metadata_urls(issuer: &url::Url) -> Vec<String> {
+    let origin = issuer.origin().ascii_serialization();
+    let path = issuer.path().trim_end_matches('/');
+    let mut urls = vec![
+        format!("{origin}/.well-known/oauth-authorization-server{path}"),
+        format!("{origin}/.well-known/openid-configuration{path}"),
+    ];
+    if !path.is_empty() {
+        urls.push(format!("{origin}{path}/.well-known/openid-configuration"));
+    }
+    urls
+}
+
+async fn get_json<T: for<'de> Deserialize<'de>>(value: &str, local: bool) -> Result<Option<T>> {
+    let endpoint = checked_url(value, local)?;
+    let response = http_for(&endpoint)?
+        .get(endpoint)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("OAuth metadata request failed"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND
+        || response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+    {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        bail!(
+            "OAuth metadata endpoint returned HTTP {}",
+            response.status()
+        );
+    }
+    serde_json::from_slice(&response_bytes(response).await?)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("OAuth metadata endpoint returned invalid JSON"))
+}
+
+fn validate_auth_metadata(meta: &AuthServerMetadata, issuer: &str, local: bool) -> Result<()> {
+    if meta.issuer != issuer {
+        bail!("OAuth metadata issuer does not match the discovered issuer");
+    }
+    checked_url(&meta.authorization_endpoint, local)?;
+    checked_url(&meta.token_endpoint, local)?;
+    if let Some(endpoint) = &meta.registration_endpoint {
+        checked_url(endpoint, local)?;
+    }
+    // The 2025-06-18 baseline predates mandatory capability advertisement, so
+    // absence is compatible. An explicit list excluding S256 is not.
+    if meta
+        .code_challenge_methods_supported
+        .as_ref()
+        .is_some_and(|methods| !methods.iter().any(|method| method == "S256"))
+    {
+        bail!("authorization server does not support PKCE S256");
+    }
+    Ok(())
+}
+
+struct Discovery {
+    auth_server: AuthServerMetadata,
+    scope: Option<String>,
+    resource: String,
+    local: bool,
+}
+
+async fn discover(mcp_url: &str) -> Result<Discovery> {
+    let parsed = checked_url(mcp_url, true)?;
+    let local = is_loopback(&parsed);
+    let resource = canonical_resource(mcp_url);
+    let probe = http_for(&parsed)?
+        .post(parsed.clone())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .body(r#"{"jsonrpc":"2.0","id":0,"method":"ping"}"#)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("MCP OAuth discovery probe failed"))?;
+    if probe.status().is_redirection() {
+        bail!("MCP OAuth discovery refuses redirects");
+    }
+    let challenges = if probe.status() == reqwest::StatusCode::UNAUTHORIZED {
+        probe
+            .headers()
+            .get_all(reqwest::header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|header| header.to_str().map(str::to_owned))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("OAuth challenge header is not valid text")?
+    } else {
+        Vec::new()
+    };
+    let mut scope = challenges
+        .iter()
+        .find_map(|header| www_authenticate_param(header, "scope"));
+    let advertised = challenges
+        .iter()
+        .find_map(|header| www_authenticate_param(header, "resource_metadata"));
+    let prm_urls = advertised
+        .map(|url| vec![url])
+        .unwrap_or_else(|| well_known(&parsed, "oauth-protected-resource"));
+    let mut prm = None;
+    for endpoint in prm_urls {
+        if let Some(meta) = get_json::<ProtectedResourceMetadata>(&endpoint, local).await? {
+            let resource_url = checked_url(&meta.resource, local)?;
+            if resource_url.query().is_some() || canonical_resource(&meta.resource) != resource {
+                bail!("OAuth protected-resource metadata does not match the MCP resource");
+            }
+            if meta.authorization_servers.is_empty() {
+                bail!("OAuth resource metadata has no authorization servers");
+            }
+            prm = Some(meta);
+            break;
+        }
+    }
+    let prm = prm.context("MCP server does not publish OAuth protected-resource metadata")?;
+    if scope.is_none() && !prm.scopes_supported.is_empty() {
+        scope = Some(prm.scopes_supported.join(" "));
+    }
+    let issuer = &prm.authorization_servers[0];
+    let issuer_url = checked_url(issuer, local)?;
+    if issuer_url.query().is_some() {
+        bail!("OAuth issuer must not contain a query");
+    }
+    let mut auth_server = None;
+    for endpoint in auth_metadata_urls(&issuer_url) {
+        if let Some(meta) = get_json::<AuthServerMetadata>(&endpoint, local).await? {
+            validate_auth_metadata(&meta, issuer, local)?;
+            auth_server = Some(meta);
+            break;
+        }
+    }
+    Ok(Discovery {
+        auth_server: auth_server.context("authorization server does not publish OAuth metadata")?,
+        scope,
+        resource: prm.resource,
+        local,
     })
 }
 
-/// Run the full browser-based authorization code flow for a remote MCP server.
-pub async fn authorize(
-    server_name: &str,
-    server_url: &str,
-    challenge_header: Option<&str>,
-    oauth_config: Option<&McpOAuthConfig>,
-    no_browser: bool,
-) -> Result<McpOAuthTokens> {
-    authorize_with_opener(
-        server_name,
-        server_url,
-        challenge_header,
-        oauth_config,
-        move |url| {
-            // Test hook: fetch the authorization URL instead of handing it to a
-            // real browser, so automated runs can exercise the whole flow.
-            if std::env::var_os("JCODE_MCP_AUTH_AUTOFOLLOW").is_some() {
-                let url = url.to_string();
-                tokio::spawn(async move {
-                    let _ = reqwest::get(&url).await;
-                });
-                return;
-            }
-            if !no_browser {
-                // Do not wait on the browser process. On macOS, `open::that`
-                // can inherit the MCP transport's lifetime and leave the
-                // authorization flow looking stalled even though no visible
-                // prompt was opened. The detached variant returns immediately
-                // and lets the system browser own the OAuth tab.
-                let _ = open::that_detached(url);
-            }
-        },
-    )
-    .await
+// Login ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RegistrationResponse {
+    client_id: String,
+    #[serde(default)]
+    token_endpoint_auth_method: Option<String>,
 }
 
-/// Same as [`authorize`], but the caller decides how the authorization URL is
-/// presented. Tests substitute a fake user-agent for the system browser, which
-/// lets the whole 401 -> discovery -> registration -> token flow be exercised.
-pub async fn authorize_with_opener<F>(
-    server_name: &str,
-    server_url: &str,
-    challenge_header: Option<&str>,
-    oauth_config: Option<&McpOAuthConfig>,
-    open_url: F,
-) -> Result<McpOAuthTokens>
-where
-    F: FnOnce(&str) + Send + 'static,
-{
-    let client = super::http::shared_client();
-    let meta = discover(&client, server_url, challenge_header).await?;
-    let authorization_endpoint = oauth_config
-        .and_then(|config| config.authorization_endpoint.clone())
-        .or(meta.authorization_endpoint)
-        .context("Authorization server did not advertise an authorization_endpoint")?;
-    let token_endpoint = oauth_config
-        .and_then(|config| config.token_endpoint.clone())
-        .or(meta.token_endpoint)
-        .context("Authorization server did not advertise a token_endpoint")?;
-
-    // A configured scope list is required for providers such as Google that do
-    // not expose scopes through MCP metadata. Otherwise request only the scopes
-    // the authorization server advertises.
-    let scope = oauth_config
-        .filter(|config| !config.scopes.is_empty())
-        .map(|config| config.scopes.join(" "))
-        .or_else(|| requested_scope(&meta.scopes_supported));
-
-    // Bind the callback before opening the browser. A fixed URI is useful for
-    // OAuth web clients that require an exact redirect registration.
-    let saved_redirect_uri = load_tokens(server_name).and_then(|tokens| tokens.redirect_uri);
-    let (listener, redirect_uri) = if let Some(configured) = oauth_config
-        .and_then(|config| config.redirect_uri.as_deref())
-        .or(saved_redirect_uri.as_deref())
+async fn register_client(
+    endpoint: &str,
+    redirect_uri: &str,
+    local: bool,
+) -> Result<RegistrationResponse> {
+    let endpoint = checked_url(endpoint, local)?;
+    let body = serde_json::json!({
+        "client_name": "jcode",
+        "client_uri": "https://github.com/1jehuang/jcode",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    });
+    let response = http_for(&endpoint)?
+        .post(endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("OAuth client registration request failed"))?;
+    if !response.status().is_success() {
+        bail!(
+            "OAuth client registration returned HTTP {}",
+            response.status()
+        );
+    }
+    let client: RegistrationResponse = serde_json::from_slice(&response_bytes(response).await?)
+        .map_err(|_| anyhow::anyhow!("OAuth client registration returned invalid JSON"))?;
+    if client.client_id.is_empty()
+        || client
+            .token_endpoint_auth_method
+            .as_deref()
+            .is_some_and(|method| method != "none")
     {
-        let redirect = url::Url::parse(configured).context("Invalid OAuth redirect_uri")?;
-        if redirect.scheme() != "http"
-            || !matches!(redirect.host_str(), Some("127.0.0.1" | "localhost"))
-            || redirect.query().is_some()
-            || redirect.fragment().is_some()
+        bail!("OAuth registration did not provide a public client");
+    }
+    Ok(client)
+}
+
+fn pkce_pair() -> (String, String) {
+    let bytes: [u8; 32] = rand::random();
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+pub enum BrowserMode {
+    Open,
+    Print,
+}
+
+// Invalid local requests are ignored, including error callbacks with the wrong
+// state. Bound method, callback path, duplicate fields and optional RFC 9207
+// issuer checks to this flow before interpreting any provider response.
+fn callback_result(target: &str, state: &str, meta: &AuthServerMetadata) -> Result<Option<String>> {
+    if !target.starts_with("/callback?") {
+        return Ok(None);
+    }
+    let callback = url::Url::parse(&format!("http://127.0.0.1{target}"))
+        .map_err(|_| anyhow::anyhow!("invalid OAuth callback"))?;
+    if callback.path() != "/callback" || callback.fragment().is_some() {
+        return Ok(None);
+    }
+    let mut values = BTreeMap::new();
+    for (key, value) in callback.query_pairs() {
+        if matches!(key.as_ref(), "state" | "code" | "error" | "iss")
+            && values
+                .insert(key.into_owned(), value.into_owned())
+                .is_some()
         {
-            anyhow::bail!("OAuth redirect_uri must be a query-free loopback HTTP URL");
+            return Ok(None);
         }
-        let host = redirect.host_str().unwrap_or("127.0.0.1");
-        let port = redirect
-            .port()
-            .context("OAuth redirect_uri must include a port")?;
-        let listener = tokio::net::TcpListener::bind((host, port))
-            .await
-            .context("Failed to bind configured OAuth callback listener")?;
-        (listener, configured.to_string())
-    } else {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .context("Failed to bind OAuth callback listener")?;
-        let port = listener.local_addr()?.port();
-        (listener, format!("http://127.0.0.1:{port}/callback"))
-    };
-
-    let client_id = oauth_config
-        .and_then(|config| config.client_id.clone())
-        // A dynamically registered client is bound to the redirect URI used
-        // during registration. Only reuse it when we also persisted that URI.
-        .or_else(|| {
-            load_tokens(server_name).and_then(|t| {
-                t.redirect_uri
-                    .filter(|registered| registered == &redirect_uri)
-                    .and(t.client_id)
-            })
-        })
-        .unwrap_or_else(|| {
-            // This sentinel is replaced below for dynamic registration. Keeping
-            // the branch explicit avoids accidentally registering when a static
-            // provider configuration is incomplete.
-            String::new()
-        });
-    let client_secret = oauth_config.and_then(|config| config.client_secret.clone());
-    let client_id = if !client_id.is_empty() {
-        client_id
-    } else {
-        let registration_endpoint = meta
-            .registration_endpoint
-            .context("Server requires OAuth but supports no dynamic client registration")?;
-        let body = serde_json::json!({
-            "client_name": "jcode",
-            "redirect_uris": [redirect_uri],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "none",
-            "scope": scope.clone().unwrap_or_default(),
-        });
-        let resp = client
-            .post(&registration_endpoint)
-            .json(&body)
-            .send()
-            .await
-            .context("Dynamic client registration failed")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::FORBIDDEN {
-                anyhow::bail!(
-                    "Dynamic client registration rejected (403): the OAuth provider does not allow this MCP client; Figma remote MCP currently requires an approved client integration"
-                );
-            }
-            anyhow::bail!(
-                "Dynamic client registration rejected ({}): {}",
-                status.as_u16(),
-                detail.chars().take(200).collect::<String>()
-            );
+    }
+    if values.get("state").map(String::as_str) != Some(state) {
+        return Ok(None);
+    }
+    match values.get("iss") {
+        Some(issuer) if issuer != &meta.issuer => bail!("OAuth callback issuer mismatch"),
+        None if meta.authorization_response_iss_parameter_supported => {
+            bail!("OAuth callback missing issuer")
         }
-        resp.json::<RegistrationResponse>().await?.client_id
-    };
-
-    let (verifier, code_challenge) = crate::auth::oauth::generate_pkce_public();
-    let state = crate::auth::oauth::generate_state_public();
-
-    let mut auth_url = url::Url::parse(&authorization_endpoint)?;
-    auth_url
-        .query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", &client_id)
-        .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("code_challenge", &code_challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("state", &state)
-        .append_pair("resource", server_url);
-    // Google access tokens are short-lived. Request offline access so the
-    // first interactive login also gives us a refresh token instead of
-    // reopening a browser every hour. Providers that ignore these standard
-    // parameters simply continue to receive the normal authorization request.
-    auth_url
-        .query_pairs_mut()
-        .append_pair("access_type", "offline");
-    if load_tokens(server_name)
-        .as_ref()
-        .is_some_and(|tokens| tokens.refresh_token.is_none())
-    {
-        // An existing grant may otherwise omit a refresh token. This is only
-        // reached when re-authorizing an already-expired, non-refreshable
-        // credential, so consent is not part of the normal request path.
-        auth_url.query_pairs_mut().append_pair("prompt", "consent");
+        _ => (),
     }
-    if let Some(scope) = &scope {
-        auth_url.query_pairs_mut().append_pair("scope", scope);
+    if values.contains_key("error") {
+        bail!("OAuth authorization was denied or cancelled");
     }
-
-    let auth_url = auth_url.to_string();
-    crate::terminal_eprintln!(
-        "\nAuthorize the MCP server '{server_name}' in your browser. If it did not open, visit:\n{auth_url}\n"
-    );
-    // Hand the URL over only after the listener is bound, so a fast responder
-    // (a test's fake browser) cannot beat us to the callback.
-    open_url(&auth_url);
-
-    let code = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        crate::auth::oauth::wait_for_callback_async_on_listener(listener, &state),
-    )
-    .await
-    .context("Timed out waiting for MCP OAuth callback")??;
-
-    let mut params = vec![
-        ("grant_type", "authorization_code"),
-        ("code", code.as_str()),
-        ("redirect_uri", redirect_uri.as_str()),
-        ("client_id", client_id.as_str()),
-        ("code_verifier", verifier.as_str()),
-        ("resource", server_url),
-    ];
-    if let Some(scope) = scope.as_deref() {
-        params.push(("scope", scope));
-    }
-    if let Some(secret) = client_secret.as_deref() {
-        params.push(("client_secret", secret));
-    }
-    let resp = client
-        .post(&token_endpoint)
-        .form(&params)
-        .send()
-        .await
-        .context("Token exchange request failed")?;
-    if !resp.status().is_success() {
-        anyhow::bail!("Token exchange failed ({})", resp.status().as_u16());
-    }
-    let token: TokenResponse = resp.json().await?;
-
-    let tokens = McpOAuthTokens {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        expires_at: token
-            .expires_in
-            .map(|secs| chrono::Utc::now().timestamp() + secs)
-            .unwrap_or(0),
-        client_id: Some(client_id),
-        token_endpoint: Some(token_endpoint),
-        redirect_uri: Some(redirect_uri),
-    };
-    save_tokens(server_name, &tokens)?;
-    Ok(tokens)
+    Ok(values.remove("code").filter(|code| !code.is_empty()))
 }
 
-/// Refresh an access token in place. Returns `None` when refresh is impossible
-/// so the caller can fall back to a full browser flow.
-pub async fn refresh(
-    server_name: &str,
-    tokens: &McpOAuthTokens,
-    oauth_config: Option<&McpOAuthConfig>,
-) -> Option<McpOAuthTokens> {
-    let refresh_token = tokens.refresh_token.as_deref()?;
-    let token_endpoint = tokens.token_endpoint.as_deref()?;
-    let client_id = tokens.client_id.as_deref()?;
-
-    let mut params = vec![
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", client_id),
-    ];
-    if let Some(secret) = oauth_config.and_then(|config| config.client_secret.as_deref()) {
-        params.push(("client_secret", secret));
+async fn callback_request(stream: &mut tokio::net::TcpStream) -> Result<Option<String>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let count = stream.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(None);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.len() > MAX_CALLBACK_BYTES {
+            return Ok(None);
+        }
+        if bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+            break;
+        }
     }
-    let resp = super::http::shared_client()
-        .post(token_endpoint)
-        .form(&params)
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let token: TokenResponse = resp.json().await.ok()?;
-    let refreshed = McpOAuthTokens {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token.or_else(|| tokens.refresh_token.clone()),
-        expires_at: token
-            .expires_in
-            .map(|secs| chrono::Utc::now().timestamp() + secs)
-            .unwrap_or(0),
-        client_id: tokens.client_id.clone(),
-        token_endpoint: tokens.token_endpoint.clone(),
-        redirect_uri: tokens.redirect_uri.clone(),
+    let Some(line) = bytes.split(|byte| *byte == b'\n').next() else {
+        return Ok(None);
     };
-    let _ = save_tokens(server_name, &refreshed);
-    Some(refreshed)
+    let Ok(line) = std::str::from_utf8(line) else {
+        return Ok(None);
+    };
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0] != "GET" || !matches!(parts[2], "HTTP/1.0" | "HTTP/1.1") {
+        return Ok(None);
+    }
+    Ok(Some(parts[1].to_owned()))
+}
+
+async fn wait_for_callback(
+    listener: tokio::net::TcpListener,
+    state: &str,
+    meta: &AuthServerMetadata,
+) -> Result<String> {
+    use tokio::io::AsyncWriteExt;
+    loop {
+        let (mut stream, peer) = listener.accept().await?;
+        if !peer.ip().is_loopback() {
+            continue;
+        }
+        let target =
+            tokio::time::timeout(Duration::from_secs(2), callback_request(&mut stream)).await;
+        let result = match target {
+            Ok(Ok(Some(target))) => callback_result(&target, state, meta),
+            _ => Ok(None),
+        };
+        let success = matches!(&result, Ok(Some(_)));
+        let (status, body) = if success {
+            ("200 OK", "Login complete. Return to jcode.")
+        } else {
+            ("400 Bad Request", "Invalid or unsuccessful OAuth callback.")
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        // The authorization code remains valid even if the browser disconnects
+        // before receiving this cosmetic acknowledgement.
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            stream.write_all(response.as_bytes()),
+        )
+        .await
+        {
+            Ok(Ok(())) => (),
+            Ok(Err(_)) => crate::logging::debug("OAuth callback acknowledgement connection closed"),
+            Err(_) => crate::logging::debug("OAuth callback acknowledgement timed out"),
+        }
+        match result {
+            Ok(Some(code)) => return Ok(code),
+            Err(error) => return Err(error),
+            Ok(None) => (),
+        }
+    }
+}
+
+/// Explicit interactive login. `on_url` receives the authorization URL once it
+/// is ready, even in `Print` mode. Only this API can open a browser. The supplied
+/// URL contains state, so callers must show it intentionally, not log it.
+pub async fn login(mcp_url: &str, browser: BrowserMode, on_url: impl FnOnce(&str)) -> Result<()> {
+    validate_mcp_url(mcp_url)?;
+    let path = store_path()?;
+    let key = canonical_resource(mcp_url);
+    let initial_generation = generation(&load_store_at(&path)?, &key);
+    let discovery = discover(mcp_url).await?;
+    let listener = crate::auth::oauth::bind_callback_listener(0)
+        .context("could not bind OAuth loopback callback")?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}/callback",
+        listener.local_addr()?.port()
+    );
+    if discovery
+        .auth_server
+        .token_endpoint_auth_methods_supported
+        .as_ref()
+        .is_some_and(|methods| !methods.iter().any(|method| method == "none"))
+    {
+        bail!("authorization server does not support public OAuth clients");
+    }
+    let registration_endpoint = discovery.auth_server.registration_endpoint.as_deref()
+        .context("authorization server does not support dynamic registration; configure static authorization instead")?;
+    let client = register_client(registration_endpoint, &redirect_uri, discovery.local).await?;
+    let (verifier, challenge) = pkce_pair();
+    let state = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let mut auth_url = checked_url(
+        &discovery.auth_server.authorization_endpoint,
+        discovery.local,
+    )?;
+    // Metadata query parameters must not supply duplicates of our security
+    // fields. Preserve other endpoint parameters, e.g. provider tenant hints.
+    if auth_url.query_pairs().any(|(key, _)| {
+        matches!(
+            key.as_ref(),
+            "response_type"
+                | "client_id"
+                | "redirect_uri"
+                | "code_challenge"
+                | "code_challenge_method"
+                | "state"
+                | "resource"
+                | "scope"
+        )
+    }) {
+        bail!("authorization endpoint contains reserved OAuth parameters");
+    }
+    {
+        let mut query = auth_url.query_pairs_mut();
+        query
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &client.client_id)
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", &state)
+            .append_pair("resource", &discovery.resource);
+        if let Some(scope) = &discovery.scope {
+            query.append_pair("scope", scope);
+        }
+    }
+    let auth_url = auth_url.to_string();
+    on_url(&auth_url);
+    if matches!(browser, BrowserMode::Open) && open::that(&auth_url).is_err() {
+        // on_url already presented the URL, so manual opening still works.
+        crate::logging::warn(
+            "Could not open OAuth browser; open the displayed authorization URL manually",
+        );
+    }
+    let code = tokio::time::timeout(
+        LOGIN_TIMEOUT,
+        wait_for_callback(listener, &state, &discovery.auth_server),
+    )
+    .await
+    .context("timed out waiting for OAuth browser login")??;
+    let mut entry = StoredOAuth {
+        client_id: client.client_id,
+        token_endpoint: discovery.auth_server.token_endpoint,
+        scope: discovery.scope,
+        resource: Some(discovery.resource),
+        ..Default::default()
+    };
+    let token = post_token(
+        &entry,
+        mcp_url,
+        vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", verifier),
+        ],
+    )
+    .await?;
+    apply_token(&mut entry, token)?;
+    let _guard = lock_store(&path).await?;
+    let mut store = load_store_at(&path)?;
+    if generation(&store, &key) != initial_generation {
+        bail!("OAuth login was superseded by logout or a newer login; retry login");
+    }
+    store.servers.insert(key.clone(), entry);
+    advance_generation(&mut store, &key)?;
+    save_store_at(&path, &store)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_resource_metadata_from_challenge() {
-        let header = r#"Bearer error="invalid_token", resource_metadata="https://mcp.granola.ai/.well-known/oauth-protected-resource""#;
-        assert_eq!(
-            resource_metadata_from_challenge(header).as_deref(),
-            Some("https://mcp.granola.ai/.well-known/oauth-protected-resource")
-        );
-    }
-
-    #[test]
-    fn challenge_without_metadata_yields_none() {
-        assert!(resource_metadata_from_challenge("Bearer realm=\"mcp\"").is_none());
-    }
-
-    #[test]
-    fn well_known_preserves_issuer_path() {
-        let issuer =
-            url::Url::parse("https://auth.atlassian.com/VCeDsk8ZHncYF1g234fKtc4lNipbBhu3").unwrap();
-        assert_eq!(
-            well_known(&issuer, "/.well-known/oauth-authorization-server"),
-            "https://auth.atlassian.com/VCeDsk8ZHncYF1g234fKtc4lNipbBhu3/.well-known/oauth-authorization-server"
-        );
-    }
-
-    #[test]
-    fn no_advertised_scopes_means_no_scope_parameter() {
-        // Granola advertises "mcp" but some servers advertise nothing; sending
-        // an empty scope can be rejected, so omit it entirely.
-        assert_eq!(requested_scope(&[]), None);
-    }
-
-    #[test]
-    fn advertised_scopes_are_requested_verbatim() {
-        let scopes = ["mcp.access".to_string()];
-        assert_eq!(requested_scope(&scopes).as_deref(), Some("mcp.access"));
-    }
-
-    #[test]
-    fn protected_resource_scopes_can_supply_missing_authorization_scopes() {
-        let metadata: ProtectedResourceMetadata = serde_json::from_value(serde_json::json!({
-            "authorization_servers": ["https://auth.example/issuer"],
-            "scopes_supported": ["read:jira-work", "search:jira-work"]
-        }))
-        .unwrap();
-        assert_eq!(
-            requested_scope(&metadata.scopes_supported).as_deref(),
-            Some("read:jira-work search:jira-work")
-        );
-    }
-
-    #[test]
-    fn duplicate_offline_synonyms_are_collapsed() {
-        // Semrush advertises both `offline` and `offline_access`; requesting
-        // both can be rejected as an unknown scope combination.
-        let scopes = [
-            "offline_access".to_string(),
-            "offline".to_string(),
-            "mcp.access".to_string(),
-        ];
-        let requested = requested_scope(&scopes).expect("scope");
-        assert_eq!(requested, "offline_access mcp.access");
-        assert!(
-            !requested.split(' ').any(|s| s == "offline"),
-            "only one offline synonym should be requested: {requested}"
-        );
-    }
-
-    #[test]
-    fn expiry_uses_a_leading_skew() {
-        let mut tokens = McpOAuthTokens {
-            access_token: "a".into(),
-            refresh_token: None,
-            expires_at: 0,
-            client_id: None,
-            token_endpoint: None,
-            redirect_uri: None,
-        };
-        assert!(!tokens.is_expired(), "0 means unknown expiry, not expired");
-        tokens.expires_at = chrono::Utc::now().timestamp() + 10;
-        assert!(tokens.is_expired(), "within the 60s skew window");
-        tokens.expires_at = chrono::Utc::now().timestamp() + 600;
-        assert!(!tokens.is_expired());
-    }
-}
+#[path = "oauth_tests.rs"]
+mod tests;

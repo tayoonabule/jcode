@@ -1,4 +1,8 @@
-//! MCP management tool - connect, disconnect, list, reload MCP servers
+//! MCP management tool - stdio/remote connections and noninteractive OAuth management
+
+#[cfg(test)]
+#[path = "mcp_remote_management_tests.rs"]
+mod remote_management_tests;
 
 use crate::mcp::{ContentBlock, McpManager, McpServerConfig, dispatch_name};
 use crate::tool::{Tool, ToolContext, ToolOutput};
@@ -49,11 +53,120 @@ struct McpSearchResult {
 /// tool references, so an empty or broad query cannot pull in a whole catalog.
 const MAX_SEARCH_TOOL_REFERENCES: usize = 32;
 
-fn matches_mcp_query(query: &str, server: &str, name: &str, tool: &str, description: &str) -> bool {
-    let searchable = format!("{} {} {} {}", name, server, tool, description).to_ascii_lowercase();
-    query
-        .split_whitespace()
-        .all(|word| searchable.contains(word))
+/// Token budget for one `mcp_search` result. Descriptions and schemas are
+/// fitted to it adaptively: a narrow query keeps everything, a broad one
+/// trims long descriptions first, then drops schemas for lower matches.
+const SEARCH_TOKEN_BUDGET: usize = 6_000;
+
+/// Shortest a description is clipped to when fitting the search budget.
+const MIN_SEARCH_DESCRIPTION_CHARS: usize = 120;
+
+/// Clip `text` to `max` chars on a char boundary, marking the cut.
+fn clip_description(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// How well a tool matches a search query. Name matches outrank description
+/// matches, so a query like "calendar" does not return every tool whose
+/// documentation merely mentions a calendar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchRank {
+    Description,
+    Name,
+}
+
+fn match_rank(
+    query_terms: &[String],
+    name: &str,
+    server: &str,
+    tool: &str,
+    description: &str,
+) -> Option<MatchRank> {
+    if query_terms.is_empty() {
+        return Some(MatchRank::Name);
+    }
+    let names = format!("{name} {server} {tool}").to_ascii_lowercase();
+    if query_terms.iter().all(|term| names.contains(term.as_str())) {
+        return Some(MatchRank::Name);
+    }
+    let all = format!("{names} {}", description.to_ascii_lowercase());
+    query_terms
+        .iter()
+        .all(|term| all.contains(term.as_str()))
+        .then_some(MatchRank::Description)
+}
+
+/// Render search matches within `budget` tokens. Tries the loosest settings
+/// first: every match in full, then shorter descriptions, then full detail for
+/// only the leading matches with the rest listed by name. The first rendering
+/// that fits wins, so small results are never trimmed.
+fn fit_search_results(matches: &[McpSearchResult], budget: usize) -> Result<(String, usize)> {
+    use jcode_core::util::estimate_tokens;
+    let render = |detailed: usize, description_chars: Option<usize>| -> Result<String> {
+        let head: Vec<McpSearchResult> = matches[..detailed]
+            .iter()
+            .map(|m| McpSearchResult {
+                name: m.name.clone(),
+                server: m.server.clone(),
+                tool: m.tool.clone(),
+                description: description_chars.map_or_else(
+                    || m.description.clone(),
+                    |max| clip_description(&m.description, max),
+                ),
+                input_schema: m.input_schema.clone(),
+            })
+            .collect();
+        let mut out = serde_json::to_string(&head)?;
+        if detailed < matches.len() {
+            let rest: Vec<&str> = matches[detailed..]
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect();
+            out.push_str(&format!(
+                "\n\n{} more matches (names only; search for one by name for its schema): {}",
+                rest.len(),
+                rest.join(", ")
+            ));
+        }
+        Ok(out)
+    };
+    let fits = |out: &String| estimate_tokens(out) <= budget;
+
+    let full = render(matches.len(), None)?;
+    if fits(&full) {
+        return Ok((full, matches.len()));
+    }
+    // Shorten descriptions progressively, keeping every schema.
+    let longest = matches
+        .iter()
+        .map(|m| m.description.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut chars = longest / 2;
+    while chars >= MIN_SEARCH_DESCRIPTION_CHARS {
+        let out = render(matches.len(), Some(chars))?;
+        if fits(&out) {
+            return Ok((out, matches.len()));
+        }
+        chars /= 2;
+    }
+    // Keep full detail for as many leading matches as fit.
+    let (mut lo, mut hi) = (0usize, matches.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(&render(mid, Some(MIN_SEARCH_DESCRIPTION_CHARS))?) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok((render(lo, Some(MIN_SEARCH_DESCRIPTION_CHARS))?, lo))
 }
 
 /// Fallback when no tool matches every word: agents often list several tool
@@ -119,26 +232,26 @@ impl Tool for McpSearchTool {
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        let input_flags = input.clone();
         let params: McpSearchInput = serde_json::from_value(input)?;
         let server_filter = params
             .server
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let query = params
+        // Tokenize the optional query directly, avoiding a lowercased copy of
+        // the entire query and an artificial empty-query sentinel.
+        let query_terms: Vec<String> = params
             .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_ascii_lowercase);
+            .iter()
+            .flat_map(|query| query.split_whitespace().map(str::to_ascii_lowercase))
+            .collect();
         let manager = self.manager.read().await;
         let catalog = manager.searchable_tools().await;
         drop(manager);
 
         let names = crate::mcp::dispatch_names(&catalog);
-        let mut server_has_tools = false;
-        let mut any_word: Vec<McpSearchResult> = Vec::new();
-        let mut matches: Vec<McpSearchResult> = catalog
+        let ranked: Vec<(MatchRank, McpSearchResult)> = catalog
             .into_iter()
             .zip(names)
             .filter_map(|((server, tool), name)| {
@@ -172,75 +285,51 @@ impl Tool for McpSearchTool {
                 if !allowed {
                     return None;
                 }
-                server_has_tools = true;
-                let result = |tool: crate::mcp::McpToolDef| McpSearchResult {
-                    name: name.clone(),
-                    server: server.clone(),
-                    tool: tool.name,
-                    description: tool.description.unwrap_or_else(|| "MCP tool".to_string()),
-                    input_schema: tool.input_schema,
-                };
-                if let Some(query) = &query {
-                    let description = tool.description.as_deref().unwrap_or_default();
-                    if !matches_mcp_query(query, &server, &name, &tool.name, description) {
-                        if matches_any_mcp_query_word(
-                            query,
-                            &server,
-                            &name,
-                            &tool.name,
-                            description,
-                        ) {
-                            any_word.push(result(tool));
-                        }
-                        return None;
-                    }
-                }
-                Some(result(tool))
+                let description = tool.description.as_deref().unwrap_or_default();
+                let rank = match_rank(&query_terms, &name, &server, &tool.name, description)?;
+                Some((
+                    rank,
+                    McpSearchResult {
+                        name,
+                        server,
+                        tool: tool.name,
+                        description: tool
+                            .description
+                            .unwrap_or_else(|| "MCP tool".to_string())
+                            .trim()
+                            .to_string(),
+                        input_schema: tool.input_schema,
+                    },
+                ))
             })
             .collect();
-        if matches.is_empty() {
-            matches = any_word;
-        }
+        // Name matches win. Description-only matches are noise once any tool
+        // matches by name, so they are dropped rather than ranked below.
+        let best = ranked.iter().map(|(rank, _)| *rank).max();
+        let matches: Vec<McpSearchResult> = ranked
+            .into_iter()
+            .filter(|(rank, _)| Some(*rank) == best)
+            .map(|(_, result)| result)
+            .collect();
+        let total = matches.len();
+        let budget = if super::accepts_large_output(&input_flags) {
+            usize::MAX
+        } else {
+            SEARCH_TOKEN_BUDGET
+        };
+        let (output, detailed) = fit_search_results(&matches, budget)?;
 
         // Ask the agent to load the matched definitions natively. With
         // provider-native deferred loading these become directly callable
         // tools without changing the cached prompt prefix; other providers
         // ignore the references and use `mcp_call` with the schemas above.
-        let references: Vec<&str> = matches
+        let references: Vec<&str> = matches[..detailed]
             .iter()
             .take(MAX_SEARCH_TOOL_REFERENCES)
             .map(|m| m.name.as_str())
             .collect();
-        let mut output = serde_json::to_string_pretty(&matches)?;
-        if matches.is_empty() && !server_has_tools {
-            // A search miss does not prove a native source is unavailable. A
-            // server may be configured after this session started, or its
-            // connection/schema cache may have failed. Show only its name and
-            // the safe reconnect action, never its URL, headers, or env.
-            let manager = self.manager.read().await;
-            let fresh = manager.load_fresh_config();
-            let mut candidates: Vec<_> = fresh
-                .servers
-                .keys()
-                .chain(manager.config().servers.keys())
-                .filter(|name| {
-                    server_filter.is_some_and(|filter| filter == name.as_str())
-                        || query
-                            .as_ref()
-                            .is_some_and(|q| q.contains(&name.to_ascii_lowercase()))
-                })
-                .collect();
-            candidates.sort();
-            candidates.dedup();
-            for name in candidates {
-                output.push_str(&format!(
-                    "\nConfigured MCP server '{}' has no searchable tools yet. Try mcp {{\"action\":\"connect\",\"server\":\"{}\"}} before falling back to a browser.",
-                    name, name
-                ));
-            }
-        }
         Ok(ToolOutput::new(output)
-            .with_title(format!("MCP tools ({})", matches.len()))
+            .with_title(format!("MCP tools ({})", total))
             .with_metadata(json!({ "tool_references": references })))
     }
 }
@@ -300,6 +389,7 @@ impl Tool for McpCallTool {
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        let input_flags = input.clone();
         let mut params: McpCallInput = serde_json::from_value(input)?;
         let dispatched_name = dispatch_name(&params.server, &params.tool);
         // Check the current alias too: a per-alias deny must not be bypassed
@@ -341,6 +431,9 @@ impl Tool for McpCallTool {
         if params.arguments.is_null() {
             params.arguments = Value::Object(serde_json::Map::new());
         }
+        // The escape hatch may arrive at either level; never forward it.
+        let accept_large_output = super::accepts_large_output(&input_flags)
+            | crate::mcp::take_accept_large_output(&mut params.arguments);
 
         // Deferred dispatch must honor the same session-local replacement as
         // eager and batched dispatch. Never fall through to the real MCP server
@@ -398,6 +491,11 @@ impl Tool for McpCallTool {
             }
         }
         let output = output_parts.join("\n");
+        let output = if accept_large_output {
+            output
+        } else {
+            crate::mcp::budget::fit_to_budget(&output, crate::mcp::budget::MCP_RESULT_TOKEN_BUDGET)
+        };
         let title = format!("mcp:{}:{}", params.server, params.tool);
         if result.is_error {
             Ok(ToolOutput::new(format!("Error: {}", output)).with_title(title))
@@ -418,11 +516,86 @@ struct McpToolInput {
     args: Option<Vec<String>>,
     #[serde(default)]
     env: Option<HashMap<String, String>>,
-    /// URL of a remote (Streamable HTTP) MCP server.
     #[serde(default)]
     url: Option<String>,
     #[serde(default)]
     headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    transport: Option<String>,
+}
+
+fn connection_config(
+    params: &McpToolInput,
+    configured: Option<McpServerConfig>,
+) -> Result<McpServerConfig> {
+    if params.command.is_some() && params.url.is_some() {
+        anyhow::bail!("Supply either 'command' for stdio or 'url' for remote MCP, not both");
+    }
+    if params.command.is_none() && params.url.is_none() {
+        if params.args.is_some()
+            || params.env.is_some()
+            || params.headers.is_some()
+            || params.transport.is_some()
+        {
+            anyhow::bail!(
+                "Connection overrides require an explicit 'command' or 'url'; omit them to use the configured server"
+            );
+        }
+        return configured.ok_or_else(|| anyhow::anyhow!("'command' or 'url' is required for connect action (server is not in the MCP config)"));
+    }
+    if let Some(url) = params.url.as_deref() {
+        if params.args.is_some() || params.env.is_some() {
+            anyhow::bail!("'args' and 'env' are only supported for stdio MCP servers");
+        }
+        let transport = params.transport.as_deref().unwrap_or("http");
+        if !matches!(transport, "http" | "streamable-http" | "sse") {
+            anyhow::bail!("Remote 'transport' must be 'http', 'streamable-http', or 'sse'");
+        }
+        validate_remote_url(url)?;
+    } else {
+        if params
+            .command
+            .as_deref()
+            .is_none_or(|command| command.trim().is_empty())
+        {
+            anyhow::bail!("'command' must not be empty");
+        }
+        if params.headers.is_some()
+            || params
+                .transport
+                .as_deref()
+                .is_some_and(|transport| transport != "stdio")
+        {
+            anyhow::bail!("'headers' and remote transports require 'url'");
+        }
+    }
+    Ok(McpServerConfig {
+        command: params.command.clone().unwrap_or_default(),
+        args: params.args.clone().unwrap_or_default(),
+        env: params.env.clone().unwrap_or_default(),
+        shared: true,
+        transport: params.transport.clone(),
+        url: params.url.clone(),
+        headers: params.headers.clone().unwrap_or_default(),
+        enabled: None,
+        disabled: None,
+        timeout_secs: None,
+    })
+}
+
+fn validate_remote_url(value: &str) -> Result<()> {
+    let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("Invalid remote MCP URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!(
+            "Remote MCP URL must be HTTP(S), without embedded user credentials or a fragment"
+        );
+    }
+    Ok(())
 }
 
 pub struct McpManagementTool {
@@ -451,7 +624,7 @@ impl Tool for McpManagementTool {
     }
 
     fn description(&self) -> &str {
-        "Manage MCP (Model Context Protocol) servers."
+        "Manage MCP (Model Context Protocol) servers, including HTTP/SSE connections and local OAuth status/logout. Interactive login requires the explicit CLI command `jcode mcp login <configured-server>`."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -461,7 +634,7 @@ impl Tool for McpManagementTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["list", "connect", "disconnect", "reload"],
+                    "enum": ["list", "connect", "disconnect", "reload", "status", "logout"],
                     "description": "Action."
                 },
                 "server": {
@@ -470,7 +643,25 @@ impl Tool for McpManagementTool {
                 },
                 "command": {
                     "type": "string",
-                    "description": "Server command."
+                    "description": "Stdio server command. Mutually exclusive with url."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "URL of a remote MCP server (Streamable HTTP). Use instead of 'command'. Browser OAuth runs automatically if the server requires it."
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Extra HTTP headers for a remote server."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "URL of a remote MCP server (Streamable HTTP). Use instead of 'command'. Browser OAuth runs automatically if the server requires it."
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Extra HTTP headers for a remote server."
                 },
                 "url": {
                     "type": "string",
@@ -490,6 +681,20 @@ impl Tool for McpManagementTool {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
                     "description": "Server env."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "HTTP(S) MCP endpoint for an ad hoc remote connect, or OAuth status/logout. Omit command/url to connect a configured server by name."
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "HTTP headers for an ad hoc remote connect. A static Authorization header overrides stored OAuth credentials."
+                },
+                "transport": {
+                    "type": "string",
+                    "enum": ["stdio", "http", "streamable-http", "sse"],
+                    "description": "Ad hoc transport. Remote URLs default to Streamable HTTP with legacy SSE fallback."
                 }
             },
             "required": ["action"]
@@ -517,8 +722,12 @@ impl Tool for McpManagementTool {
             "connect" => self.connect_server(params, &ctx.session_id).await,
             "disconnect" => self.disconnect_server(params).await,
             "reload" => self.reload_config(&ctx.session_id).await,
+            "status" | "logout" => self.oauth_action(params).await,
+            "login" => anyhow::bail!(
+                "Interactive MCP OAuth login is CLI-only. Run `jcode mcp login <configured-server>` in a terminal (add --no-browser to print the authorization URL). No browser was opened."
+            ),
             _ => Ok(ToolOutput::new(format!(
-                "Unknown action: {}. Use 'list', 'connect', 'disconnect', or 'reload'.",
+                "Unknown action: {}. Use 'list', 'connect', 'disconnect', 'reload', 'status', or 'logout'.",
                 params.action
             ))),
         };
@@ -563,6 +772,61 @@ impl McpManagementTool {
 }
 
 impl McpManagementTool {
+    async fn oauth_action(&self, params: McpToolInput) -> Result<ToolOutput> {
+        let configured =
+            if let Some(name) = params.server.as_deref().filter(|_| params.url.is_none()) {
+                self.manager
+                    .read()
+                    .await
+                    .config()
+                    .servers
+                    .get(name)
+                    .cloned()
+            } else {
+                None
+            };
+        if params.url.is_none()
+            && configured
+                .as_ref()
+                .is_some_and(|server| !server.is_remote())
+        {
+            anyhow::bail!("OAuth status/logout is only supported for remote MCP servers");
+        }
+        let url = params
+            .url
+            .as_deref()
+            .or_else(|| configured.as_ref().and_then(|server| server.url.as_deref()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Supply a configured remote 'server' or its 'url' for OAuth status/logout"
+                )
+            })?;
+        validate_remote_url(url)?;
+        if params.action == "logout" {
+            let removed = crate::mcp::oauth::logout(url)?;
+            return Ok(ToolOutput::new(format!("{}. Static headers and existing connections are unchanged. This only forgets local OAuth credentials, not server-side authorization. Disconnect/reconnect active servers to stop using the old token.",
+                if removed { "Removed local OAuth credentials" } else { "No local OAuth credentials stored" }))
+                .with_title("MCP: OAuth logout"));
+        }
+        let static_auth = params
+            .headers
+            .as_ref()
+            .or_else(|| configured.as_ref().map(|server| &server.headers))
+            .is_some_and(|headers| {
+                headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+            });
+        let status = if static_auth {
+            "Static Authorization header configured (takes precedence over OAuth)"
+        } else if crate::mcp::oauth::status(url)?.logged_in {
+            "OAuth credentials stored (not a connection or token-validity check)"
+        } else {
+            "No OAuth credentials stored. To sign in, run `jcode mcp login <configured-server>` in a terminal."
+        };
+        Ok(ToolOutput::new(status).with_title("MCP: OAuth status"))
+    }
+
     async fn list_servers(&self) -> Result<ToolOutput> {
         let manager = self.manager.read().await;
         let servers = manager.connected_servers().await;
@@ -587,36 +851,52 @@ impl McpManagementTool {
             ).with_title("MCP: No servers"));
         }
 
+        // Names only: full descriptions for every tool of every server cost
+        // tens of thousands of tokens. `mcp_search` returns descriptions and
+        // schemas for the tools the agent actually needs.
         let mut output = String::new();
-        output.push_str(&format!("Connected MCP servers: {}\n\n", servers.len()));
+        output.push_str(&format!(
+            "Connected MCP servers: {} ({} tools)\n\n",
+            servers.len(),
+            all_tools
+                .iter()
+                .filter(|(owner, _)| servers.contains(owner))
+                .count()
+        ));
 
         let names = crate::mcp::dispatch_names(&all_tools);
+        let registry = self.registry.as_ref().and_then(|r| r.upgrade());
         for server in &servers {
-            output.push_str(&format!("## {}\n", server));
-            let server_tools: Vec<_> = all_tools
+            // Callable aliases, which differ from raw names when servers collide.
+            let server_tools: Vec<String> = all_tools
                 .iter()
                 .zip(&names)
                 .filter(|((owner, _), _)| owner == server)
-                .collect();
-
-            if server_tools.is_empty() {
-                output.push_str("  (no tools)\n");
-            } else {
-                for ((_, tool), fallback) in server_tools {
-                    let name = self
-                        .registry
+                .map(|((_, tool), fallback)| {
+                    registry
                         .as_ref()
-                        .and_then(|r| r.upgrade())
                         .and_then(|r| r.mcp_alias(server, &tool.name))
-                        .unwrap_or_else(|| fallback.clone());
-                    output.push_str(&format!(
-                        "  - {}: {}\n",
-                        name,
-                        tool.description.as_deref().unwrap_or("(no description)")
-                    ));
-                }
+                        .unwrap_or_else(|| fallback.clone())
+                })
+                .collect();
+            output.push_str(&format!(
+                "## {} ({} tool{})\n",
+                server,
+                server_tools.len(),
+                if server_tools.len() == 1 { "" } else { "s" }
+            ));
+            if server_tools.is_empty() {
+                output.push_str("(no tools)\n");
+            } else {
+                output.push_str(&server_tools.join(", "));
+                output.push('\n');
             }
             output.push('\n');
+        }
+        if !servers.is_empty() {
+            output.push_str(
+                "Use mcp_search with a server or query for descriptions and input schemas.\n\n",
+            );
         }
 
         if !configured.is_empty() {
@@ -642,61 +922,20 @@ impl McpManagementTool {
     async fn connect_server(&self, params: McpToolInput, session_id: &str) -> Result<ToolOutput> {
         let server_name = params
             .server
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("'server' is required for connect action"))?;
 
-        // With an explicit command this is an ad-hoc connect. Without one, fall
-        // back to the configured server of that name, which also lets disabled
-        // configured servers be connected on demand, session-scoped, without
-        // rewriting config (issue #436).
-        let config = if let Some(url) = params.url {
-            McpServerConfig {
-                command: String::new(),
-                args: Vec::new(),
-                env: Default::default(),
-                shared: true,
-                transport: Some("http".to_string()),
-                url: Some(url),
-                headers: params.headers.unwrap_or_default(),
-                oauth: None,
-                enabled: None,
-                disabled: None,
-                timeout_secs: None,
-            }
-        } else if let Some(command) = params.command {
-            McpServerConfig {
-                command,
-                args: params.args.unwrap_or_default(),
-                env: params.env.unwrap_or_default(),
-                shared: true,
-                transport: None,
-                url: None,
-                headers: std::collections::HashMap::new(),
-                oauth: None,
-                enabled: None,
-                disabled: None,
-                timeout_secs: None,
-            }
-        } else {
-            let manager = self.manager.read().await;
-            // Read the config from disk rather than the manager's in-memory
-            // snapshot. A long-lived session (or shared daemon) otherwise keeps
-            // serving the config as it looked at startup, so editing
-            // `~/.jcode/mcp.json` to fix a broken server has no effect until
-            // the whole process restarts.
-            let fresh = manager.load_fresh_config();
-            let configured = fresh
-                .servers
-                .get(&server_name)
-                .or_else(|| manager.config().servers.get(&server_name))
-                .cloned();
-            drop(manager);
-            configured.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'command' or 'url' is required for connect action ('{}' is not in the MCP config)",
-                    server_name
-                )
-            })?
-        };
+        // Explicit command/URL is ad hoc. Otherwise use the named config,
+        // including disabled entries, without changing persistent configuration.
+        let configured = self
+            .manager
+            .read()
+            .await
+            .config()
+            .servers
+            .get(&server_name)
+            .cloned();
+        let config = connection_config(&params, configured)?;
 
         let manager = self.manager.read().await;
 
@@ -776,24 +1015,30 @@ impl McpManagementTool {
                     .with_metadata(json!({ "tool_references": references })))
             }
             Err(e) => {
-                // `{}` on an anyhow error prints only the outermost context,
-                // which for a failed connect is always the generic
-                // "Failed to connect to MCP server '<name>'". The actual cause
-                // (an OAuth registration rejection, a refused port, a bad URL)
-                // lives further down the chain and is what the user needs.
-                let detail = format_error_chain(&e);
+                let auth_hint = if config.is_remote()
+                    && !config
+                        .headers
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case("authorization"))
+                {
+                    format!(
+                        "\nIf authentication is required, configure this server and run `jcode mcp login {server_name}` in a terminal, then reconnect. Login never runs automatically."
+                    )
+                } else {
+                    String::new()
+                };
                 crate::logging::event_warn(
                     "MCP_LIFECYCLE",
                     vec![
                         ("phase", "connect_failed".to_string()),
                         ("server", server_name.clone()),
                         ("session_id", session_id.to_string()),
-                        ("error", detail.clone()),
+                        ("error", e.to_string()),
                     ],
                 );
                 Ok(ToolOutput::new(format!(
-                    "Failed to connect to '{}': {}",
-                    server_name, detail
+                    "Failed to connect to '{}': {}{}",
+                    server_name, e, auth_hint
                 ))
                 .with_title("MCP: Connection failed"))
             }
@@ -966,485 +1211,5 @@ impl McpManagementTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tool::Tool;
-    use std::fs;
-    use std::path::PathBuf;
-
-    #[test]
-    fn multiword_query_matches_across_server_and_tool_description() {
-        assert!(matches_mcp_query(
-            "granola transcript",
-            "granola",
-            "mcp__granola__get_meeting_transcript",
-            "get_meeting_transcript",
-            "Get the full transcript by meeting ID"
-        ));
-        assert!(!matches_mcp_query(
-            "granola invoice",
-            "granola",
-            "mcp__granola__get_meeting_transcript",
-            "get_meeting_transcript",
-            "Get the full transcript by meeting ID"
-        ));
-    }
-
-    #[test]
-    fn several_tool_names_in_one_query_match_each_tool() {
-        let query = "conversations_search_messages list_meetings";
-        let slack = (
-            "slack",
-            "mcp__slack__conversations_search_messages",
-            "conversations_search_messages",
-            "Search messages",
-        );
-        assert!(!matches_mcp_query(
-            query, slack.0, slack.1, slack.2, slack.3
-        ));
-        assert!(matches_any_mcp_query_word(
-            query, slack.0, slack.1, slack.2, slack.3
-        ));
-        assert!(!matches_any_mcp_query_word(
-            query,
-            "slack",
-            "mcp__slack__users_list",
-            "users_list",
-            "List users"
-        ));
-    }
-
-    fn create_test_tool() -> McpManagementTool {
-        // Use an explicit empty config so tests are hermetic: McpManager::new()
-        // would load the developer's real ~/.jcode/mcp.json, and list output
-        // now includes configured-but-not-connected servers (issue #436).
-        let manager = Arc::new(RwLock::new(McpManager::with_config(
-            crate::mcp::McpConfig::default(),
-        )));
-        McpManagementTool::new(manager)
-    }
-
-    fn create_test_context() -> ToolContext {
-        ToolContext {
-            session_id: "test-session".to_string(),
-            message_id: "test-message".to_string(),
-            tool_call_id: "test-tool-call".to_string(),
-            working_dir: None,
-            stdin_request_tx: None,
-            graceful_shutdown_signal: None,
-            execution_mode: crate::tool::ToolExecutionMode::Direct,
-        }
-    }
-
-    struct LocalMcpConfigGuard {
-        path: PathBuf,
-        backup: Option<String>,
-        created_dir: bool,
-    }
-
-    impl LocalMcpConfigGuard {
-        fn new(content: &str) -> std::io::Result<Self> {
-            let path = PathBuf::from(".jcode/mcp.json");
-            let dir = path
-                .parent()
-                .ok_or_else(|| std::io::Error::other("missing parent"))?;
-            let created_dir = if !dir.exists() {
-                fs::create_dir_all(dir)?;
-                true
-            } else {
-                false
-            };
-            let backup = if path.exists() {
-                Some(fs::read_to_string(&path)?)
-            } else {
-                None
-            };
-            fs::write(&path, content)?;
-            Ok(Self {
-                path,
-                backup,
-                created_dir,
-            })
-        }
-    }
-
-    impl Drop for LocalMcpConfigGuard {
-        fn drop(&mut self) {
-            match &self.backup {
-                Some(content) => {
-                    let _ = fs::write(&self.path, content);
-                }
-                None => {
-                    let _ = fs::remove_file(&self.path);
-                    if self.created_dir
-                        && let Some(dir) = self.path.parent()
-                    {
-                        let _ = fs::remove_dir(dir);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_tool_name() {
-        let tool = create_test_tool();
-        assert_eq!(tool.name(), "mcp");
-    }
-
-    #[test]
-    fn test_tool_description() {
-        let tool = create_test_tool();
-        assert!(tool.description().contains("MCP"));
-        assert!(tool.description().contains("Model Context Protocol"));
-    }
-
-    #[test]
-    fn test_parameters_schema() {
-        let tool = create_test_tool();
-        let schema = tool.parameters_schema();
-        assert_eq!(schema["type"], "object");
-        assert!(schema["properties"]["action"].is_object());
-        assert!(schema["properties"]["server"].is_object());
-        assert!(schema["properties"]["command"].is_object());
-    }
-
-    #[test]
-    fn mcp_call_allows_dynamic_argument_keys_in_provider_schemas() {
-        let tool = McpCallTool::new(Arc::clone(create_test_tool().manager()));
-        let schema = tool.parameters_schema();
-        assert_eq!(
-            schema["properties"]["arguments"]["additionalProperties"],
-            true
-        );
-
-        for spec in [
-            &jcode_schema_dialect::registry::OPENROUTER,
-            &jcode_schema_dialect::registry::OPENAI,
-            &jcode_schema_dialect::registry::ANTHROPIC,
-        ] {
-            let normalized = jcode_schema_dialect::dialect::apply(&schema, spec);
-            let arguments = &normalized["properties"]["arguments"];
-            assert_eq!(arguments["type"], "object", "{}", spec.id);
-            assert_eq!(arguments["additionalProperties"], true, "{}", spec.id);
-            if spec.transforms.require_properties_on_objects {
-                // Empty declared properties must not close the dynamic payload (#1214).
-                assert_eq!(arguments["properties"], json!({}), "{}", spec.id);
-            }
-            assert_eq!(normalized["required"], schema["required"], "{}", spec.id);
-        }
-    }
-
-    #[test]
-    fn mcp_call_dynamic_arguments_remain_ineligible_for_openai_strict_mode() {
-        let tool = McpCallTool::new(Arc::clone(create_test_tool().manager()));
-        let compatible =
-            jcode_provider_core::openai_schema::openai_compatible_schema(&tool.parameters_schema());
-        assert!(!jcode_provider_core::openai_schema::schema_supports_strict(
-            &compatible
-        ));
-        assert_eq!(
-            compatible["properties"]["arguments"]["additionalProperties"],
-            true
-        );
-    }
-
-    #[tokio::test]
-    async fn test_list_empty() {
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "list"});
-
-        let result = tool.execute(input, ctx).await.unwrap();
-        assert!(result.output.contains("No MCP servers connected"));
-    }
-
-    #[tokio::test]
-    async fn test_list_shows_disabled_configured_server() {
-        // Issue #436: disabled servers stay visible in the list with their
-        // state, so users can see and enable them on demand.
-        let mut config = crate::mcp::McpConfig::default();
-        config.servers.insert(
-            "off-server".to_string(),
-            McpServerConfig {
-                command: "some-bin".to_string(),
-                args: vec![],
-                env: HashMap::new(),
-                shared: true,
-                transport: None,
-                url: None,
-                headers: HashMap::new(),
-                oauth: None,
-                enabled: Some(false),
-                disabled: None,
-                timeout_secs: None,
-            },
-        );
-        let manager = Arc::new(RwLock::new(McpManager::with_config(config)));
-        let tool = McpManagementTool::new(manager);
-        let ctx = create_test_context();
-
-        let result = tool.execute(json!({"action": "list"}), ctx).await.unwrap();
-        assert!(
-            result.output.contains("off-server"),
-            "disabled server must be listed: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("disabled in config"),
-            "disabled state must be visible: {}",
-            result.output
-        );
-    }
-
-    /// Slack and Granola with cached tools, under a temp JCODE_HOME.
-    fn cached_slack_granola() -> (Arc<RwLock<McpManager>>, tempfile::TempDir) {
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("JCODE_HOME", tmp.path());
-        }
-        let server = |url: &str| McpServerConfig {
-            command: String::new(),
-            args: vec![],
-            env: HashMap::new(),
-            shared: true,
-            transport: Some("http".to_string()),
-            url: Some(url.to_string()),
-            headers: HashMap::new(),
-            oauth: None,
-            enabled: None,
-            disabled: None,
-            timeout_secs: None,
-        };
-        let tool = |name: &str, description: &str| crate::mcp::McpToolDef {
-            name: name.to_string(),
-            description: Some(description.to_string()),
-            input_schema: json!({"type": "object"}),
-        };
-        let mut config = crate::mcp::McpConfig::default();
-        let mut cache = crate::mcp::McpSchemaCache::default();
-        for (name, tools) in [
-            (
-                "slack",
-                vec![
-                    tool("conversations_search_messages", "Search messages"),
-                    tool("users_list", "List users"),
-                ],
-            ),
-            (
-                "granola",
-                vec![
-                    tool("list_meetings", "List meeting notes"),
-                    tool("get_meetings", "Read notes"),
-                ],
-            ),
-        ] {
-            let cfg = server(&format!("https://example.invalid/{name}"));
-            cache.update(name, &cfg, tools);
-            config.servers.insert(name.to_string(), cfg);
-        }
-        cache.save();
-        (Arc::new(RwLock::new(McpManager::with_config(config))), tmp)
-    }
-
-    #[tokio::test]
-    async fn search_with_several_tool_names_returns_each_tool() {
-        let _guard = crate::storage::lock_test_env();
-        let (manager, _tmp) = cached_slack_granola();
-        let search = McpSearchTool::new(manager);
-        let all = search
-            .execute(
-                json!({"query": "conversations_search_messages list_meetings"}),
-                create_test_context(),
-            )
-            .await
-            .unwrap();
-        let slack = search
-            .execute(
-                json!({"server": "slack", "query": "conversations_search_messages list_meetings"}),
-                create_test_context(),
-            )
-            .await
-            .unwrap();
-        unsafe {
-            std::env::remove_var("JCODE_HOME");
-        }
-        assert!(
-            all.output
-                .contains("\"tool\": \"conversations_search_messages\""),
-            "{}",
-            all.output
-        );
-        assert!(
-            all.output.contains("\"tool\": \"list_meetings\""),
-            "{}",
-            all.output
-        );
-        assert!(!all.output.contains("users_list"), "{}", all.output);
-        assert!(
-            slack
-                .output
-                .contains("\"tool\": \"conversations_search_messages\""),
-            "{}",
-            slack.output
-        );
-        assert!(!slack.output.contains("list_meetings"), "{}", slack.output);
-        assert!(
-            !slack.output.contains("no searchable tools"),
-            "{}",
-            slack.output
-        );
-    }
-
-    #[tokio::test]
-    async fn no_match_on_a_server_with_tools_does_not_claim_it_has_none() {
-        let _guard = crate::storage::lock_test_env();
-        let (manager, _tmp) = cached_slack_granola();
-        let result = McpSearchTool::new(manager)
-            .execute(
-                json!({"server": "slack", "query": "invoice"}),
-                create_test_context(),
-            )
-            .await
-            .unwrap();
-        unsafe {
-            std::env::remove_var("JCODE_HOME");
-        }
-        assert_eq!(result.output.trim(), "[]");
-        assert!(!result.output.contains("no searchable tools"));
-    }
-
-    #[tokio::test]
-    async fn search_miss_points_to_configured_granola_before_browser() {
-        let mut config = crate::mcp::McpConfig::default();
-        config.servers.insert(
-            "granola".to_string(),
-            McpServerConfig {
-                command: String::new(),
-                args: vec![],
-                env: HashMap::new(),
-                shared: true,
-                transport: Some("http".to_string()),
-                url: Some("https://example.invalid/secret-url".to_string()),
-                headers: HashMap::from([("Authorization".to_string(), "secret-token".to_string())]),
-                oauth: None,
-                enabled: None,
-                disabled: None,
-                timeout_secs: None,
-            },
-        );
-        let manager = Arc::new(RwLock::new(McpManager::with_config(config)));
-        let search = McpSearchTool::new(Arc::clone(&manager));
-        let result = search
-            .execute(
-                json!({"query": "Granola transcript"}),
-                create_test_context(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            result.output.contains("\"server\":\"granola\""),
-            "{}",
-            result.output
-        );
-        assert!(result.output.contains("before falling back to a browser"));
-        assert!(!result.output.contains("secret-token"));
-        assert!(!result.output.contains("secret-url"));
-
-        let listed = McpManagementTool::new(manager)
-            .execute(json!({"action": "list"}), create_test_context())
-            .await
-            .unwrap();
-        assert!(listed.output.contains("granola (enabled; connect with"));
-        assert!(!listed.output.contains("secret-token"));
-    }
-
-    #[tokio::test]
-    async fn test_connect_missing_server() {
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "connect", "command": "/bin/test"});
-
-        let result = tool.execute(input, ctx).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("server"));
-    }
-
-    #[tokio::test]
-    async fn test_connect_missing_command() {
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "connect", "server": "test"});
-
-        let result = tool.execute(input, ctx).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("command"));
-    }
-
-    #[tokio::test]
-    async fn test_disconnect_not_connected() {
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "disconnect", "server": "nonexistent"});
-
-        let result = tool.execute(input, ctx).await.unwrap();
-        assert!(result.output.contains("not connected"));
-    }
-
-    #[tokio::test]
-    async fn test_unknown_action() {
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "invalid_action"});
-
-        let result = tool.execute(input, ctx).await.unwrap();
-        assert!(result.output.contains("Unknown action"));
-    }
-
-    #[tokio::test]
-    async fn test_reload_empty_config() {
-        let _guard =
-            LocalMcpConfigGuard::new("{\"servers\":{}}").expect("create temporary .jcode/mcp.json");
-        let tool = create_test_tool();
-        let ctx = create_test_context();
-        let input = json!({"action": "reload"});
-
-        let result = tool.execute(input, ctx).await.unwrap();
-        // With config merging, global config may have servers.
-        // If both are empty: "No servers found in config"
-        // If global has servers: "Reloaded MCP config" (may show connection failures)
-        assert!(
-            result.output.contains("No servers")
-                || result.output.contains("Empty config")
-                || result.output.contains("Connected servers: 0")
-                || result.output.contains("Reloaded MCP config")
-        );
-    }
-}
-
-#[cfg(test)]
-mod error_chain_tests {
-    use super::format_error_chain;
-    use anyhow::Context;
-
-    #[test]
-    fn reports_the_root_cause_not_just_the_outer_context() {
-        let error = Err::<(), _>(anyhow::anyhow!(
-            "Dynamic client registration rejected (403)"
-        ))
-        .context("MCP server 'Figma Desktop' failed to initialize")
-        .context("Failed to connect to MCP server 'Figma Desktop'")
-        .unwrap_err();
-        let rendered = format_error_chain(&error);
-        assert!(
-            rendered.contains("Dynamic client registration rejected (403)"),
-            "root cause missing from {rendered}"
-        );
-        assert!(rendered.starts_with("Failed to connect to MCP server 'Figma Desktop'"));
-    }
-
-    #[test]
-    fn a_bare_error_is_unchanged() {
-        assert_eq!(format_error_chain(&anyhow::anyhow!("boom")), "boom");
-    }
-}
+#[path = "mcp_tests.rs"]
+mod tests;

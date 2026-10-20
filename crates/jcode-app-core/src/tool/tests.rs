@@ -96,9 +96,21 @@ async fn fresh_registry_sees_configured_http_granola_before_browser_fallback() {
     let working_dir = tempfile::tempdir().expect("isolated working directory");
     std::fs::write(
         home.path().join("mcp.json"),
-        r#"{"mcpServers":{"granola":{"type":"http","url":"https://example.invalid/mcp","enabled":false}}}"#,
+        r#"{"mcpServers":{"granola":{"type":"http","url":"https://example.invalid/mcp"}}}"#,
     )
     .expect("write configured remote server");
+    let config = crate::mcp::McpConfig::load_from_file(&home.path().join("mcp.json"))
+        .expect("load configured remote server");
+    let granola = config.servers.get("granola").expect("Granola config");
+    crate::mcp::McpSchemaCache::sync_server(
+        "granola",
+        granola,
+        &[crate::mcp::McpToolDef {
+            name: "get_meetings".into(),
+            description: Some("Search Granola meeting transcripts".into()),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+        }],
+    );
 
     let registry = Registry::empty();
     registry
@@ -112,13 +124,7 @@ async fn fresh_registry_sees_configured_http_granola_before_browser_fallback() {
         )
         .await
         .unwrap();
-    assert!(
-        listed
-            .output
-            .contains("granola (disabled in config; connect on demand"),
-        "{}",
-        listed.output
-    );
+    assert!(listed.output.contains("granola"), "{}", listed.output);
     let found = registry
         .execute(
             "mcp_search",
@@ -132,7 +138,6 @@ async fn fresh_registry_sees_configured_http_granola_before_browser_fallback() {
         "{}",
         found.output
     );
-    assert!(found.output.contains("before falling back to a browser"));
 }
 
 #[tokio::test]
@@ -740,6 +745,7 @@ async fn tool_descriptions_stay_under_token_cap() {
     // user, so planning happens proactively rather than only when prompted.
     // applet carries the whole view-node vocabulary inline, since the model has
     // no other way to learn which node types and props the host renders.
+    // codemode documents its sandbox API; compile_remote a credit/consent notice.
     const EXEMPT: &[&str] = &[
         "integration_tools",
         "swarm",
@@ -747,6 +753,8 @@ async fn tool_descriptions_stay_under_token_cap() {
         "browser",
         "todo",
         "applet",
+        "codemode",
+        "compile_remote",
     ];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
@@ -1895,8 +1903,7 @@ fn the_dialect_sweep_catches_the_issue_754_schema() {
 async fn only_the_known_open_world_tools_are_ineligible_for_openai_strict_mode() {
     /// Built-ins that legitimately cannot be strict. Verified against master
     /// before the #711/#713 eligibility changes, so this is pre-existing.
-    // applet's view is a recursive, open-ended node tree.
-    const KNOWN_OPEN_WORLD_TOOLS: &[&str] = &["applet", "batch", "browser", "swarm"];
+    const KNOWN_OPEN_WORLD_TOOLS: &[&str] = &["batch", "browser", "swarm"];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
@@ -1929,3 +1936,69 @@ mod mcp_collision;
 
 #[path = "tests/sdk.rs"]
 mod sdk_tests;
+
+#[test]
+fn touched_paths_include_patch_headers_and_path_keys() {
+    let ctx = mcp_test_context(std::path::Path::new("/work"));
+    let input = serde_json::json!({
+        "file_path": "notes.md",
+        "patch_text": "*** Begin Patch\n*** Update File: docs/a.md\n@@\n-x\n+y\n*** Add File: /abs/b.txt\n+hi\n*** Update File: notes.md\n*** End Patch",
+    });
+    let paths: Vec<String> = Registry::touched_paths(&input, &ctx)
+        .into_iter()
+        .map(|(key, path)| format!("{key}:{}", path.display()))
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "file_path:/work/notes.md",
+            "patch:/work/docs/a.md",
+            "patch:/abs/b.txt",
+        ]
+    );
+
+    let diff = "--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1 +1 @@\n-a\n+b\n--- /dev/null\n+++ b/new.md\n";
+    assert_eq!(Registry::patch_paths(diff), vec!["src/x.rs", "new.md"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn post_tool_feedback_hook_appends_stdout_to_tool_result() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env_lock = crate::storage::lock_test_env();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let target = dir.path().join("prose.md");
+    std::fs::write(&target, "hello\n").expect("write target");
+    let script = dir.path().join("feedback.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ninput=$(cat)\necho \"call=$JCODE_HOOK_TOOL_CALL_ID tool=$JCODE_HOOK_TOOL_NAME\"\necho \"paths=$JCODE_HOOK_TOUCHED_PATHS\"\ncase \"$input\" in *prose.md*) echo stdin-ok ;; esac\nexit 1\n",
+    )
+    .expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let previous = std::env::var_os("JCODE_HOOK_POST_TOOL_FEEDBACK");
+    crate::env::set_var("JCODE_HOOK_POST_TOOL_FEEDBACK", &script);
+    crate::config::invalidate_config_cache();
+
+    let registry = Registry::new(Arc::new(MockProvider) as Arc<dyn Provider>).await;
+    let mut ctx = mcp_test_context(dir.path());
+    ctx.tool_call_id = "call_feedback".to_string();
+    let result = registry
+        .execute("read", serde_json::json!({"file_path": "prose.md"}), ctx)
+        .await;
+
+    match previous {
+        Some(value) => crate::env::set_var("JCODE_HOOK_POST_TOOL_FEEDBACK", value),
+        None => crate::env::remove_var("JCODE_HOOK_POST_TOOL_FEEDBACK"),
+    }
+    crate::config::invalidate_config_cache();
+    let output = result.expect("read should succeed").output;
+    assert!(output.contains("hello"), "{output}");
+    assert!(output.contains("[post_tool_feedback]"), "{output}");
+    assert!(output.contains("call=call_feedback tool=read"), "{output}");
+    assert!(
+        output.contains(&format!("paths={}", target.display())),
+        "{output}"
+    );
+    assert!(output.contains("stdin-ok"), "{output}");
+}

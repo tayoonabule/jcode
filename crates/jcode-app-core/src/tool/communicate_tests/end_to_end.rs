@@ -129,6 +129,7 @@ async fn communicate_list_and_await_members_work_end_to_end() {
     assert_eq!(ready_peer.status.as_deref(), Some("ready"));
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]
@@ -237,6 +238,7 @@ async fn communicate_await_members_background_returns_immediately_and_notifies()
     );
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]
@@ -294,6 +296,7 @@ async fn communicate_run_plan_with_empty_plan_returns_inline_even_in_background_
     );
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]
@@ -381,6 +384,7 @@ async fn communicate_status_returns_busy_snapshot_for_running_member() {
         .expect("peer message should finish");
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]
@@ -461,6 +465,7 @@ async fn communicate_spawn_reports_completion_back_to_spawner() {
         .expect("spawner should receive completion report-back notification");
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]
@@ -560,6 +565,7 @@ async fn communicate_spawn_with_prompt_and_summary_work_end_to_end() {
     );
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 /// `message` routes by the fields supplied (DM when `to_session` is set,
@@ -714,4 +720,5 @@ async fn communicate_message_routes_as_dm_while_broadcast_targets_swarm() {
     );
 
     server_task.abort();
+    let _ = server_task.await;
 }

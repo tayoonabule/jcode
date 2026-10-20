@@ -632,11 +632,18 @@ pub fn release_retained_heap_if_excessive(
 ) -> bool {
     use std::sync::atomic::Ordering;
 
+    if threshold_bytes == u64::MAX {
+        // The configuration parser uses MAX to represent disabled trimming.
+        return false;
+    }
+
     let Some(apparent) = apparent_heap_retention_bytes() else {
         // No OS-side metric available (non-Linux, or allocator stats missing):
         // fall back to the allocator-reported retained counter as an absolute
         // threshold. Coarse, but better than never trimming.
-        let stats_retained = allocator_info().stats.and_then(|stats| stats.retained_bytes);
+        let stats_retained = allocator_info()
+            .stats
+            .and_then(|stats| stats.retained_bytes);
         #[cfg(target_os = "macos")]
         if stats_retained.is_none() {
             // macOS system malloc exposes no retained counter; pressure relief

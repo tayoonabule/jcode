@@ -137,6 +137,7 @@ impl AmbientRunnerHandle {
                 images: Vec::new(),
                 urgent: false,
                 source: SoftInterruptSource::User,
+                client_id: None,
             });
             logging::info(&format!(
                 "{} message injected into active ambient cycle: {}",
@@ -165,6 +166,7 @@ impl AmbientRunnerHandle {
             AmbientStatus::Scheduled { .. } | AmbientStatus::Idle
         ) {
             state.status = AmbientStatus::Idle;
+            let _ = state.save();
         }
         drop(state);
         self.inner.wake_notify.notify_one();
@@ -413,7 +415,10 @@ impl AmbientRunnerHandle {
         session_id: &str,
     ) -> anyhow::Result<()> {
         let session = Session::load(session_id)?;
-        let cycle_provider = provider.fork();
+        // Ambient runs are long-lived server work, so a plain fork can preserve
+        // the server's stale provider selection. Rebuild the provider and apply
+        // ambient's own route, the same way a normal cycle does.
+        let cycle_provider = self.configured_cycle_provider(provider);
         let registry = tool::Registry::new(cycle_provider.clone()).await;
         if session.is_canary {
             registry.register_selfdev_tools().await;
@@ -454,7 +459,11 @@ impl AmbientRunnerHandle {
                 child.compaction = parent.compaction.clone();
                 child.provider_key = parent.provider_key.clone();
                 child.route_api_method = parent.route_api_method.clone();
-                child.model = parent.model.clone();
+                child.model = parent
+                    .effective_agent_model("ambient", crate::config::Config::load().ambient.model)
+                    .filter(|model| model != "inherit")
+                    .or_else(|| parent.model.clone());
+                child.agent_model_overrides = parent.agent_model_overrides.clone();
                 child.subagent_model = parent.subagent_model.clone();
                 child.improve_mode = parent.improve_mode;
                 child.autoreview_enabled = parent.autoreview_enabled;
@@ -490,7 +499,7 @@ impl AmbientRunnerHandle {
         let child_session_id = child.id.clone();
         let child_is_canary = child.is_canary;
         let child_is_debug = child.is_debug;
-        let cycle_provider = provider.fork();
+        let cycle_provider = self.configured_cycle_provider(provider);
         let registry = tool::Registry::new(cycle_provider.clone()).await;
         if child_is_canary {
             registry.register_selfdev_tools().await;
@@ -573,6 +582,17 @@ impl AmbientRunnerHandle {
         {
             let mut running = self.inner.running.write().await;
             *running = true;
+        }
+        {
+            let mut state = self.inner.state.write().await;
+            if matches!(state.status, AmbientStatus::Running { .. }) {
+                state.status = AmbientStatus::Idle;
+                if let Err(error) = state.save() {
+                    logging::warn(&format!(
+                        "Ambient runner: failed to recover stale running state: {error}"
+                    ));
+                }
+            }
         }
         logging::info("Ambient runner: starting background loop");
 
@@ -784,8 +804,16 @@ impl AmbientRunnerHandle {
                             }
                             CycleStatus::Incomplete => crate::safety::TranscriptStatus::Incomplete,
                         },
-                        provider: provider.name().to_string(),
-                        model: provider.model(),
+                        provider: result
+                            .route
+                            .as_ref()
+                            .map(|route| route.provider.clone())
+                            .unwrap_or_default(),
+                        model: result
+                            .route
+                            .as_ref()
+                            .map(|route| route.model.clone())
+                            .unwrap_or_default(),
                         actions: Vec::new(),
                         pending_permissions: self.inner.safety.pending_requests().len(),
                         summary: Some(result.summary.clone()),
@@ -990,6 +1018,7 @@ impl AmbientRunnerHandle {
                 started_at,
                 ended_at: Utc::now(),
                 conversation: Some(conversation),
+                route: Some(route.clone()),
                 ..result
             });
         }
@@ -1017,6 +1046,7 @@ impl AmbientRunnerHandle {
                 started_at,
                 ended_at: Utc::now(),
                 conversation: Some(conversation),
+                route: Some(route),
                 ..result
             });
         }

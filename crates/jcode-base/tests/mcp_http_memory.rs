@@ -166,7 +166,6 @@ fn make_config(url: &str) -> McpServerConfig {
         transport: Some("http".to_string()),
         url: Some(url.to_string()),
         headers: HashMap::new(),
-        oauth: None,
         timeout_secs: None,
         enabled: None,
         disabled: None,
