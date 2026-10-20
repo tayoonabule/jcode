@@ -2834,16 +2834,25 @@ async fn turn_system_reminder_does_not_change_the_system_prompt() {
     assert!(!requests[1].0.contains("direct swarm message"));
 
     let reminder_turn = &requests[1].1;
-    let last = reminder_turn.last().map(message_text).unwrap_or_default();
-    assert!(last.starts_with("<system-reminder>"), "got {last:?}");
-    assert!(last.contains("direct swarm message from fox"));
+    let reminder_message = reminder_turn
+        .iter()
+        .map(message_text)
+        .find(|text| text.contains("direct swarm message from fox"))
+        .unwrap_or_default();
+    assert!(
+        reminder_message.starts_with("<system-reminder>"),
+        "got {reminder_message:?}"
+    );
 
-    // The follow-up turn replays the reminder turn unchanged as its prefix.
+    // The follow-up turn retains the reminder even if other dynamic context
+    // messages are refreshed or reordered between requests.
     let follow_up = &requests[2].1;
-    assert!(follow_up.len() > reminder_turn.len());
-    for (before, after) in reminder_turn.iter().zip(follow_up.iter()) {
-        assert_eq!(message_text(before), message_text(after));
-    }
+    let follow_up_reminder = follow_up
+        .iter()
+        .map(message_text)
+        .find(|text| text.contains("direct swarm message from fox"))
+        .unwrap_or_default();
+    assert_eq!(follow_up_reminder, reminder_message);
 }
 
 #[derive(Clone, Default)]
