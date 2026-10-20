@@ -2,9 +2,9 @@
 
 use super::{
     App, DisplayMessage, MAX_TURN_HOLD_SECS, PendingReloadReconnectStatus, ProcessingStatus,
-    RemoteResumeActivity, SendAction, ctrl_bracket_fallback_to_esc, ctrl_m_to_enter, input,
-    parse_rate_limit_error, remote_notifications::present_swarm_notification,
-    spawn_in_new_terminal,
+    RemoteResumeActivity, SendAction, auth::auth_muse_helpers, ctrl_bracket_fallback_to_esc,
+    ctrl_m_to_enter, input, parse_rate_limit_error,
+    remote_notifications::present_swarm_notification, spawn_in_new_terminal,
 };
 use crate::bus::BusEvent;
 use crate::message::ToolCall;
@@ -580,10 +580,12 @@ async fn apply_terminal_event<B: Backend>(
                                             app.provider.context_window(),
                                         );
                                         let _ = remote.switch_anthropic_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(format!(
-                                            "Switched to Anthropic account `{}`.",
-                                            label
-                                        )));
+                                        app.push_display_message(DisplayMessage::system(
+                                            crate::tui::app::helpers::account_switch_notice(
+                                                "Anthropic",
+                                                &label,
+                                            ),
+                                        ));
                                         app.set_status_notice(format!(
                                             "Account: switched to {}",
                                             label
@@ -602,10 +604,11 @@ async fn apply_terminal_event<B: Backend>(
                                             app.provider.context_window(),
                                         );
                                         let _ = remote.switch_openai_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(format!(
-                                            "Switched to OpenAI account `{}`.",
-                                            label
-                                        )));
+                                        app.push_display_message(DisplayMessage::system(
+                                            crate::tui::app::helpers::account_switch_notice(
+                                                "OpenAI", &label,
+                                            ),
+                                        ));
                                         app.set_status_notice(format!(
                                             "OpenAI account: switched to {}",
                                             label
@@ -733,7 +736,7 @@ pub(super) async fn handle_bus_event(
                 app.set_status_notice("Local login does not change SSH server credentials");
                 return true;
             }
-            let success = login.success && login.provider != "copilot_code";
+            let success = login.success && auth_muse_helpers::is_completed_login(&login);
             let provider_hint = auth_provider_hint_for_login_provider(&login.provider);
             let auth = auth_changed_event_for_login_provider(&login.provider);
             let prefer_strongest = success && app.onboarding_should_prefer_strongest_model();

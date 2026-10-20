@@ -504,11 +504,10 @@ wake_mode = "internal"
 # Env override: JCODE_SWARM_MODEL
 # swarm_model = "inherit"
 #
-# Default reasoning effort for spawned swarm workers when the spawn call does
-# not pass an explicit `effort` ("low", "medium", "high", ...). Leave unset so
-# workers inherit the provider-wide reasoning effort.
+# Reasoning effort for spawned swarm workers ("low", "medium", "high", ...).
+# Agents cannot choose worker effort through the swarm tool. Unset = "low".
 # Env override: JCODE_SWARM_EFFORT
-# swarm_effort = "medium"
+# swarm_effort = "low"
 #
 # Root model reasoning while /effort swarm is selected. Independent of worker
 # swarm_effort. Supported levels: none|minimal|low|medium|high|xhigh|max.
@@ -553,10 +552,18 @@ swarm_stall_after_secs = 600
 # swarm_strip_layout = "vertical"
 #
 # Recall uses Jev typed Decisions directly, without embeddings or a sidecar LLM.
-# Provider values: auto, jcode, openrouter, typesafe, aimlapi.
+# Provider values: auto, jcode, openrouter, typesafe, laya, aimlapi.
 # auto prefers Jcode, then OpenRouter, TypeSafe, AI/ML API credentials.
+# laya uses a local/self-hosted laya-serve (/v1/systemone, default http://127.0.0.1:8080,
+# override via JCODE_LAYA_BASE_URL or LAYA_BASE_URL, optional LAYA_API_KEY in laya.env).
 # Env override: JCODE_MEMORY_JEV_PROVIDER
 # memory_jev_provider = "auto"
+# Optional per-purpose Jev Decisions model overrides. Unset preserves the
+# selected provider's existing model. Environment overrides take precedence.
+# Env overrides: JCODE_MEMORY_JEV_MODEL, JCODE_BROWSER_JEV_MODEL, JCODE_VOICE_JEV_MODEL
+# memory_jev_model = "typesafe/jev-1.14"
+# browser_jev_model = "typesafe/jev-1.14"
+# voice_jev_model = "typesafe/jev-1.14"
 # Minimum relevance probability (0.8..=1.0). Invalid values fail closed.
 # memory_jev_threshold = 0.8
 # BYOK: OPENROUTER_API_KEY, TYPESAFE_API_KEY, or AIMLAPI_API_KEY.
