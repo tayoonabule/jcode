@@ -130,7 +130,12 @@ impl Provider for RetentionReadinessProvider {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(transcript.clone());
 
-        let latest = transcript.last().cloned().unwrap_or_default();
+        let latest = transcript
+            .iter()
+            .rev()
+            .find(|text| !text.starts_with("<system-reminder>"))
+            .cloned()
+            .unwrap_or_default();
         if latest.contains("D7_RECOVER")
             && self
                 .fail_d7_once

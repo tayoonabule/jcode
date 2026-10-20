@@ -1,16 +1,14 @@
-//! End-to-end test of the MCP OAuth flow against a real local server.
+//! End-to-end test of the explicit MCP OAuth login flow against local fixtures.
 //!
-//! The fake server implements the full chain jcode must traverse: an
-//! unauthenticated `401` carrying a `WWW-Authenticate` challenge, the
-//! protected-resource and authorization-server metadata documents, dynamic
-//! client registration, the authorization endpoint (which redirects back to
-//! jcode's loopback listener), and the token endpoint. A stand-in "browser"
-//! fetches the authorization URL instead of a real one.
+//! The fake authorization server implements protected-resource metadata,
+//! authorization-server metadata, dynamic client registration, the PKCE
+//! authorization redirect, and token exchange. The test follows the printed
+//! authorization URL programmatically rather than opening a real browser.
 //!
-//! This proves the flow works, that the resulting bearer token is actually
-//! attached to MCP requests, and that credentials are persisted for reuse.
+//! This exercises the current public login and connection APIs, verifies the
+//! bearer token is sent to MCP, and checks credentials are persisted/reused.
 
-use jcode_base::mcp::{McpClient, McpServerConfig};
+use jcode_base::mcp::{McpClient, McpServerConfig, oauth::BrowserMode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -82,7 +80,11 @@ async fn serve(listener: tokio::net::TcpListener, base: String, counters: Arc<Co
 
             let response = match path {
                 "/.well-known/oauth-protected-resource" => write_response(
-                    &serde_json::json!({"authorization_servers": [base]}).to_string(),
+                    &serde_json::json!({
+                        "resource": format!("{base}/mcp"),
+                        "authorization_servers": [base]
+                    })
+                    .to_string(),
                     "application/json",
                 ),
                 "/.well-known/oauth-authorization-server" => write_response(
@@ -125,11 +127,6 @@ async fn serve(listener: tokio::net::TcpListener, base: String, counters: Arc<Co
                     assert!(
                         params.contains_key("code_challenge"),
                         "PKCE challenge must be present"
-                    );
-                    assert_eq!(
-                        params.get("access_type").map(String::as_str),
-                        Some("offline"),
-                        "authorization must request offline access for refreshable credentials"
                     );
                     let redirect = params.get("redirect_uri").cloned().unwrap_or_default();
                     let state = params.get("state").cloned().unwrap_or_default();
@@ -216,15 +213,12 @@ async fn serve(listener: tokio::net::TcpListener, base: String, counters: Arc<Co
 }
 
 #[tokio::test]
-async fn unauthorized_server_triggers_oauth_and_then_connects() {
-    // Redirect credential storage into a temp dir so the real ~/.jcode is
-    // untouched.
+async fn explicit_oauth_login_persists_credentials_and_connects() {
+    // Keep test credentials isolated from the real user store.
     let home = tempfile::tempdir().expect("home tempdir");
-    // SAFETY: single-threaded setup before any concurrent env access here.
+    let previous_home = std::env::var_os("JCODE_HOME");
+    // SAFETY: this is the only environment mutation in this test binary.
     unsafe { std::env::set_var("JCODE_HOME", home.path()) };
-    // Follow the authorization URL programmatically instead of opening a real
-    // browser on the machine running the tests.
-    unsafe { std::env::set_var("JCODE_MCP_AUTH_AUTOFOLLOW", "1") };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -232,35 +226,39 @@ async fn unauthorized_server_triggers_oauth_and_then_connects() {
     let counters = Arc::new(Counters::default());
     tokio::spawn(serve(listener, base.clone(), Arc::clone(&counters)));
 
+    let mcp_url = format!("{base}/mcp");
     let config = McpServerConfig {
         command: String::new(),
         args: Vec::new(),
         env: HashMap::new(),
         shared: false,
         transport: Some("http".to_string()),
-        url: Some(format!("{base}/mcp")),
+        url: Some(mcp_url.clone()),
         headers: HashMap::new(),
-        oauth: None,
         timeout_secs: None,
         enabled: None,
         disabled: None,
     };
 
+    // Explicit login receives the authorization URL; simulate a user following
+    // it in the local fixture rather than opening a real browser.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        jcode_base::mcp::oauth::login(&mcp_url, BrowserMode::Print, |auth_url| {
+            let auth_url = auth_url.to_string();
+            tokio::spawn(async move {
+                let _ = reqwest::get(auth_url).await;
+            });
+        }),
+    )
+    .await
+    .expect("OAuth fixture callback should complete promptly")
+    .expect("complete explicit OAuth flow");
+
     let client = McpClient::connect("oauth-test".to_string(), &config)
         .await
-        .expect("connect after completing the OAuth flow");
-
-    // The server rejected us before we had a token, proving auth was required.
-    assert!(
-        counters.unauthorized.load(Ordering::SeqCst) >= 1,
-        "the server must have challenged an unauthenticated request"
-    );
-    assert_eq!(
-        counters.registrations.load(Ordering::SeqCst),
-        1,
-        "dynamic client registration must run exactly once"
-    );
-
+        .expect("connect with saved OAuth credentials");
+    assert_eq!(counters.registrations.load(Ordering::SeqCst), 1);
     assert_eq!(
         client.server_info().expect("server info").name,
         "oauth-server"
@@ -268,58 +266,23 @@ async fn unauthorized_server_triggers_oauth_and_then_connects() {
     assert_eq!(client.tools().len(), 1);
     assert_eq!(client.tools()[0].name, "secret");
 
-    // Credentials persist for the next run, with the client id retained so a
-    // second connect does not re-register.
-    let stored = jcode_base::mcp::oauth::load_tokens("oauth-test").expect("tokens persisted");
-    assert_eq!(stored.access_token, ACCESS_TOKEN);
+    let stored = jcode_base::mcp::oauth::stored(&mcp_url).expect("credentials persisted");
+    assert_eq!(stored.access_token.as_deref(), Some(ACCESS_TOKEN));
     assert_eq!(stored.refresh_token.as_deref(), Some("test-refresh-token"));
-    assert_eq!(stored.client_id.as_deref(), Some("test-client"));
-    assert!(
-        !stored.is_expired(),
-        "a 3600s token must not read as expired"
-    );
+    assert_eq!(stored.client_id, "test-client");
+    assert!(stored.expires_at.is_some());
 
-    // A second connect with a still-valid token must not re-authorize at all:
-    // no new 401 challenge beyond the first, and no new registration.
-    let challenges_before = counters.unauthorized.load(Ordering::SeqCst);
     let _second = McpClient::connect("oauth-test".to_string(), &config)
         .await
         .expect("reconnect with stored credentials");
-    assert_eq!(
-        counters.unauthorized.load(Ordering::SeqCst),
-        challenges_before,
-        "a valid stored token must be sent on the first request, avoiding a 401"
-    );
+    assert_eq!(counters.registrations.load(Ordering::SeqCst), 1);
+    // The explicit OAuth discovery probe is intentionally unauthenticated; the
+    // actual MCP connection and subsequent reconnect use the saved token.
+    assert_eq!(counters.unauthorized.load(Ordering::SeqCst), 1);
 
-    // Now force a genuine re-authorization: keep the registered client_id and
-    // redirect URI but make the access token invalid and remove any refresh
-    // token, so the only way back in is a fresh authorization. Both values must
-    // be reused rather than registering a second client or changing the URI.
-    jcode_base::mcp::oauth::save_tokens(
-        "oauth-test",
-        &jcode_base::mcp::oauth::McpOAuthTokens {
-            access_token: "stale-token".to_string(),
-            refresh_token: None,
-            expires_at: 0,
-            client_id: stored.client_id.clone(),
-            token_endpoint: stored.token_endpoint.clone(),
-            redirect_uri: stored.redirect_uri.clone(),
-        },
-    )
-    .expect("seed stale credentials");
-
-    let _third = McpClient::connect("oauth-test".to_string(), &config)
-        .await
-        .expect("reconnect by re-authorizing with the stored client_id");
-    assert!(
-        counters.unauthorized.load(Ordering::SeqCst) > challenges_before,
-        "the stale token must have been rejected, forcing re-authorization"
-    );
-    assert_eq!(
-        counters.registrations.load(Ordering::SeqCst),
-        1,
-        "re-authorization must reuse the stored client_id instead of registering again"
-    );
-
-    unsafe { std::env::remove_var("JCODE_HOME") };
+    if let Some(previous_home) = previous_home {
+        unsafe { std::env::set_var("JCODE_HOME", previous_home) };
+    } else {
+        unsafe { std::env::remove_var("JCODE_HOME") };
+    }
 }

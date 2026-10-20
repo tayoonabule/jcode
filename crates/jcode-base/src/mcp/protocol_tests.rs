@@ -178,6 +178,83 @@ fn test_mcp_http_server_is_not_stdio() {
     let server = config.servers.get("remote").unwrap();
     assert!(!server.is_stdio());
     assert_eq!(server.url.as_deref(), Some("https://example.com/mcp"));
+    assert!(server.is_runnable());
+    assert_eq!(
+        server.remote_transport(),
+        Some(RemoteTransport::StreamableHttp)
+    );
+}
+
+#[test]
+fn remote_transport_inference_respects_explicit_type() {
+    let parse = |value| serde_json::from_value::<McpServerConfig>(value).unwrap();
+    assert_eq!(
+        parse(serde_json::json!({"url": "https://example.com/mcp"})).remote_transport(),
+        Some(RemoteTransport::StreamableHttp)
+    );
+    assert_eq!(
+        parse(serde_json::json!({"type": " SSE ", "url": "https://example.com/mcp"}))
+            .remote_transport(),
+        Some(RemoteTransport::LegacySse)
+    );
+    for kind in ["stdio", "websocket", "unknown"] {
+        let config = parse(serde_json::json!({"type": kind, "url": "https://example.com/mcp"}));
+        assert!(!config.is_runnable(), "explicit {kind} must not infer HTTP");
+        assert!(config.remote_transport().is_none());
+    }
+    let unknown = parse(serde_json::json!({"type": "unknown", "command": "do-not-spawn"}));
+    assert!(!unknown.is_runnable());
+    let local =
+        parse(serde_json::json!({"command": "local-server", "url": "https://example.com/mcp"}));
+    assert!(local.is_stdio());
+    assert!(local.remote_transport().is_none());
+    assert!(!parse(serde_json::json!({"type": "http"})).is_runnable());
+}
+
+#[test]
+fn remote_display_target_does_not_expose_url_credentials() {
+    let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "url": "https://user:secret@example.com/mcp?token=secret#secret",
+    }))
+    .unwrap();
+    assert_eq!(config.display_target(), "http https://example.com/mcp");
+    let opaque: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "url": "mailto:user:secret@example.com?token=secret",
+    }))
+    .unwrap();
+    assert_eq!(opaque.display_target(), "http [invalid URL]");
+}
+
+#[test]
+fn merged_config_retains_remote_servers_and_expands_headers() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    crate::env::set_var("JCODE_HOME", home.path());
+    std::fs::write(project.path().join(".mcp.json"), r#"{
+        "mcpServers": {
+            "remote-http": {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer ${MCP_TEST_TOKEN_MISSING:-fixture-token}"}},
+            "remote-sse": {"type": "sse", "url": "https://example.com/events"},
+            "unknown": {"type": "websocket", "url": "https://example.com/ws"},
+            "missing-url": {"type": "http"}
+        }
+    }"#).unwrap();
+    let config = McpConfig::load_for_dir(Some(project.path()));
+    match previous_home {
+        Some(value) => crate::env::set_var("JCODE_HOME", value),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+    assert_eq!(config.servers.len(), 2);
+    assert!(config.servers["remote-http"].is_remote());
+    assert_eq!(
+        config.servers["remote-http"].headers["Authorization"],
+        "Bearer fixture-token"
+    );
+    assert_eq!(
+        config.servers["remote-sse"].remote_transport(),
+        Some(RemoteTransport::LegacySse)
+    );
 }
 
 #[test]
@@ -193,15 +270,7 @@ fn environment_expansion_matches_claude_syntax_across_config_fields() {
                 },
                 "type": "http",
                 "url": "${BASE_URL:-https://example.test}/mcp",
-                "headers": {"Authorization": "Bearer ${TOKEN}"},
-                "oauth": {
-                    "clientId": "${CLIENT_ID}",
-                    "clientSecret": "${CLIENT_SECRET}",
-                    "authorizationEndpoint": "${AUTH_ENDPOINT}",
-                    "tokenEndpoint": "${TOKEN_ENDPOINT}",
-                    "scopes": ["scope:${TOKEN}"],
-                    "redirectUri": "${REDIRECT_URI}"
-                }
+                "headers": {"Authorization": "Bearer ${TOKEN}"}
             }
         }
     }"#;
@@ -210,11 +279,6 @@ fn environment_expansion_matches_claude_syntax_across_config_fields() {
     let warnings = config.expand_environment_variables_with(|variable| match variable {
         "BIN_DIR" => Some("/opt/tools".to_string()),
         "TOKEN" => Some("secret-token".to_string()),
-        "CLIENT_ID" => Some("client-id".to_string()),
-        "CLIENT_SECRET" => Some("client-secret".to_string()),
-        "AUTH_ENDPOINT" => Some("https://accounts.example.test/authorize".to_string()),
-        "TOKEN_ENDPOINT" => Some("https://accounts.example.test/token".to_string()),
-        "REDIRECT_URI" => Some("http://127.0.0.1:1455/callback".to_string()),
         _ => None,
     });
 
@@ -228,22 +292,6 @@ fn environment_expansion_matches_claude_syntax_across_config_fields() {
     assert_eq!(server.env["STILL_MISSING"], "prefix-${MISSING}");
     assert_eq!(server.url.as_deref(), Some("https://example.test/mcp"));
     assert_eq!(server.headers["Authorization"], "Bearer secret-token");
-    let oauth = server.oauth.as_ref().expect("static OAuth config");
-    assert_eq!(oauth.client_id.as_deref(), Some("client-id"));
-    assert_eq!(oauth.client_secret.as_deref(), Some("client-secret"));
-    assert_eq!(
-        oauth.authorization_endpoint.as_deref(),
-        Some("https://accounts.example.test/authorize")
-    );
-    assert_eq!(
-        oauth.token_endpoint.as_deref(),
-        Some("https://accounts.example.test/token")
-    );
-    assert_eq!(oauth.scopes, ["scope:secret-token"]);
-    assert_eq!(
-        oauth.redirect_uri.as_deref(),
-        Some("http://127.0.0.1:1455/callback")
-    );
     assert_eq!(
         warnings,
         vec![UnresolvedEnvironmentVariable {

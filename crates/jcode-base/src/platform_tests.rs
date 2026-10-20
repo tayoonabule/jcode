@@ -1,5 +1,36 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn is_process_running_excludes_unreaped_zombies() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    assert!(is_process_running(std::process::id()));
+    let mut child = Command::new("sh")
+        .args(["-c", "exit 0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn short-lived child");
+    let pid = child.id();
+    // Do not call try_wait: that would reap the zombie and miss the regression.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while is_process_running(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let reported_running = is_process_running(pid);
+    let pid_still_exists = unsafe { libc::kill(pid as i32, 0) == 0 };
+    let status = child.wait().expect("reap test child");
+    assert!(status.success());
+    assert!(
+        pid_still_exists,
+        "the assertion must exercise an unreaped PID"
+    );
+    assert!(!reported_running, "an exited zombie cannot serve requests");
+}
+
 #[test]
 fn desired_nofile_soft_limit_only_raises_when_possible() {
     assert_eq!(desired_nofile_soft_limit(1024, 524_288, 8192), Some(8192));
@@ -14,11 +45,22 @@ fn spawn_detached_creates_new_session() {
 
     let output = NamedTempFile::new().expect("temp file");
     let output_path = output.path().to_string_lossy().to_string();
-    let parent_sid = unsafe { libc::getsid(0) };
+    // macOS `ps` accepts `sess` but reports 0, so verify the detached process
+    // group there; `setsid` creates both a new session and a new process group.
+    let field = if cfg!(target_os = "macos") {
+        "pgid"
+    } else {
+        "sid"
+    };
+    let parent_id = if cfg!(target_os = "macos") {
+        unsafe { libc::getpgrp() }
+    } else {
+        unsafe { libc::getsid(0) }
+    };
 
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c")
-        .arg("ps -o sid= -p $$ > \"$JCODE_TEST_OUTPUT\"")
+        .arg(format!("ps -o {field}= -p $$ > \"$JCODE_TEST_OUTPUT\""))
         .env("JCODE_TEST_OUTPUT", &output_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -39,8 +81,8 @@ fn spawn_detached_creates_new_session() {
         "detached child should lead its own session"
     );
     assert_ne!(
-        child_sid as i32, parent_sid,
-        "detached child should not share parent session"
+        child_sid as i32, parent_id,
+        "detached child should not share the parent's session/process group"
     );
 }
 

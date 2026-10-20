@@ -1,6 +1,7 @@
 #[tokio::test]
 async fn communicate_assign_task_can_spawn_fallback_agent() {
     let _env_lock = crate::storage::lock_test_env();
+    let _isolated_runtime_identity = isolate_openrig_runtime_identity();
     let runtime_dir = tempfile::TempDir::new().expect("runtime tempdir");
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
@@ -128,11 +129,13 @@ async fn communicate_assign_task_can_spawn_fallback_agent() {
     assert_eq!(spawned_member.role.as_deref(), Some("agent"));
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]
 async fn communicate_assign_next_assigns_next_runnable_task() {
     let _env_lock = crate::storage::lock_test_env();
+    let _isolated_runtime_identity = isolate_openrig_runtime_identity();
     let runtime_dir = tempfile::TempDir::new().expect("runtime tempdir");
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
@@ -238,11 +241,13 @@ async fn communicate_assign_next_assigns_next_runnable_task() {
     );
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]
 async fn communicate_assign_next_can_prefer_fresh_spawn_server_side() {
     let _env_lock = crate::storage::lock_test_env();
+    let _isolated_runtime_identity = isolate_openrig_runtime_identity();
     let runtime_dir = tempfile::TempDir::new().expect("runtime tempdir");
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
@@ -348,11 +353,13 @@ async fn communicate_assign_next_can_prefer_fresh_spawn_server_side() {
         .expect("preferred spawned worker should appear in swarm");
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]
 async fn communicate_assign_next_can_spawn_if_needed_server_side() {
     let _env_lock = crate::storage::lock_test_env();
+    let _isolated_runtime_identity = isolate_openrig_runtime_identity();
     let runtime_dir = tempfile::TempDir::new().expect("runtime tempdir");
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
@@ -440,11 +447,13 @@ async fn communicate_assign_next_can_spawn_if_needed_server_side() {
         .expect("spawn_if_needed worker should appear in swarm");
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]
 async fn communicate_fill_slots_tops_up_to_concurrency_limit() {
     let _env_lock = crate::storage::lock_test_env();
+    let _isolated_runtime_identity = isolate_openrig_runtime_identity();
     let runtime_dir = tempfile::TempDir::new().expect("runtime tempdir");
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
@@ -534,11 +543,13 @@ async fn communicate_fill_slots_tops_up_to_concurrency_limit() {
     );
 
     server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]
 async fn communicate_assign_task_can_prefer_fresh_spawn_over_reuse() {
     let _env_lock = crate::storage::lock_test_env();
+    let _isolated_runtime_identity = isolate_openrig_runtime_identity();
     let runtime_dir = tempfile::TempDir::new().expect("runtime tempdir");
     let repo_dir = std::env::current_dir().expect("repo cwd");
     let socket_path = runtime_dir.path().join("jcode.sock");
@@ -661,4 +672,5 @@ async fn communicate_assign_task_can_prefer_fresh_spawn_over_reuse() {
         .expect("preferred spawned worker should appear in swarm");
 
     server_task.abort();
+    let _ = server_task.await;
 }

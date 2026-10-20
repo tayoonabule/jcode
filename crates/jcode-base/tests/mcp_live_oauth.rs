@@ -26,7 +26,6 @@ async fn live_remote_server_completes_oauth_and_lists_tools() {
         transport: Some("http".to_string()),
         url: Some(url.clone()),
         headers: HashMap::new(),
-        oauth: None,
         timeout_secs: None,
         enabled: None,
         disabled: None,

@@ -1,21 +1,21 @@
 //! MCP (Model Context Protocol) client implementation
 //!
-//! Connects to MCP servers that provide tools via JSON-RPC over stdio.
+//! Connects to MCP servers via JSON-RPC over stdio, Streamable HTTP, or legacy
+//! HTTP+SSE. Remote servers support static headers and explicit OAuth login.
 //! Supports shared server pools so multiple sessions reuse the same
 //! MCP server processes instead of spawning duplicates.
 
 #[cfg(unix)]
 pub mod broker;
+pub mod budget;
 mod client;
-pub mod http;
 mod manager;
 pub mod oauth;
 mod pending;
 pub mod pool;
 mod protocol;
+mod remote;
 pub mod schema_cache;
-pub mod sse;
-mod sse_wire;
 mod tool;
 
 pub use client::{DEFAULT_MCP_REQUEST_TIMEOUT, McpClient, McpHandle, request_timeout_for};
@@ -25,5 +25,5 @@ pub use protocol::*;
 pub use schema_cache::{McpSchemaCache, fingerprint_config};
 pub use tool::{
     McpTool, create_mcp_tools, create_mcp_tools_from_cached, create_mcp_tools_from_cached_many,
-    dispatch_name, dispatch_names,
+    dispatch_name, dispatch_names, take_accept_large_output,
 };

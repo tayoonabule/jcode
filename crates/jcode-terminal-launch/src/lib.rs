@@ -1007,7 +1007,10 @@ mod tests {
         command.env("OPENRIG_NODE_ID", "stale-node");
         apply_client_terminal_env(
             &mut command,
-            &[("OPENRIG_SESSION_NAME".to_string(), "main-lead@provineer".to_string())],
+            &[(
+                "OPENRIG_SESSION_NAME".to_string(),
+                "main-lead@provineer".to_string(),
+            )],
         );
         let env = command
             .get_envs()
@@ -1018,8 +1021,14 @@ mod tests {
                 )
             })
             .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(env["OPENRIG_SESSION_NAME"].as_deref(), Some("main-lead@provineer"));
-        assert_eq!(env["OPENRIG_NODE_ID"], None, "server's node id must not leak");
+        assert_eq!(
+            env["OPENRIG_SESSION_NAME"].as_deref(),
+            Some("main-lead@provineer")
+        );
+        assert_eq!(
+            env["OPENRIG_NODE_ID"], None,
+            "server's node id must not leak"
+        );
     }
 
     #[test]

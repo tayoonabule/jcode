@@ -26,7 +26,6 @@ async fn live_remote_tool_call_returns_content() {
         transport: Some("http".to_string()),
         url: Some(url),
         headers: HashMap::new(),
-        oauth: None,
         timeout_secs: None,
         enabled: None,
         disabled: None,

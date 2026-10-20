@@ -34,7 +34,6 @@ done
         transport: None,
         url: None,
         headers: std::collections::HashMap::new(),
-        oauth: None,
         enabled: None,
         disabled: None,
         timeout_secs: Some(10),
