@@ -1653,7 +1653,10 @@ impl Agent {
                 let registry_clone = self.registry.clone();
                 let tool_name_for_spawn = tc.name.clone();
                 let tool_input_for_spawn = tc.input.clone();
-                let tool_handle = tokio::spawn(async move {
+                // Task-locals do not follow tokio::spawn. Re-enter the requesting
+                // client's scope so tools on a shared server run with that client's
+                // identity (OpenRig seat, terminal), not the server process env.
+                let tool_handle = crate::hooks::spawn_with_client_env(async move {
                     registry_clone
                         .execute(&tool_name_for_spawn, tool_input_for_spawn, ctx)
                         .await

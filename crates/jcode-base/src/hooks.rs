@@ -113,6 +113,20 @@ pub fn client_env_for_tools() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// `tokio::spawn` that keeps the current client's identity.
+///
+/// Task-locals do not follow `tokio::spawn`, so a tool run in a spawned task on a
+/// shared server would otherwise see the server process env (another seat's
+/// OpenRig identity). Use this for any spawn that can run tools or hooks.
+pub fn spawn_with_client_env<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let env = client_env_for_tools();
+    tokio::spawn(CLIENT_TERMINAL_ENV.scope(env, future))
+}
+
 /// Replace server-inherited client identity on a subprocess with `env`.
 pub fn apply_client_env_pairs(mut set: impl FnMut(&str, Option<&str>), env: &[(String, String)]) {
     if env.is_empty() {
@@ -702,6 +716,29 @@ async fn run_post_tool_feedback_command(
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spawned_tool_task_keeps_requesting_clients_identity() {
+        // Regression: TUI turns spawn each tool in its own task. A plain
+        // tokio::spawn dropped the client scope, so tools on a shared server
+        // ran as whichever seat started the server.
+        let seat = vec![(
+            "OPENRIG_SESSION_NAME".to_string(),
+            "seat-a@test".to_string(),
+        )];
+        let (kept, lost) = with_client_terminal_env(seat.clone(), async {
+            let kept = spawn_with_client_env(async { client_env_for_tools() })
+                .await
+                .unwrap();
+            let lost = tokio::spawn(async { client_env_for_tools() })
+                .await
+                .unwrap();
+            (kept, lost)
+        })
+        .await;
+        assert_eq!(kept, seat);
+        assert!(lost.is_empty(), "plain spawn should not see the scope");
+    }
 
     #[test]
     fn payload_json_includes_event_and_lowercased_fields() {
