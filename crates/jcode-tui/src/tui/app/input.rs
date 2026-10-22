@@ -3872,7 +3872,11 @@ impl App {
     pub(super) fn take_streaming_text(&mut self) -> String {
         let content = std::mem::take(&mut self.streaming.streaming_text);
         self.stream_message_ended = false;
-        self.deferred_stream_done_id = None;
+        // Do not clear `deferred_stream_done_id` here. Committing the live text
+        // is not a turn boundary: a Done deferred for the paced backlog must
+        // still be replayed by the tick, otherwise `current_message_id` is never
+        // cleared and the client treats every later Done as "unrelated",
+        // stranding queued input until Escape.
         self.reasoning_streaming = false;
         self.reasoning_pending_line.clear();
         self.reasoning_partial_len = 0;

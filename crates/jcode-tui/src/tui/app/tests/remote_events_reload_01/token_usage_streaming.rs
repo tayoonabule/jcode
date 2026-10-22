@@ -234,6 +234,52 @@ fn test_remote_done_waits_for_paced_backlog_and_one_live_frame() {
 }
 
 #[test]
+fn test_remote_deferred_done_survives_soft_interrupt_injected_before_backlog_drains() {
+    // Regression: a deferred Done was dropped when an idle-promoted soft
+    // interrupt's SoftInterruptInjected committed the live text first. The
+    // client then kept the finished turn's id as current forever, ignored
+    // every later Done as "unrelated", and stranded queued input until Escape.
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.current_message_id = Some(42);
+    app.is_processing = true;
+    app.status = ProcessingStatus::Streaming;
+    let ops = app.stream_buffer.push_text("paced text");
+    app.apply_stream_ops(ops);
+    assert!(!app.stream_buffer.is_empty());
+
+    app.handle_server_event(crate::protocol::ServerEvent::Done { id: 42 }, &mut remote);
+    assert_eq!(app.deferred_stream_done_id, Some(42));
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::SoftInterruptInjected {
+            content: "queued follow-up".to_string(),
+            display_role: None,
+            point: "idle".to_string(),
+            tools_skipped: None,
+            client_ids: Vec::new(),
+        },
+        &mut remote,
+    );
+    assert_eq!(
+        app.deferred_stream_done_id,
+        Some(42),
+        "committing live text must not drop the deferred Done"
+    );
+
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(20));
+        rt.block_on(crate::tui::app::remote::handle_tick(&mut app, &mut remote));
+    }
+    assert_eq!(app.deferred_stream_done_id, None);
+    assert_eq!(app.current_message_id, None);
+    assert!(!app.is_processing);
+}
+
+#[test]
 fn test_handle_server_event_tps_connection_phase_streaming_starts_collection_only_for_streaming() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
