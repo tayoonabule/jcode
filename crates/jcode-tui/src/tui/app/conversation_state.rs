@@ -589,8 +589,16 @@ impl App {
                 &self.provider.model(),
                 crate::telemetry::SessionEndReason::NormalExit,
             );
-            self.session.mark_closed();
-            let _ = self.session.save();
+            // Only a local session may save here. For a remote client the
+            // server owns the session file and marks it Closed when this
+            // client disconnects. The client only holds a startup stub whose
+            // metadata (notably `compaction`) is stale; saving it journals
+            // `compaction: null` over the server's summary, so the next
+            // resume replays the whole transcript.
+            if !self.is_remote {
+                self.session.mark_closed();
+                let _ = self.session.save();
+            }
             self.should_quit = true;
             return true;
         }

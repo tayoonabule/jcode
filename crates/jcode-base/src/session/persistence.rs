@@ -739,7 +739,15 @@ impl Session {
         } else {
             let entry_build_start = Instant::now();
             let mut entry_meta = current_meta.clone();
-            if entry_meta.compaction.is_some()
+            if self.persist_state.transcript_stripped {
+                // A transcript-stripped stub (remote client shadow copy) has
+                // its `compaction` cleared, not unknown-and-empty. Journaling
+                // that as `compaction: null` erased the server's summary, and
+                // the next resume replayed the whole transcript (multi-MB
+                // requests, context_length_exceeded). Never let a stub write it.
+                entry_meta.compaction = None;
+                entry_meta.compaction_unchanged = true;
+            } else if entry_meta.compaction.is_some()
                 && self
                     .persist_state
                     .last_meta

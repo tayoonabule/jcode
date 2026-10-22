@@ -3220,6 +3220,62 @@ fn journal_entries_elide_unchanged_compaction_but_loads_keep_it() -> Result<()> 
     Ok(())
 }
 
+/// A remote client holds a transcript-stripped stub of the server's session
+/// (compaction cleared). Its saves (quit, memory injection, deferred turn
+/// save) must not journal `compaction: null` over the server's summary, or
+/// the next resume replays the whole transcript to the provider.
+#[test]
+fn stripped_stub_save_never_erases_persisted_compaction() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-compaction-stub-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_compaction_stub_save";
+    let mut server = Session::create_with_id(session_id.to_string(), None, None);
+    for i in 0..4 {
+        server.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: format!("hello {i}"),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: Some(Utc::now()),
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    server.compaction = Some(big_compaction("S"));
+    server.save()?;
+
+    // Client-side shadow copies: both the raw startup stub and the stripped
+    // remote copy.
+    let mut stub = Session::load_startup_stub(session_id)?;
+    stub.strip_transcript_for_remote_client();
+    assert_eq!(stub.compaction, None);
+    stub.mark_closed();
+    // A checkpointing save is refused outright; an append save must journal
+    // compaction as unchanged. Either way the server's summary survives.
+    let _ = stub.save();
+
+    let mut raw_stub = Session::load_startup_stub(session_id)?;
+    raw_stub.strip_transcript_for_remote_client();
+    let _ = raw_stub.save();
+
+    let reloaded = Session::load(session_id)?;
+    assert_eq!(reloaded.messages.len(), 4);
+    assert_eq!(reloaded.compaction, Some(big_compaction("S")));
+    assert_eq!(
+        Session::load_startup_stub(session_id)?.compaction,
+        Some(big_compaction("S"))
+    );
+    Ok(())
+}
+
 /// Journals written before the elision flag existed carry the full
 /// compaction in every entry and must still load unchanged.
 #[test]
