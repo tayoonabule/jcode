@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 const CLIENT_WRITER_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CLIENT_WRITER_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CLIENT_WRITER_CHUNK_BYTES: usize = 64 * 1024;
 
 pub(super) async fn write_client_bytes(
     writer: &Arc<Mutex<crate::transport::WriteHalf>>,
@@ -36,16 +37,20 @@ async fn write_client_bytes_with_timeout(
             ));
             anyhow::anyhow!("client writer lock timed out")
         })?;
-    tokio::time::timeout(write_timeout, guard.write_all(bytes))
-        .await
-        .map_err(|_| {
-            crate::logging::warn(&format!(
-                "client socket write timed out after {}ms ({} bytes); dropping connection",
-                write_timeout.as_millis(),
-                bytes.len()
-            ));
-            anyhow::anyhow!("client socket write timed out")
-        })??;
+    for (chunk_index, chunk) in bytes.chunks(CLIENT_WRITER_CHUNK_BYTES).enumerate() {
+        tokio::time::timeout(write_timeout, guard.write_all(chunk))
+            .await
+            .map_err(|_| {
+                crate::logging::warn(&format!(
+                    "client socket write timed out after {}ms ({} bytes total, chunk {} of {}); dropping connection",
+                    write_timeout.as_millis(),
+                    bytes.len(),
+                    chunk_index + 1,
+                    bytes.len().div_ceil(CLIENT_WRITER_CHUNK_BYTES)
+                ));
+                anyhow::anyhow!("client socket write timed out")
+            })??;
+    }
     Ok(())
 }
 
@@ -83,6 +88,45 @@ mod tests {
     use crate::side_panel::{
         SidePanelPage, SidePanelPageFormat, SidePanelPageSource, SidePanelSnapshot,
     };
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn slow_reader_receives_large_event_without_write_timeout() {
+        let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let (_, writer) = server.into_split();
+        let writer = Arc::new(Mutex::new(writer));
+        let payload = vec![b'x'; 600 * 1024];
+        let expected_len = payload.len();
+
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::with_capacity(expected_len);
+            let mut buffer = vec![0; 50 * 1024];
+            while received.len() < expected_len {
+                client.read_exact(&mut buffer).await.unwrap();
+                received.extend_from_slice(&buffer);
+                if received.len() < expected_len {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+            received
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            write_client_bytes_with_timeout(
+                &writer,
+                &payload,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("a slow but progressing reader must not hit a whole-event deadline")
+        .expect("large event should be fully written");
+
+        let received = reader.await.unwrap();
+        assert_eq!(received, payload);
+    }
 
     #[tokio::test]
     async fn stopped_client_reader_times_out_and_releases_writer() {
