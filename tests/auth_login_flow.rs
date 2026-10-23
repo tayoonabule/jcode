@@ -9,7 +9,7 @@ use jcode_provider_openrouter_runtime::OpenRouterProvider;
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
@@ -70,6 +70,7 @@ struct TestEnv {
 impl TestEnv {
     fn new() -> Result<Self> {
         let lock = lock_env();
+        jcode_provider_openrouter_runtime::reset_profile_catalog_refresh_tracker_for_tests();
         let temp = tempfile::Builder::new()
             .prefix("jcode-auth-flow-")
             .tempdir()?;
@@ -130,6 +131,7 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
+        jcode_provider_openrouter_runtime::reset_profile_catalog_refresh_tracker_for_tests();
         AuthStatus::invalidate_cache();
         for (key, value) in &self.saved {
             if let Some(value) = value {
@@ -146,6 +148,7 @@ struct FakeModelsServer {
     api_base: String,
     requests: mpsc::Receiver<String>,
     request_count: Arc<AtomicUsize>,
+    accepted_connections: Arc<AtomicUsize>,
 }
 
 fn spawn_models_server(
@@ -170,22 +173,43 @@ fn spawn_raw_models_server(
     let (request_tx, request_rx) = mpsc::channel();
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_count_thread = Arc::clone(&request_count);
+    let accepted_connections = Arc::new(AtomicUsize::new(0));
+    let accepted_connections_thread = Arc::clone(&accepted_connections);
     let body = body.into();
     let status = status.into();
 
     std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while request_count_thread.load(Ordering::SeqCst) < max_requests
             && Instant::now() < deadline
         {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    accepted_connections_thread.fetch_add(1, Ordering::SeqCst);
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .expect("set read timeout");
-                    let mut request = vec![0u8; 8192];
-                    let n = stream.read(&mut request).unwrap_or(0);
-                    let request = String::from_utf8_lossy(&request[..n]).into_owned();
+                    let mut request = Vec::with_capacity(1024);
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if request.is_empty() || !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        continue;
+                    }
+                    let request = String::from_utf8_lossy(&request).into_owned();
                     request_count_thread.fetch_add(1, Ordering::SeqCst);
                     let _ = request_tx.send(request);
 
@@ -212,7 +236,47 @@ fn spawn_raw_models_server(
         api_base: format!("http://{addr}/v1"),
         requests: request_rx,
         request_count,
+        accepted_connections,
     }
+}
+
+#[test]
+fn models_server_ignores_connections_closed_before_a_request() -> Result<()> {
+    let server = spawn_models_server(
+        1,
+        r#"{"data":[{"id":"after-abandoned-connection","object":"model"}]}"#,
+        Duration::ZERO,
+    );
+
+    drop(TcpStream::connect(
+        server
+            .api_base
+            .trim_start_matches("http://")
+            .trim_end_matches("/v1"),
+    )?);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while server.accepted_connections.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(server.accepted_connections.load(Ordering::SeqCst), 1);
+
+    let address = server
+        .api_base
+        .trim_start_matches("http://")
+        .trim_end_matches("/v1");
+    let mut stream = TcpStream::connect(address)?;
+    stream.write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("after-abandoned-connection"));
+    let request = server.requests.recv_timeout(Duration::from_secs(2))?;
+    assert_models_request(&request);
+    assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+
+    Ok(())
 }
 
 fn assert_models_request(request: &str) {
