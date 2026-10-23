@@ -1219,6 +1219,8 @@ pub struct FeatureConfig {
     /// classified as misses. Harness changes without a documented cause raise a
     /// warning, while explained misses are informational (default: true).
     pub kv_cache_miss_notices: bool,
+    /// Record and deliver end-of-turn todo quality review observations (default: false).
+    pub todo_quality_review: bool,
     /// Update channel: "stable" (releases only) or "main" (latest commits)
     pub update_channel: UpdateChannel,
 }
@@ -1234,6 +1236,7 @@ impl Default for FeatureConfig {
             message_timestamps: true,
             persist_memory_injections: false,
             kv_cache_miss_notices: true,
+            todo_quality_review: false,
             update_channel: UpdateChannel::default(),
         }
     }

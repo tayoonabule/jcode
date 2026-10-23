@@ -1619,10 +1619,7 @@ impl App {
     /// Delivered at most once per turn: the reminder asks the model to verify
     /// weak points, and re-asking after it has done so would loop. The
     /// observation log is cleared either way, so the next turn starts clean.
-    fn deliver_deferred_gate_digest_if_needed(&mut self) -> bool {
-        if self.todo_gate_digest_delivered {
-            return false;
-        }
+    pub(super) fn deliver_deferred_gate_digest_if_needed(&mut self) -> bool {
         // In a remote client `self.session` is the local wrapper session, while
         // todo tools execute against the remote session. Reading the wrapper's
         // files makes every persisted remote assessment appear to be missing.
@@ -1631,6 +1628,13 @@ impl App {
             .as_deref()
             .unwrap_or_else(|| self.session_id())
             .to_string();
+        if !crate::config::todo_quality_review_enabled() {
+            let _ = crate::todo::clear_gate_observations(&session_id);
+            return false;
+        }
+        if self.todo_gate_digest_delivered {
+            return false;
+        }
         let observations = crate::todo::load_gate_observations(&session_id).unwrap_or_default();
         if observations.is_empty() {
             return false;

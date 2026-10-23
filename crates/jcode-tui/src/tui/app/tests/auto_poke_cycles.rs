@@ -83,6 +83,7 @@ fn auto_poke_does_not_repeat_until_incomplete_todos_change() {
 #[test]
 fn completed_cycle_rearms_auto_poke_only_when_default_on() {
     with_temp_jcode_home(|| {
+        crate::env::set_var("JCODE_TODO_QUALITY_REVIEW", "1");
         let completed = |id: &str| crate::todo::TodoItem {
             id: id.to_string(),
             content: "Done".to_string(),

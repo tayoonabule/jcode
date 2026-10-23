@@ -890,8 +890,11 @@ impl Tool for TodoTool {
                 let stored_plan = load_plan(&ctx.session_id).unwrap_or_default();
                 let goals = prune_orphaned_goals(merge_goals(&stored_goals, params.goals), &todos);
                 let plan = merge_plan(&stored_plan, params.plan);
-                let (observations, nudges) =
-                    record_reframe_observations(&plan, &goals, &todos, &previous);
+                let (observations, nudges) = if crate::config::todo_quality_review_enabled() {
+                    record_reframe_observations(&plan, &goals, &todos, &previous)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 for observation in &observations {
                     let kind = match observation.kind {
                         GateObservationKind::IntentUnderstanding => {
@@ -1832,8 +1835,10 @@ mod tests {
     async fn a_moderate_first_write_returns_no_continuation_and_records_instead() {
         let _guard = crate::storage::lock_test_env();
         let previous_home = std::env::var_os("JCODE_HOME");
+        let previous_review = std::env::var_os("JCODE_TODO_QUALITY_REVIEW");
         let dir = tempfile::TempDir::new().expect("tempdir");
         crate::env::set_var("JCODE_HOME", dir.path());
+        crate::env::set_var("JCODE_TODO_QUALITY_REVIEW", "1");
         let session = "gate-deferral-execute";
 
         let output = TodoTool::new()
@@ -1955,6 +1960,50 @@ mod tests {
             Some(value) => crate::env::set_var("JCODE_HOME", value),
             None => crate::env::remove_var("JCODE_HOME"),
         }
+        match previous_review {
+            Some(value) => crate::env::set_var("JCODE_TODO_QUALITY_REVIEW", value),
+            None => crate::env::remove_var("JCODE_TODO_QUALITY_REVIEW"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_quality_review_does_not_compute_or_record_observations() {
+        let _guard = crate::storage::lock_test_env();
+        let previous_home = std::env::var_os("JCODE_HOME");
+        let previous_review = std::env::var_os("JCODE_TODO_QUALITY_REVIEW");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", dir.path());
+        crate::env::remove_var("JCODE_TODO_QUALITY_REVIEW");
+        crate::config::invalidate_config_cache();
+        let session = "todo-quality-review-disabled";
+
+        TodoTool::new()
+            .execute(
+                json!({
+                    "todos": [{"id":"work","content":"ship","status":"in_progress","priority":"high","confidence":60}],
+                    "plan": {"user_intention":"ship", "understands_user_intent":60},
+                    "goals": [{"closed_feedback_loop":60,"feedback_loop":"run checks","feedback_loop_relevance":"indirect","feedback_loop_coverage":"narrow"}]
+                }),
+                test_ctx(session),
+            )
+            .await
+            .expect("todo write should succeed with review disabled");
+
+        assert!(
+            crate::todo::load_gate_observations(session)
+                .expect("observations")
+                .is_empty()
+        );
+
+        match previous_home {
+            Some(value) => crate::env::set_var("JCODE_HOME", value),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+        match previous_review {
+            Some(value) => crate::env::set_var("JCODE_TODO_QUALITY_REVIEW", value),
+            None => crate::env::remove_var("JCODE_TODO_QUALITY_REVIEW"),
+        }
+        crate::config::invalidate_config_cache();
     }
 
     #[tokio::test]

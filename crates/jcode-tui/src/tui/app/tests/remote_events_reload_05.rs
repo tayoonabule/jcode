@@ -869,6 +869,7 @@ fn test_repeated_guardrail_refusals_stop_auto_poke_loop() {
 #[test]
 fn test_gate_digest_is_delivered_at_turn_end_and_rearms_next_cycle() {
     with_temp_jcode_home(|| {
+        crate::env::set_var("JCODE_TODO_QUALITY_REVIEW", "1");
         let mut app = create_test_app();
         app.auto_poke_incomplete_todos = true;
 
@@ -971,30 +972,73 @@ fn test_gate_digest_is_delivered_at_turn_end_and_rearms_next_cycle() {
             "final response handoff should be queued"
         );
 
-        // Simulate that handoff completing. The stale review observation must
-        // be consumed here, before the next cycle is re-armed.
+        // Simulate that handoff completing. The next work cycle must have a
+        // different todo fingerprint, otherwise duplicate final-response
+        // continuations for the same completed work are correctly suppressed.
         app.queued_messages.clear();
         app.pending_queued_dispatch = false;
+        let mut next_cycle_todos = crate::todo::load_todos(&app.session.id).expect("load todos");
+        next_cycle_todos.push(crate::todo::TodoItem {
+            id: "todo-2".to_string(),
+            content: "Update the docs".to_string(),
+            status: "completed".to_string(),
+            priority: "normal".to_string(),
+            confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
+            completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
+            ..Default::default()
+        });
+        crate::todo::save_todos(&app.session.id, &next_cycle_todos).expect("save next-cycle todo");
+        crate::todo::append_gate_observations(
+            &app.session.id,
+            &[crate::todo::GateObservation {
+                kind: crate::todo::GateObservationKind::IntentUnderstanding,
+                group: None,
+                state: Some("partial".to_string()),
+            }],
+        )
+        .expect("record next-cycle observation");
         assert!(
             app.schedule_auto_poke_followup_if_needed(),
-            "with nothing left outstanding the final response should be requested"
+            "new work should re-arm the quality review"
         );
-        assert_eq!(
-            app.queued_messages,
-            vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()]
-        );
-        app.queued_messages.clear();
-        app.pending_queued_dispatch = false;
-        assert!(!app.schedule_auto_poke_followup_if_needed());
         assert!(
-            !app.todo_gate_digest_delivered,
-            "a finished cycle must re-arm the review for later work"
+            app.queued_messages
+                .last()
+                .is_some_and(|message| message.starts_with(crate::todo::TODO_GATE_DIGEST_PREFIX)),
+            "the new cycle should queue its deferred quality review"
         );
+        assert!(app.todo_gate_digest_delivered);
         assert!(
             crate::todo::load_gate_observations(&app.session.id)
-                .expect("reload after completion")
+                .expect("reload after next cycle")
                 .is_empty(),
-            "completed cycle must clear observations recorded during review"
+            "the new-cycle digest should consume its observations"
+        );
+    });
+}
+
+#[test]
+fn test_disabled_gate_digest_clears_observations_without_queueing() {
+    with_temp_jcode_home(|| {
+        crate::env::remove_var("JCODE_TODO_QUALITY_REVIEW");
+        let mut app = create_test_app();
+        crate::todo::append_gate_observations(
+            &app.session.id,
+            &[crate::todo::GateObservation {
+                kind: crate::todo::GateObservationKind::IntentUnderstanding,
+                group: None,
+                state: Some("partial".to_string()),
+            }],
+        )
+        .expect("record stale observation");
+
+        assert!(!app.deliver_deferred_gate_digest_if_needed());
+        assert!(app.queued_messages.is_empty());
+        assert!(
+            crate::todo::load_gate_observations(&app.session.id)
+                .expect("observations")
+                .is_empty(),
+            "disabled review should discard stale observations"
         );
     });
 }
