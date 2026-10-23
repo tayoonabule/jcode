@@ -25,7 +25,7 @@ use super::client_session::{
 use super::client_state::{
     handle_get_compacted_history, handle_get_history, handle_get_model_catalog, handle_get_state,
 };
-use super::client_writer::write_direct_event;
+use super::client_writer::{write_client_bytes, write_direct_event};
 use super::comm_await::{CommAwaitMembersContext, handle_comm_await_members};
 use super::comm_control::{
     handle_client_debug_command, handle_client_debug_response, handle_comm_assign_next,
@@ -70,7 +70,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
@@ -662,6 +662,7 @@ pub(super) async fn handle_client(
     let writer_clone = Arc::clone(&writer);
     let client_connection_id_for_events = client_connection_id.clone();
     let client_connections_for_events = Arc::clone(&client_connections);
+    let (writer_failed_tx, mut writer_failed_rx) = tokio::sync::watch::channel(false);
     let event_handle = tokio::spawn(async move {
         while let Some(event) = client_event_rx.recv().await {
             {
@@ -686,8 +687,7 @@ pub(super) async fn handle_client(
                 }
             }
             let json = encode_event(&event);
-            let mut w = writer_clone.lock().await;
-            if let Err(error) = w.write_all(json.as_bytes()).await {
+            if let Err(error) = write_client_bytes(&writer_clone, json.as_bytes()).await {
                 // A broken pipe here is routine (client reload/disconnect mid
                 // broadcast), so keep the line short: a full Debug dump of e.g.
                 // a SwarmStatus event prints every member and floods the log.
@@ -696,6 +696,7 @@ pub(super) async fn handle_client(
                     "event_forwarder write failed for connection {} while sending {}: {}",
                     client_connection_id_for_events, event_desc, error
                 ));
+                let _ = writer_failed_tx.send(true);
                 break;
             }
         }
@@ -922,6 +923,15 @@ pub(super) async fn handle_client(
                 }
                 continue;
             }
+            result = writer_failed_rx.changed() => {
+                if result.is_err() || *writer_failed_rx.borrow() {
+                    crate::logging::warn(&format!(
+                        "Closing client connection {} after bounded writer failure",
+                        client_connection_id
+                    ));
+                    break;
+                }
+            }
             }
 
             match decode_request(&line) {
@@ -933,8 +943,7 @@ pub(super) async fn handle_client(
                         retry_after_secs: None,
                     };
                     let json = encode_event(&event);
-                    let mut w = writer.lock().await;
-                    if w.write_all(json.as_bytes()).await.is_err() {
+                    if write_client_bytes(&writer, json.as_bytes()).await.is_err() {
                         break;
                     }
                     continue;
@@ -1114,8 +1123,7 @@ pub(super) async fn handle_client(
         let json = encode_event(&ack);
         {
             let ack_start = Instant::now();
-            let mut w = writer.lock().await;
-            if w.write_all(json.as_bytes()).await.is_err() {
+            if write_client_bytes(&writer, json.as_bytes()).await.is_err() {
                 if request_lifecycle_logged {
                     let mut fields =
                         server_request_lifecycle_fields(ServerRequestLifecycleFields {
@@ -1581,8 +1589,7 @@ pub(super) async fn handle_client(
             Request::Ping { id } => {
                 let event = super::session_connections::connection_presence_pong(id, &client_connections, &swarm_members).await;
                 let json = encode_event(&event);
-                let mut w = writer.lock().await;
-                if w.write_all(json.as_bytes()).await.is_err() {
+                if write_client_bytes(&writer, json.as_bytes()).await.is_err() {
                     break;
                 }
             }
@@ -1590,8 +1597,7 @@ pub(super) async fn handle_client(
             Request::PrepareDisconnect { id } => {
                 drop(crate::tool::sdk::ConnectionGuard(client_connection_id.clone()));
                 let json = encode_event(&ServerEvent::Done { id });
-                let mut w = writer.lock().await;
-                if w.write_all(json.as_bytes()).await.is_err() {
+                if write_client_bytes(&writer, json.as_bytes()).await.is_err() {
                     break;
                 }
             }

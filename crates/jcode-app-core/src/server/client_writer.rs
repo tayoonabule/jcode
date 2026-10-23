@@ -4,6 +4,51 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+const CLIENT_WRITER_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CLIENT_WRITER_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub(super) async fn write_client_bytes(
+    writer: &Arc<Mutex<crate::transport::WriteHalf>>,
+    bytes: &[u8],
+) -> Result<()> {
+    write_client_bytes_with_timeout(
+        writer,
+        bytes,
+        CLIENT_WRITER_LOCK_TIMEOUT,
+        CLIENT_WRITER_WRITE_TIMEOUT,
+    )
+    .await
+}
+
+async fn write_client_bytes_with_timeout(
+    writer: &Arc<Mutex<crate::transport::WriteHalf>>,
+    bytes: &[u8],
+    lock_timeout: std::time::Duration,
+    write_timeout: std::time::Duration,
+) -> Result<()> {
+    let mut guard = tokio::time::timeout(lock_timeout, writer.lock())
+        .await
+        .map_err(|_| {
+            crate::logging::warn(&format!(
+                "client writer lock timed out after {}ms ({} bytes); dropping connection",
+                lock_timeout.as_millis(),
+                bytes.len()
+            ));
+            anyhow::anyhow!("client writer lock timed out")
+        })?;
+    tokio::time::timeout(write_timeout, guard.write_all(bytes))
+        .await
+        .map_err(|_| {
+            crate::logging::warn(&format!(
+                "client socket write timed out after {}ms ({} bytes); dropping connection",
+                write_timeout.as_millis(),
+                bytes.len()
+            ));
+            anyhow::anyhow!("client socket write timed out")
+        })??;
+    Ok(())
+}
+
 /// Project wire copies only. Persisted state and opted-in API bridges retain
 /// PDF bytes, while old native clients can decode the complete History event.
 pub(super) fn side_panel_for_client(
@@ -29,9 +74,7 @@ pub(super) async fn write_direct_event(
     event: &ServerEvent,
 ) -> Result<()> {
     let json = encode_event(event);
-    let mut w = writer.lock().await;
-    w.write_all(json.as_bytes()).await?;
-    Ok(())
+    write_client_bytes(writer, json.as_bytes()).await
 }
 
 #[cfg(test)]
@@ -40,6 +83,50 @@ mod tests {
     use crate::side_panel::{
         SidePanelPage, SidePanelPageFormat, SidePanelPageSource, SidePanelSnapshot,
     };
+
+    #[tokio::test]
+    async fn stopped_client_reader_times_out_and_releases_writer() {
+        let (server, _client_that_does_not_read) = tokio::net::UnixStream::pair().unwrap();
+        let (_, writer) = server.into_split();
+        let writer = Arc::new(Mutex::new(writer));
+        let _held_guard = writer.lock().await;
+        let lock_result = write_client_bytes_with_timeout(
+            &writer,
+            b"lock timeout probe",
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            lock_result
+                .unwrap_err()
+                .to_string()
+                .contains("lock timed out")
+        );
+        drop(_held_guard);
+
+        let payload = vec![b'x'; 16 * 1024 * 1024];
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            write_client_bytes_with_timeout(
+                &writer,
+                &payload,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("a peer that stopped reading must not block the writer indefinitely");
+
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), writer.lock())
+                .await
+                .is_ok(),
+            "timed-out writes must release the writer mutex"
+        );
+    }
 
     #[test]
     fn pdf_panels_live_projection_preserves_fallback_and_opted_in_payload() {

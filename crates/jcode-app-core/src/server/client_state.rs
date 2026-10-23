@@ -1,4 +1,5 @@
 use super::ClientConnectionInfo;
+use super::client_writer::write_client_bytes;
 use super::server_has_newer_binary;
 use crate::agent::Agent;
 use crate::bus::Bus;
@@ -19,7 +20,6 @@ type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 pub(super) enum HistoryPayloadMode {
     Full,
 }
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
 const ATTACH_MODEL_PREFETCH_DEBOUNCE_SECS: u64 = 15;
@@ -398,22 +398,16 @@ pub(super) async fn handle_get_model_catalog(
     let json = encode_event(&event);
     let encode_ms = encode_started.elapsed().as_millis();
     let write_started = Instant::now();
-    let mut writer_guard = writer.lock().await;
-    let writer_lock_ms = write_started.elapsed().as_millis();
-    writer_guard.write_all(json.as_bytes()).await?;
-    let write_ms = write_started
-        .elapsed()
-        .as_millis()
-        .saturating_sub(writer_lock_ms);
+    write_client_bytes(writer, json.as_bytes()).await?;
+    let writer_wait_ms = write_started.elapsed().as_millis();
     crate::logging::info(&format!(
-        "[TIMING] handle_get_model_catalog: session={}, source={}, bytes={}, build={}ms, encode={}ms, writer_lock={}ms, write={}ms, total={}ms",
+        "[TIMING] handle_get_model_catalog: session={}, source={}, bytes={}, build={}ms, encode={}ms, writer_wait={}ms, total={}ms",
         session_id,
         source,
         json.len(),
         build_ms,
         encode_ms,
-        writer_lock_ms,
-        write_ms,
+        writer_wait_ms,
         started.elapsed().as_millis()
     ));
     Ok(())
@@ -1117,26 +1111,21 @@ async fn send_history_with_guard(
     drop(history_event);
     let json_len = json.len();
     let encode_ms = encode_start.elapsed().as_millis();
-    let writer_lock_start = Instant::now();
-    let mut writer_guard = writer.lock().await;
-    let writer_lock_ms = writer_lock_start.elapsed().as_millis();
     let write_start = Instant::now();
-    let result = writer_guard.write_all(json.as_bytes()).await;
-    drop(writer_guard);
+    let result = write_client_bytes(writer, json.as_bytes()).await;
     // Release the serialized payload before any further work (logging below
     // only needs the captured length).
     drop(json);
-    let write_ms = write_start.elapsed().as_millis();
+    let writer_wait_ms = write_start.elapsed().as_millis();
 
     crate::logging::info(&format!(
-        "[TIMING] send_history write: session={}, bytes={}, build={}ms ({}), encode={}ms, writer_lock={}ms, write={}ms, total={}ms",
+        "[TIMING] send_history write: session={}, bytes={}, build={}ms ({}), encode={}ms, writer_wait={}ms, total={}ms",
         session_id,
         json_len,
         build_ms,
         build_parts,
         encode_ms,
-        writer_lock_ms,
-        write_ms,
+        writer_wait_ms,
         history_start.elapsed().as_millis(),
     ));
 
@@ -1193,8 +1182,7 @@ async fn write_event(writer: &Arc<Mutex<WriteHalf>>, event: &ServerEvent) -> Res
     // outlive the socket write.
     let mut buf = serde_json::to_vec(event).unwrap_or_else(|_| b"{}".to_vec());
     buf.push(b'\n');
-    let mut writer = writer.lock().await;
-    writer.write_all(&buf).await?;
+    write_client_bytes(writer, &buf).await?;
     drop(buf);
     Ok(())
 }
