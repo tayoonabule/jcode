@@ -34,7 +34,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
 pub(super) fn parse_swarm_spawn_mode(
     id: u64,
@@ -245,7 +245,7 @@ pub(super) struct LightweightControlContext<'a> {
 
 pub(super) async fn handle_lightweight_control_request(
     request: Request,
-    writer: Arc<Mutex<crate::transport::WriteHalf>>,
+    writer: super::client_writer::ClientWriter,
     context: LightweightControlContext<'_>,
 ) -> Result<()> {
     let LightweightControlContext {
@@ -287,7 +287,7 @@ pub(super) async fn handle_lightweight_control_request(
     write_direct_event(&writer, &ServerEvent::Ack { id: request.id() }).await?;
 
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let writer_clone = Arc::clone(&writer);
+    let writer_clone = writer.clone();
     let event_handle = tokio::spawn(async move {
         while let Some(event) = client_event_rx.recv().await {
             if let Err(error) = write_direct_event(&writer_clone, &event).await {

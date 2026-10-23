@@ -9,7 +9,6 @@ use crate::protocol::{
 };
 use crate::provider::Provider;
 use crate::session::{Session, SessionStatus};
-use crate::transport::WriteHalf;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
@@ -156,7 +155,7 @@ pub(super) async fn handle_get_state(
     client_is_processing: bool,
     pending_soft_interrupts: usize,
     sessions: &SessionAgents,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &super::client_writer::ClientWriter,
 ) -> Result<()> {
     let session_count = {
         let sessions_guard = sessions.read().await;
@@ -190,7 +189,7 @@ pub(super) async fn handle_get_history(
     sessions: &SessionAgents,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     client_count: &Arc<RwLock<usize>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &super::client_writer::ClientWriter,
     server_name: &str,
     server_icon: &str,
     was_interrupted: Option<bool>,
@@ -269,7 +268,7 @@ pub(super) async fn handle_get_model_catalog(
     session_id: &str,
     agent: &Arc<Mutex<Agent>>,
     provider: &Arc<dyn Provider>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &super::client_writer::ClientWriter,
 ) -> Result<()> {
     let started = Instant::now();
     let build_started = Instant::now();
@@ -417,7 +416,7 @@ pub(super) async fn handle_get_compacted_history(
     id: u64,
     session_id: &str,
     agent: &Arc<Mutex<Agent>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &super::client_writer::ClientWriter,
     visible_messages: usize,
 ) -> Result<()> {
     let started = Instant::now();
@@ -679,7 +678,7 @@ async fn send_history_from_persisted_session(
     provider: &Arc<dyn Provider>,
     sessions: &SessionAgents,
     client_count: &Arc<RwLock<usize>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &super::client_writer::ClientWriter,
     server_name: &str,
     server_icon: &str,
     was_interrupted: Option<bool>,
@@ -846,7 +845,7 @@ async fn send_history_with_guard(
     agent_guard: tokio::sync::MutexGuard<'_, Agent>,
     sessions: &SessionAgents,
     client_count: &Arc<RwLock<usize>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &super::client_writer::ClientWriter,
     server_name: &str,
     server_icon: &str,
     was_interrupted: Option<bool>,
@@ -1175,7 +1174,10 @@ pub(super) async fn session_activity_snapshot(
     })
 }
 
-async fn write_event(writer: &Arc<Mutex<WriteHalf>>, event: &ServerEvent) -> Result<()> {
+async fn write_event(
+    writer: &super::client_writer::ClientWriter,
+    event: &ServerEvent,
+) -> Result<()> {
     // Serialize straight to bytes with the same framing as encode_event
     // (JSON body, "{}" on serialize failure, trailing newline) and drop the
     // buffer as soon as the bytes are written so the serialized copy does not

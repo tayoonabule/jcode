@@ -93,8 +93,6 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
 
     let mut client_selfdev = false;
     let mut client_session_id = temp_session_id.to_string();
-    let writer_guard = writer.lock().await;
-
     let resume_task = tokio::spawn({
         let agent = Arc::clone(&agent);
         let provider = Arc::clone(&provider);
@@ -112,7 +110,7 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         let swarm_plans = Arc::clone(&swarm_plans);
         let swarm_coordinators = Arc::clone(&swarm_coordinators);
         let client_count = Arc::clone(&client_count);
-        let writer = Arc::clone(&writer);
+        let writer = writer.clone();
         let client_event_tx = client_event_tx.clone();
         let mcp_pool = Arc::clone(&mcp_pool);
         let event_history = Arc::clone(&event_history);
@@ -177,13 +175,6 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
     })
     .await
     .map_err(|_| anyhow!("live event sender should register before history replay completes"))?;
-
-    assert!(
-        !resume_task.is_finished(),
-        "resume should still be blocked on history replay while writer is locked"
-    );
-
-    drop(writer_guard);
 
     resume_task
         .await

@@ -213,7 +213,7 @@ fn status(_id: u64, step: &str, message: impl Into<String>) -> ServerEvent {
 pub(super) async fn handle(
     id: u64,
     candidate: &str,
-    writer: &Arc<Mutex<crate::transport::WriteHalf>>,
+    writer: &super::client_writer::ClientWriter,
     sessions: &super::SessionAgents,
 ) -> Result<()> {
     use super::client_writer::write_direct_event;

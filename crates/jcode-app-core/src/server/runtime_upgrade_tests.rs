@@ -262,8 +262,10 @@ async fn invalid_native_upgrade_returns_status_without_exec_or_agent() {
     use tokio::io::AsyncBufReadExt;
     let (client, server) = crate::transport::stream_pair().unwrap();
     let (_, write) = server.into_split();
+    let (failed_tx, _failed_rx) = tokio::sync::watch::channel(false);
+    let writer = super::super::client_writer::ClientWriter::spawn(write, failed_tx);
     let sessions = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    handle(7, "relative-jcode", &Arc::new(Mutex::new(write)), &sessions)
+    handle(7, "relative-jcode", &writer, &sessions)
         .await
         .unwrap();
     let mut line = String::new();

@@ -25,7 +25,7 @@ use super::client_session::{
 use super::client_state::{
     handle_get_compacted_history, handle_get_history, handle_get_model_catalog, handle_get_state,
 };
-use super::client_writer::{write_client_bytes, write_direct_event};
+use super::client_writer::{ClientWriter, write_client_bytes, write_direct_event};
 use super::comm_await::{CommAwaitMembersContext, handle_comm_await_members};
 use super::comm_control::{
     handle_client_debug_command, handle_client_debug_response, handle_comm_assign_next,
@@ -398,7 +398,8 @@ pub(super) async fn handle_client(
     let handler_start = Instant::now();
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let writer = Arc::new(Mutex::new(writer));
+    let (writer_failed_tx, mut writer_failed_rx) = tokio::sync::watch::channel(false);
+    let writer = ClientWriter::spawn(writer, writer_failed_tx.clone());
     let mut line = String::new();
 
     let mut initial_request = loop {
@@ -433,7 +434,7 @@ pub(super) async fn handle_client(
                     let keep_connection_open = matches!(request, Request::Ping { .. });
                     handle_lightweight_control_request(
                         request,
-                        Arc::clone(&writer),
+                        writer.clone(),
                         LightweightControlContext {
                             sessions: &sessions,
                             global_session_id: &global_session_id,
@@ -659,10 +660,9 @@ pub(super) async fn handle_client(
         tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
 
     // Spawn event forwarder for this client only
-    let writer_clone = Arc::clone(&writer);
+    let writer_clone = writer.clone();
     let client_connection_id_for_events = client_connection_id.clone();
     let client_connections_for_events = Arc::clone(&client_connections);
-    let (writer_failed_tx, mut writer_failed_rx) = tokio::sync::watch::channel(false);
     let event_handle = tokio::spawn(async move {
         while let Some(event) = client_event_rx.recv().await {
             {

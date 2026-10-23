@@ -17,7 +17,6 @@ use crate::message::ContentBlock;
 use crate::protocol::{NotificationType, ServerEvent};
 use crate::provider::Provider;
 use crate::tool::Registry;
-use crate::transport::WriteHalf;
 use anyhow::Result;
 use futures::FutureExt;
 use jcode_agent_runtime::InterruptSignal;
@@ -1496,7 +1495,7 @@ pub(super) async fn handle_resume_session(
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
     client_count: &Arc<RwLock<usize>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &super::client_writer::ClientWriter,
     server_name: &str,
     server_icon: &str,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
@@ -1576,7 +1575,7 @@ pub(super) async fn handle_resume_session_with_model_override(
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
     client_count: &Arc<RwLock<usize>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &super::client_writer::ClientWriter,
     server_name: &str,
     server_icon: &str,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,

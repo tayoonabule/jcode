@@ -43,7 +43,8 @@ async fn restore_for_concurrency_test(
     let mut client_session_id = source.lock().await.session_id().to_owned();
     let (stream, _peer) = crate::transport::stream_pair()?;
     let (_, writer) = stream.into_split();
-    let writer = Arc::new(Mutex::new(writer));
+    let (failed_tx, _failed_rx) = tokio::sync::watch::channel(false);
+    let writer = super::super::super::client_writer::ClientWriter::spawn(writer, failed_tx);
     let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel();
     let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(8);
     let now = Instant::now();

@@ -15,6 +15,13 @@ use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock, mpsc};
 
+fn queued_test_writer(
+    half: crate::transport::WriteHalf,
+) -> super::super::client_writer::ClientWriter {
+    let (failed_tx, _failed_rx) = tokio::sync::watch::channel(false);
+    super::super::client_writer::ClientWriter::spawn(half, failed_tx)
+}
+
 struct MockProvider(Option<&'static str>);
 
 #[derive(Clone)]
@@ -102,7 +109,7 @@ async fn model_prefetch_hydrates_capabilities_with_existing_model_names() {
 
     let (stream, mut peer) = crate::transport::stream_pair().unwrap();
     let (_, writer) = stream.into_split();
-    let writer = Arc::new(Mutex::new(writer));
+    let writer = queued_test_writer(writer);
     handle_get_model_catalog(44, session_id, &agent, &provider, &writer)
         .await
         .unwrap();
@@ -369,11 +376,12 @@ async fn handle_get_history_busy_fresh_session_returns_empty_without_waiting() {
     let count = Arc::new(RwLock::new(1));
     let (stream, mut peer) = crate::transport::stream_pair().unwrap();
     let (_reader, write_half) = stream.into_split();
-    let writer = Arc::new(Mutex::new(write_half));
+    let writer = queued_test_writer(write_half);
     let busy_guard = agent.lock().await;
 
-    // Keep the mutex held throughout, representing either idle prefetch or a
-    // real turn. Concurrent requests must not queue behind either lock owner.
+    // Keep the agent mutex held throughout, representing either idle prefetch
+    // or a real turn. History requests must continue to use the persisted
+    // snapshot instead of queuing behind that agent lock.
     let request = |id, processing| {
         handle_get_history(
             id,
@@ -580,7 +588,7 @@ async fn assert_history_service_tier_and_pdf_capability(
 
     let (stream_a, mut stream_b) = crate::transport::stream_pair().expect("stream pair");
     let (_reader_a, writer_a) = stream_a.into_split();
-    let writer = Arc::new(Mutex::new(writer_a));
+    let writer = queued_test_writer(writer_a);
     super::HISTORY_SESSION_LOADS
         .lock()
         .expect("history load counter lock")
@@ -594,9 +602,9 @@ async fn assert_history_service_tier_and_pdf_capability(
         tokio::pin!(turn);
         assert!(futures::poll!(&mut turn).is_pending());
 
-        // Socket backpressure lets us inspect the lock lifetime after snapshot
-        // preparation, while the history request is still in flight.
-        let writer_guard = writer.lock().await;
+        // The history payload is queued to the independent writer task. That
+        // must not retain the agent guard, so the waiting turn can acquire it
+        // before the peer drains the socket.
         let history = super::send_history_with_guard(
             42,
             session_id,
@@ -613,17 +621,13 @@ async fn assert_history_service_tier_and_pdf_capability(
             supports_pdf_panels,
             None,
         );
-        tokio::pin!(history);
-        assert!(futures::poll!(&mut history).is_pending());
+        history.await.expect("queue live history");
         let turn_guard = match futures::poll!(&mut turn) {
             std::task::Poll::Ready(guard) => guard,
-            std::task::Poll::Pending => panic!("snapshot must release agent before socket write"),
+            std::task::Poll::Pending => {
+                panic!("history queueing must release agent before socket write")
+            }
         };
-        drop(writer_guard);
-        tokio::time::timeout(std::time::Duration::from_secs(2), &mut history)
-            .await
-            .expect("history must not reacquire the racing turn's lock")
-            .expect("write live history");
         drop(turn_guard);
     } else {
         tokio::time::timeout(
@@ -819,7 +823,7 @@ async fn assert_model_catalog_service_tier(tier: Option<&'static str>, busy: boo
 
     let (stream_a, mut stream_b) = crate::transport::stream_pair().expect("stream pair");
     let (_reader_a, writer_a) = stream_a.into_split();
-    let writer = Arc::new(Mutex::new(writer_a));
+    let writer = queued_test_writer(writer_a);
 
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
