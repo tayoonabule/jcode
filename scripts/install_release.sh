@@ -88,6 +88,39 @@ version_dir="$builds_dir/versions/$hash"
 mkdir -p "$version_dir"
 install -m 755 "$bin" "$version_dir/jcode"
 
+# macOS TCC permissions are associated with a code requirement. Sign every
+# installed build with the stable local Jcode identity before publishing its
+# version/channel symlinks. Intentionally omit --options runtime so this is not
+# hardened-runtime signed and matches the Hull-granted FDA identity.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  signing_identity="D6EBD6E3A89DEA09FA90A0A0C539BF5203C7CD10"
+  signing_identifier="com.tayo.jcode"
+  if ! command -v codesign >/dev/null 2>&1; then
+    echo "codesign is required to install Jcode on macOS" >&2
+    exit 1
+  fi
+  if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$signing_identity"; then
+    echo "Required stable Jcode signing identity is unavailable: $signing_identity" >&2
+    exit 1
+  fi
+  codesign --force --sign "$signing_identity" --identifier "$signing_identifier" "$version_dir/jcode"
+  codesign --verify --strict "$version_dir/jcode"
+  signature_details="$(codesign -dv --verbose=4 "$version_dir/jcode" 2>&1)"
+  if ! printf '%s\n' "$signature_details" | grep -Fqx "Identifier=$signing_identifier"; then
+    echo "Installed Jcode signature has the wrong identifier" >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$signature_details" | grep -Fq "Authority=Apple Development: alexander.onabule@gmail.com (TNVYL7C8V5)"; then
+    echo "Installed Jcode signature is not from the stable FDA-granted identity" >&2
+    exit 1
+  fi
+  if printf '%s\n' "$signature_details" | grep -Fq "flags=0x10000(runtime)"; then
+    echo "Installed Jcode unexpectedly has the hardened runtime enabled" >&2
+    exit 1
+  fi
+  echo "Signed and verified macOS Jcode as $signing_identifier with stable identity $signing_identity (no hardened runtime)."
+fi
+
 # Update stable symlink
 stable_dir="$builds_dir/stable"
 mkdir -p "$stable_dir"
