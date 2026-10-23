@@ -3,13 +3,16 @@ use anyhow::Result;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
 
-const CLIENT_WRITER_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Writes are serialized through one task so callers never hold a socket lock,
+// but like upstream jcode a slow client is never dropped for being slow:
+// only a real socket error closes it. Dropping busy clients on a 5s timeout
+// or a 64-event cap caused reconnect storms (full history resend plus an
+// aborted tool per drop) under heavy build load.
 const CLIENT_WRITER_CHUNK_BYTES: usize = 64 * 1024;
-const CLIENT_WRITER_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Clone)]
 pub(super) struct ClientWriter {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
     failed_tx: watch::Sender<bool>,
 }
 
@@ -18,33 +21,20 @@ impl ClientWriter {
         mut stream: crate::transport::WriteHalf,
         failed_tx: watch::Sender<bool>,
     ) -> Self {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CLIENT_WRITER_QUEUE_CAPACITY);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let task_failed_tx = failed_tx.clone();
         tokio::spawn(async move {
             while let Some(bytes) = rx.recv().await {
                 for (chunk_index, chunk) in bytes.chunks(CLIENT_WRITER_CHUNK_BYTES).enumerate() {
-                    match tokio::time::timeout(CLIENT_WRITER_WRITE_TIMEOUT, stream.write_all(chunk))
-                        .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
+                    match stream.write_all(chunk).await {
+                        Ok(()) => {}
+                        Err(error) => {
                             crate::logging::warn(&format!(
                                 "client socket write failed ({} bytes total, chunk {} of {}): {}; dropping connection",
                                 bytes.len(),
                                 chunk_index + 1,
                                 bytes.len().div_ceil(CLIENT_WRITER_CHUNK_BYTES),
                                 error
-                            ));
-                            let _ = task_failed_tx.send(true);
-                            return;
-                        }
-                        Err(_) => {
-                            crate::logging::warn(&format!(
-                                "client socket write made no progress for {}ms ({} bytes total, chunk {} of {}); dropping connection",
-                                CLIENT_WRITER_WRITE_TIMEOUT.as_millis(),
-                                bytes.len(),
-                                chunk_index + 1,
-                                bytes.len().div_ceil(CLIENT_WRITER_CHUNK_BYTES)
                             ));
                             let _ = task_failed_tx.send(true);
                             return;
@@ -58,20 +48,9 @@ impl ClientWriter {
 }
 
 pub(super) async fn write_client_bytes(writer: &ClientWriter, bytes: &[u8]) -> Result<()> {
-    match writer.tx.try_send(bytes.to_vec()) {
+    match writer.tx.send(bytes.to_vec()) {
         Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            crate::logging::warn(&format!(
-                "client writer queue overflow ({} bytes; capacity {}); dropping connection",
-                bytes.len(),
-                CLIENT_WRITER_QUEUE_CAPACITY
-            ));
-            let _ = writer.failed_tx.send(true);
-            Err(anyhow::anyhow!(
-                "client writer queue overflow; connection is closing"
-            ))
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
+        Err(_) => {
             let _ = writer.failed_tx.send(true);
             Err(anyhow::anyhow!(
                 "client writer task stopped; connection is closing"
@@ -171,45 +150,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_client_reader_is_dropped_by_writer_task() {
-        let (server, _client_that_does_not_read) = tokio::net::UnixStream::pair().unwrap();
+    async fn busy_client_is_not_dropped_for_backlog_or_slowness() {
+        // Upstream parity: a client that is momentarily not reading (busy
+        // machine) keeps its connection however much is queued.
+        let (server, client_not_reading_yet) = tokio::net::UnixStream::pair().unwrap();
         let (_, writer_half) = server.into_split();
-        let (failed_tx, mut failed_rx) = watch::channel(false);
+        let (failed_tx, failed_rx) = watch::channel(false);
         let writer = ClientWriter::spawn(writer_half, failed_tx);
-        write_client_bytes(&writer, &vec![b'x'; 16 * 1024 * 1024])
+        write_client_bytes(&writer, &vec![b'x'; 4 * 1024 * 1024])
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(8), async {
-            while !*failed_rx.borrow() {
-                failed_rx.changed().await.unwrap();
-            }
-        })
-        .await
-        .expect("a non-reading peer must be disconnected after no write progress");
-        assert!(
-            write_client_bytes(&writer, b"after close").await.is_err(),
-            "the failed writer task must close its bounded queue"
-        );
-    }
-
-    #[tokio::test]
-    async fn full_client_writer_queue_fails_connection_instead_of_blocking() {
-        let (server, _client_that_does_not_read) = tokio::net::UnixStream::pair().unwrap();
-        let (_, writer_half) = server.into_split();
-        let (failed_tx, mut failed_rx) = watch::channel(false);
-        let writer = ClientWriter::spawn(writer_half, failed_tx);
-
-        for _ in 0..CLIENT_WRITER_QUEUE_CAPACITY {
+        for _ in 0..1000 {
             write_client_bytes(&writer, b"queued-event").await.unwrap();
         }
-        let overflow = write_client_bytes(&writer, b"overflow-event")
-            .await
-            .unwrap_err();
-        assert!(overflow.to_string().contains("queue overflow"));
-        assert!(
-            *failed_rx.borrow(),
-            "overflow must signal connection teardown"
-        );
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        assert!(!*failed_rx.borrow(), "a slow client must not be dropped");
+        drop(client_not_reading_yet);
     }
 
     #[test]
