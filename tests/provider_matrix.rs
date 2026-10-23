@@ -55,6 +55,7 @@ fn tracked_env_vars() -> Vec<String> {
         "JCODE_NAMED_PROVIDER_PROFILE",
         "JCODE_PROVIDER_PROFILE_ACTIVE",
         "JCODE_PROVIDER_PROFILE_NAME",
+        "JCODE_EXPERIMENTAL_MUSE_SUBSCRIPTION",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
@@ -576,6 +577,11 @@ async fn provider_matrix_explicit_compatible_choice_overrides_stale_active_profi
             .unwrap_or_else(|| panic!("{} should map to a ProviderChoice", provider.id));
 
         let env = TestEnv::new()?;
+        if provider.id == "muse-subscription" {
+            // This matrix intentionally exercises the experimental provider, so
+            // opt in explicitly instead of depending on the caller's shell.
+            jcode::env::set_var("JCODE_EXPERIMENTAL_MUSE_SUBSCRIPTION", "1");
+        }
         env.clear_profile_keys();
         write_profile_login_material(&env, selected, "selected-direct")?;
         write_profile_login_material(&env, stale, "stale-direct")?;
