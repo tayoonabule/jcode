@@ -1356,6 +1356,7 @@ fn minimax_default_provider_applies_minimax_api_key_env_not_openrouter() {
         "JCODE_OPENROUTER_CACHE_NAMESPACE",
         "JCODE_PROVIDER_PROFILE_ACTIVE",
         "JCODE_NAMED_PROVIDER_PROFILE",
+        "OPENAI_API_KEY",
     ]);
     for v in [
         "JCODE_OPENROUTER_API_KEY_NAME",
@@ -1364,6 +1365,7 @@ fn minimax_default_provider_applies_minimax_api_key_env_not_openrouter() {
         "JCODE_OPENROUTER_CACHE_NAMESPACE",
         "JCODE_PROVIDER_PROFILE_ACTIVE",
         "JCODE_NAMED_PROVIDER_PROFILE",
+        "OPENAI_API_KEY",
     ] {
         crate::env::remove_var(v);
     }

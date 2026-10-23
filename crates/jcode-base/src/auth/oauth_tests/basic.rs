@@ -88,6 +88,7 @@ fn save_openai_tokens_uses_jcode_home_sandbox() -> Result<()> {
     let _lock = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().map_err(|e| anyhow!(e))?;
     let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    let _openai_api_key = EnvVarGuard::remove("OPENAI_API_KEY");
 
     let tokens = OAuthTokens {
         access_token: "at_sandbox".to_string(),

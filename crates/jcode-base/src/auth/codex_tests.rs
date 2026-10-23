@@ -18,6 +18,12 @@ impl EnvVarGuard {
         crate::env::set_var(key, value);
         Self { key, previous }
     }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        crate::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvVarGuard {
@@ -199,6 +205,7 @@ fn multi_account_active_switch_works() {
     let _lock = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().unwrap();
     let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _openai_api_key = EnvVarGuard::remove("OPENAI_API_KEY");
     set_active_account_override(None);
 
     upsert_account(OpenAiAccount {
@@ -271,6 +278,7 @@ fn load_credentials_ignores_legacy_oauth_without_consent() {
     let _lock = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().unwrap();
     let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _openai_api_key = EnvVarGuard::remove("OPENAI_API_KEY");
     set_active_account_override(None);
 
     let legacy_path = temp
