@@ -170,18 +170,18 @@ enum OpenAITransportMode {
 impl OpenAITransportMode {
     fn from_config(raw: Option<&str>) -> Self {
         let Some(raw) = raw else {
-            return Self::Auto;
+            return Self::WebSocket;
         };
         match raw.trim().to_ascii_lowercase().as_str() {
-            "auto" | "" => Self::Auto,
-            "websocket" | "ws" | "wss" => Self::WebSocket,
+            "websocket" | "ws" | "wss" | "" => Self::WebSocket,
+            "auto" => Self::Auto,
             "https" | "http" | "sse" => Self::HTTPS,
             other => {
                 jcode_base::logging::warn(&format!(
-                    "Unknown JCODE_OPENAI_TRANSPORT '{}'; using auto. Use: auto, websocket, or https.",
+                    "Unknown JCODE_OPENAI_TRANSPORT '{}'; using websocket. Use: auto, websocket, or https.",
                     other
                 ));
-                Self::Auto
+                Self::WebSocket
             }
         }
     }
