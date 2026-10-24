@@ -210,7 +210,9 @@ pub fn build_responses_input_with_logger(
     }
 
     let mut items = Vec::new();
-    let mut open_calls: HashSet<String> = HashSet::new();
+    // Insertion-ordered: iteration order feeds the request prefix, so it must
+    // be deterministic across builds (a HashSet would reorder per instance).
+    let mut open_calls: Vec<String> = Vec::new();
     let mut pending_outputs: HashMap<String, String> = HashMap::new();
     let mut used_outputs: HashSet<String> = HashSet::new();
     let mut skipped_results = 0usize;
@@ -288,13 +290,15 @@ pub fn build_responses_input_with_logger(
                             } else {
                                 content.clone()
                             };
-                            if open_calls.contains(tool_use_id.as_str()) {
+                            if let Some(open_pos) =
+                                open_calls.iter().position(|id| id == tool_use_id)
+                            {
                                 items.push(serde_json::json!({
                                     "type": "function_call_output",
                                     "call_id": sanitize_tool_id(tool_use_id),
                                     "output": output
                                 }));
-                                open_calls.remove(tool_use_id.as_str());
+                                open_calls.remove(open_pos);
                                 used_outputs.insert(tool_use_id.clone());
                             } else if pending_outputs.contains_key(tool_use_id.as_str()) {
                                 skipped_results += 1;
@@ -392,7 +396,9 @@ pub fn build_responses_input_with_logger(
                                     .map(|pos| *pos > idx)
                                     .unwrap_or(false);
                                 if has_future_output {
-                                    open_calls.insert(id.clone());
+                                    if !open_calls.contains(id) {
+                                        open_calls.push(id.clone());
+                                    }
                                 } else {
                                     injected_missing += 1;
                                     items.push(serde_json::json!({
@@ -937,6 +943,44 @@ mod tests {
         assert_eq!(loaded, vec!["mcp__weather__forecast"]);
         // Everything before the insertion point is unchanged (cache prefix).
         assert_eq!(&input[..pos], &before[..pos]);
+    }
+
+    #[test]
+    fn open_calls_output_order_is_deterministic() {
+        let ids = ["call_c", "call_a", "call_d", "call_b"];
+        let mut messages = vec![msg(
+            Role::Assistant,
+            ids.iter()
+                .map(|id| ContentBlock::ToolUse {
+                    id: (*id).into(),
+                    name: "bash".into(),
+                    input: json!({}),
+                    thought_signature: None,
+                })
+                .collect(),
+        )];
+        // Results land after every call is open, in a different order.
+        messages.push(msg(
+            Role::User,
+            ["call_b", "call_d", "call_a", "call_c"]
+                .iter()
+                .map(|id| ContentBlock::ToolResult {
+                    tool_use_id: (*id).into(),
+                    content: "out".into(),
+                    is_error: None,
+                })
+                .collect(),
+        ));
+        let first = build_responses_input(&messages);
+        for _ in 0..50 {
+            assert_eq!(build_responses_input(&messages), first);
+        }
+        let order: Vec<&str> = first
+            .iter()
+            .filter(|i| i["type"] == json!("function_call_output"))
+            .map(|i| i["call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, ids.to_vec());
     }
 
     #[test]
