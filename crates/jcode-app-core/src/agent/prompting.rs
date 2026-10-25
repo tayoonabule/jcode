@@ -238,10 +238,15 @@ fn append_tool_capability_reminder(
         lines.push(format!("- Installed CLIs on PATH: {}. Use `gws` for Google Workspace; `playwright` is available for local testing, not as a substitute for a connected service's native integration.", installed.join(", ")));
     }
 
-    if !split.dynamic_part.is_empty() {
-        split.dynamic_part.push_str("\n\n");
+    // Keep this in the static part. The dynamic part is sent as a message
+    // right after the latest user prompt, so every new user message moves it,
+    // which changes an earlier input item and resets the persistent OpenAI
+    // websocket chain (a full-prefix cache miss). The tool list is locked for
+    // cache stability, so this text is constant for the session.
+    if !split.static_part.is_empty() {
+        split.static_part.push_str("\n\n");
     }
-    split.dynamic_part.push_str(&lines.join("\n"));
+    split.static_part.push_str(&lines.join("\n"));
 }
 
 fn installed_cli_names(path: Option<&std::ffi::OsStr>) -> Vec<&'static str> {
@@ -302,11 +307,11 @@ mod capability_reminder_tests {
             ],
         );
 
-        assert!(prompt.dynamic_part.contains("MCP tools available"));
-        assert!(prompt.dynamic_part.contains("mcp__slack__search_messages"));
-        assert!(prompt.dynamic_part.contains("Subagents and orchestration"));
-        assert!(prompt.dynamic_part.contains("Provider routes"));
-        assert!(prompt.dynamic_part.contains("Other tools available: read"));
+        assert!(prompt.static_part.contains("MCP tools available"));
+        assert!(prompt.static_part.contains("mcp__slack__search_messages"));
+        assert!(prompt.static_part.contains("Subagents and orchestration"));
+        assert!(prompt.static_part.contains("Provider routes"));
+        assert!(prompt.static_part.contains("Other tools available: read"));
     }
 
     #[test]
@@ -314,9 +319,9 @@ mod capability_reminder_tests {
         let mut prompt = crate::prompt::SplitSystemPrompt::default();
         append_tool_capability_reminder(&mut prompt, &[tool("read")]);
 
-        assert!(!prompt.dynamic_part.contains("MCP tools available"));
-        assert!(!prompt.dynamic_part.contains("Subagents and orchestration"));
-        assert!(prompt.dynamic_part.contains("Other tools available: read"));
+        assert!(!prompt.static_part.contains("MCP tools available"));
+        assert!(!prompt.static_part.contains("Subagents and orchestration"));
+        assert!(prompt.static_part.contains("Other tools available: read"));
     }
 
     #[test]
@@ -324,7 +329,7 @@ mod capability_reminder_tests {
         let mut prompt = crate::prompt::SplitSystemPrompt::default();
         append_tool_capability_reminder(&mut prompt, &[]);
 
-        assert!(prompt.dynamic_part.is_empty());
+        assert!(prompt.static_part.is_empty());
     }
 
     #[cfg(unix)]
