@@ -916,6 +916,17 @@ impl BashTool {
         let has_stdin_channel = ctx.stdin_request_tx.is_some();
 
         let mut command = build_shell_command(&params.command);
+        crate::hooks::apply_client_env_pairs(
+            |k, v| match v {
+                Some(v) => {
+                    command.env(k, v);
+                }
+                None => {
+                    command.env_remove(k);
+                }
+            },
+            &crate::hooks::client_env_for_tools(),
+        );
         command.envs(cloud_command_environment(ctx.working_dir.as_deref())?);
         command
             .env("JCODE_SESSION_ID", &ctx.session_id)
@@ -1147,6 +1158,17 @@ impl BashTool {
         let display_name = summarize_background_command(params.intent.as_deref(), &params.command);
 
         let mut cmd = build_detached_shell_wrapper(&params.command);
+        crate::hooks::apply_client_env_pairs(
+            |k, v| match v {
+                Some(v) => {
+                    cmd.env(k, v);
+                }
+                None => {
+                    cmd.env_remove(k);
+                }
+            },
+            &crate::hooks::client_env_for_tools(),
+        );
         cmd.envs(cloud_command_environment(ctx.working_dir.as_deref())?);
         cmd.env("JCODE_SESSION_ID", &ctx.session_id);
         let stdout = OpenOptions::new()
@@ -1288,6 +1310,8 @@ impl BashTool {
         let working_dir = ctx.working_dir.clone();
         let cloud_environment = cloud_command_environment(working_dir.as_deref())?;
         let session_id_env = ctx.session_id.clone();
+        // Capture before spawning: task-locals do not follow tokio::spawn.
+        let client_env_pairs = crate::hooks::client_env_for_tools();
         let timeout_ms = params.timeout.map(|timeout| timeout.min(600000));
         let timeout_duration = timeout_ms.map(Duration::from_millis);
 
@@ -1302,6 +1326,17 @@ impl BashTool {
                 wake,
 				move |output_path| async move {
 					let mut cmd = build_shell_command(&command);
+					crate::hooks::apply_client_env_pairs(
+						|k, v| match v {
+							Some(v) => {
+								cmd.env(k, v);
+							}
+							None => {
+								cmd.env_remove(k);
+							}
+						},
+						&client_env_pairs,
+					);
 					cmd.envs(cloud_environment);
 					cmd.env("JCODE_SESSION_ID", &session_id_env);
 					#[cfg(unix)]
