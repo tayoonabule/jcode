@@ -19,7 +19,9 @@ pub(super) async fn execute_with_background(
     let auto_background = auto_background_allowed(&name, &input);
     let session_id = ctx.session_id.clone();
     let tool_name = name.clone();
-    let mut work = tokio::spawn(async move { registry.execute(&tool_name, input, ctx).await });
+    let mut work = crate::hooks::spawn_with_client_env(async move {
+        registry.execute(&tool_name, input, ctx).await
+    });
     tokio::select! {
         biased;
         result = &mut work => result.map_err(|e| anyhow::anyhow!("Tool task panicked: {}", e))?,
@@ -1844,7 +1846,7 @@ impl Agent {
                 let registry_clone = self.registry.clone();
                 let tool_name_for_spawn = tc.name.clone();
                 let tool_input_for_spawn = tc.input.clone();
-                let tool_handle = tokio::spawn(async move {
+                let tool_handle = crate::hooks::spawn_with_client_env(async move {
                     registry_clone
                         .execute(&tool_name_for_spawn, tool_input_for_spawn, ctx)
                         .await
