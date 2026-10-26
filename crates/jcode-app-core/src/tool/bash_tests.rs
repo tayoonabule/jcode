@@ -1363,3 +1363,41 @@ async fn test_detached_promoted_command_reports_intermediate_progress() {
     let _ = tokio::fs::remove_file(output_file).await;
     let _ = tokio::fs::remove_file(status_file).await;
 }
+
+#[tokio::test]
+async fn bash_tool_sees_requesting_clients_openrig_identity_not_servers() {
+    // A shared server hosts many seats. The tool must report the identity of
+    // the client whose request is running, not the server process env.
+    let tool = BashTool::new();
+    let seat_a = vec![(
+        "OPENRIG_SESSION_NAME".to_string(),
+        "seat-a@test".to_string(),
+    )];
+    let seat_b = vec![(
+        "OPENRIG_SESSION_NAME".to_string(),
+        "seat-b@test".to_string(),
+    )];
+    let run = |env: Vec<(String, String)>| {
+        let tool = &tool;
+        async move {
+            crate::hooks::with_client_terminal_env(env, async {
+                tool.execute(
+                    json!({"command": "echo SEAT=${OPENRIG_SESSION_NAME:-none}"}),
+                    make_ctx(None),
+                )
+                .await
+                .unwrap()
+                .output
+            })
+            .await
+        }
+    };
+    let (a, b) = tokio::join!(run(seat_a), run(seat_b));
+    assert!(a.contains("SEAT=seat-a@test"), "got {a}");
+    assert!(b.contains("SEAT=seat-b@test"), "got {b}");
+    let none = run(Vec::new()).await;
+    assert!(
+        !none.contains("seat-a") && !none.contains("seat-b"),
+        "got {none}"
+    );
+}
