@@ -512,6 +512,31 @@ impl Session {
         Self::load(session_id)
     }
 
+    /// Return `(parent_id, is_debug)` for a persisted session without holding the
+    /// whole snapshot in memory.
+    ///
+    /// The snapshot is streamed through a buffered reader, so the message array is
+    /// skipped token by token instead of being copied into one large buffer. The
+    /// journal override is applied exactly as [`Session::load_startup_stub`] does,
+    /// because the journal can change both fields.
+    pub fn load_root_visibility_fields(session_id: &str) -> Result<(Option<String>, bool)> {
+        #[derive(serde::Deserialize)]
+        struct RootFields {
+            #[serde(default)]
+            parent_id: Option<String>,
+            #[serde(default)]
+            is_debug: bool,
+        }
+        let path = session_path(session_id)?;
+        let file = std::fs::File::open(&path)?;
+        let fields: RootFields =
+            serde_json::from_reader(BufReader::with_capacity(64 * 1024, file))?;
+        let mut session = Session::create_with_id(session_id.to_string(), fields.parent_id, None);
+        session.is_debug = fields.is_debug;
+        apply_latest_journal_meta(&mut session, &session_journal_path_from_snapshot(&path));
+        Ok((session.parent_id, session.is_debug))
+    }
+
     /// Load only the metadata needed for remote-client startup.
     ///
     /// This intentionally skips heavyweight transcript vectors so the remote

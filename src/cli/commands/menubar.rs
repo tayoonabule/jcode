@@ -31,9 +31,11 @@ impl From<SessionCounts> for CountsReport {
 /// active-PID registry, but those are implementation details rather than menu
 /// entries.
 fn load_user_root_session(session_id: &str) -> Option<bool> {
-    session::Session::load_startup_stub(session_id)
+    // Stream only the root fields. The full-file read this replaced held the
+    // whole session transcript in memory for every uncached presence.
+    session::Session::load_root_visibility_fields(session_id)
         .ok()
-        .map(|session| session.parent_id.is_none() && !session.is_debug)
+        .map(|(parent_id, is_debug)| parent_id.is_none() && !is_debug)
 }
 
 fn user_root_session_presence() -> Vec<SessionPresence> {

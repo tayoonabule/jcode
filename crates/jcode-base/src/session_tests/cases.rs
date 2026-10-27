@@ -476,6 +476,81 @@ fn existing_non_empty_session_does_not_get_retroactive_session_context() {
 }
 
 #[test]
+fn load_root_visibility_fields_matches_startup_stub_including_journal_override() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-root-visibility-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let root_id = "session_root_visibility_root";
+    let mut root = Session::create_with_id(root_id.to_string(), None, Some("root".to_string()));
+    root.append_stored_message(StoredMessage {
+        id: "msg_big".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "x".repeat(256 * 1024),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    root.save()?;
+
+    let child_id = "session_root_visibility_child";
+    let mut child = Session::create_with_id(
+        child_id.to_string(),
+        Some("parent_123".to_string()),
+        None,
+    );
+    child.save_prepared()?;
+
+    let debug_id = "session_root_visibility_debug";
+    let mut debug = Session::create_with_id(debug_id.to_string(), None, None);
+    debug.is_debug = true;
+    debug.save_prepared()?;
+
+    // Journal override: the snapshot says root, but the latest journal meta
+    // says the session is now a child. The streamed reader must honor it.
+    let overridden_id = "session_root_visibility_journal";
+    let mut overridden = Session::create_with_id(overridden_id.to_string(), None, None);
+    overridden.save_prepared()?;
+    let mut overridden_meta = Session::load(overridden_id)?;
+    overridden_meta.parent_id = Some("parent_456".to_string());
+    overridden_meta.save_prepared()?;
+
+    for id in [root_id, child_id, debug_id, overridden_id] {
+        let stub = Session::load_startup_stub(id)?;
+        let (parent_id, is_debug) = Session::load_root_visibility_fields(id)?;
+        assert_eq!(
+            parent_id, stub.parent_id,
+            "parent_id must match the startup stub for {id}"
+        );
+        assert_eq!(
+            is_debug, stub.is_debug,
+            "is_debug must match the startup stub for {id}"
+        );
+    }
+
+    let (root_parent, root_debug) = Session::load_root_visibility_fields(root_id)?;
+    assert!(root_parent.is_none() && !root_debug, "plain root session is visible");
+    let (child_parent, _) = Session::load_root_visibility_fields(child_id)?;
+    assert_eq!(child_parent.as_deref(), Some("parent_123"));
+    let (_, debug_flag) = Session::load_root_visibility_fields(debug_id)?;
+    assert!(debug_flag, "debug session keeps is_debug");
+    let (overridden_parent, _) = Session::load_root_visibility_fields(overridden_id)?;
+    assert_eq!(
+        overridden_parent.as_deref(),
+        Some("parent_456"),
+        "journal override of parent_id must be applied"
+    );
+    Ok(())
+}
+
+#[test]
 fn load_startup_stub_preserves_metadata_but_skips_heavy_vectors() -> Result<()> {
     let _env_lock = lock_env();
     let temp_home = tempfile::Builder::new()
