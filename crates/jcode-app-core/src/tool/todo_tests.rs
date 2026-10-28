@@ -101,7 +101,6 @@ fn hierarchy_rejects_malformed_structures() {
     let lane = json!({"lane":"x","items":[item]});
     let phase = json!({"phase":1,"lanes":[lane]});
     for bad in [
-        json!(null),
         json!({}),
         json!([null]),
         json!([{"phase":0,"lanes":[lane]}]),
@@ -135,6 +134,23 @@ fn hierarchy_rejects_malformed_structures() {
         input[key] = json!([]);
         assert!(apply_todo_patch(input, || json!([])).is_err());
     }
+}
+
+#[test]
+fn null_phases_is_treated_as_omitted() {
+    assert!(parse_todo_input(json!({"phases":null})).unwrap().todos.is_none());
+}
+
+#[test]
+fn null_phases_does_not_conflict_with_incremental_patch() {
+    let stored = json!([{"id":"a","content":"A","status":"pending","priority":"high"}]);
+    let patched = apply_todo_patch(
+        json!({"phases":null,"update":[{"id":"a","content":"changed"}]}),
+        || stored.clone(),
+    )
+    .unwrap();
+    let todos = parse_todo_input(patched).unwrap().todos.unwrap();
+    assert_eq!(todos[0].content, "changed");
 }
 
 #[test]
