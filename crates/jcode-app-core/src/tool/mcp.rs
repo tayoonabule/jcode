@@ -232,11 +232,10 @@ impl Tool for McpSearchTool {
         let names = crate::mcp::dispatch_names(&catalog);
         let rank_pass = |any_word: bool| -> Vec<(MatchRank, McpSearchResult)> {
             catalog
-                .clone()
-                .into_iter()
-                .zip(names.clone())
+                .iter()
+                .zip(names.iter())
                 .filter_map(|((server, tool), name)| {
-                    if server_filter.is_some_and(|wanted| wanted != server) {
+                    if server_filter.is_some_and(|wanted| wanted != server.as_str()) {
                         return None;
                     }
                     let legacy_name = dispatch_name(&server, &tool.name);
@@ -278,15 +277,16 @@ impl Tool for McpSearchTool {
                     Some((
                         rank,
                         McpSearchResult {
-                            name,
-                            server,
-                            tool: tool.name,
+                            name: name.clone(),
+                            server: server.clone(),
+                            tool: tool.name.clone(),
                             description: tool
                                 .description
-                                .unwrap_or_else(|| "MCP tool".to_string())
+                                .as_deref()
+                                .unwrap_or("MCP tool")
                                 .trim()
                                 .to_string(),
-                            input_schema: tool.input_schema,
+                            input_schema: tool.input_schema.clone(),
                         },
                     ))
                 })
