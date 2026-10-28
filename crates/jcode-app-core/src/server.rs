@@ -1384,6 +1384,7 @@ impl Server {
         let monitor_swarm_coordinators = Arc::clone(&self.swarm_state.coordinators);
         let monitor_shared_context = Arc::clone(&self.shared_context);
         let monitor_sessions = Arc::clone(&self.sessions);
+        let monitor_client_connections = Arc::clone(&self.client_connections);
         let monitor_soft_interrupt_queues = Arc::clone(&self.soft_interrupt_queues);
         let monitor_event_history = Arc::clone(&self.event_history);
         let monitor_event_counter = Arc::clone(&self.event_counter);
@@ -1399,6 +1400,7 @@ impl Server {
                 monitor_shared_context,
                 monitor_sessions,
                 monitor_soft_interrupt_queues,
+                monitor_client_connections,
                 monitor_event_history,
                 monitor_event_counter,
                 monitor_swarm_event_tx,
@@ -2062,6 +2064,7 @@ impl Server {
         _shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
         sessions: Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>,
         soft_interrupt_queues: SessionInterruptQueues,
+        client_connections: Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
         event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
         event_counter: Arc<std::sync::atomic::AtomicU64>,
         swarm_event_tx: broadcast::Sender<SwarmEvent>,
@@ -2340,6 +2343,7 @@ impl Server {
                         &task,
                         &sessions,
                         &soft_interrupt_queues,
+                        &client_connections,
                         &swarm_members,
                         &swarms_by_id,
                         &event_history,
@@ -2356,6 +2360,7 @@ impl Server {
                         &task,
                         &sessions,
                         &soft_interrupt_queues,
+                        &client_connections,
                         &swarm_members,
                         &swarms_by_id,
                         &event_history,
@@ -2369,6 +2374,7 @@ impl Server {
                         &event,
                         &sessions,
                         &soft_interrupt_queues,
+                        &client_connections,
                         &swarm_members,
                         &swarms_by_id,
                         &event_history,
