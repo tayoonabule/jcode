@@ -1,8 +1,9 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 use super::{
-    FileAccess, Server, SessionInterruptQueues, SwarmMember, dispatch_background_task_completion,
-    file_activity_scope_label, persist_swarm_state_snapshot, remove_session_entry,
+    ClientConnectionInfo, FileAccess, Server, SessionInterruptQueues, SwarmMember,
+    dispatch_background_task_completion, file_activity_scope_label, persist_swarm_state_snapshot,
+    remove_session_entry,
 };
 use crate::agent::Agent;
 use crate::bus::{
@@ -23,6 +24,28 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::time::timeout;
+
+fn active_client_connections(
+    session_id: &str,
+) -> Arc<RwLock<HashMap<String, ClientConnectionInfo>>> {
+    let (disconnect_tx, _) = mpsc::unbounded_channel();
+    let now = Instant::now();
+    Arc::new(RwLock::new(HashMap::from([(
+        "test-connection".to_string(),
+        ClientConnectionInfo {
+            client_id: "test-connection".to_string(),
+            session_id: session_id.to_string(),
+            client_instance_id: None,
+            debug_client_id: None,
+            connected_at: now,
+            last_seen: now,
+            is_processing: false,
+            current_tool_name: None,
+            terminal_env: Vec::new(),
+            disconnect_tx,
+        },
+    )])))
+}
 
 struct EnvGuard {
     prev_home: Option<OsString>,
@@ -340,6 +363,7 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
         agent.clone(),
     )])));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
+    let client_connections = active_client_connections(&session_id);
     let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
         session_id.clone(),
@@ -364,6 +388,7 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
         &task,
         &sessions,
         &soft_interrupt_queues,
+        &client_connections,
         &swarm_members,
         &swarms_by_id,
         &event_history,
@@ -441,6 +466,7 @@ async fn external_background_task_wake_emits_request_without_starting_turn() {
         agent.clone(),
     )])));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
+    let client_connections = active_client_connections(&session_id);
     let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
         session_id.clone(),
@@ -465,6 +491,7 @@ async fn external_background_task_wake_emits_request_without_starting_turn() {
         &task,
         &sessions,
         &soft_interrupt_queues,
+        &client_connections,
         &swarm_members,
         &swarms_by_id,
         &event_history,
@@ -593,12 +620,14 @@ async fn wake_turn_holds_reservation_until_terminal_status_is_published() {
     let member = attached_swarm_member(&session_id, member_event_tx);
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(session_id.clone(), member)])));
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    let client_connections = active_client_connections(&session_id);
     let ctx = super::live_turn::LiveTurnSwarmContext::new(
         &swarm_members,
         &swarms_by_id,
         &event_history,
         &event_counter,
         &swarm_event_tx,
+        &client_connections,
     );
 
     let started = super::live_turn::run_live_turn_if_idle(
@@ -666,6 +695,7 @@ async fn wake_turn_tracks_member_status_and_emits_terminal_done() {
     member.swarm_id = Some("test-swarm".to_string());
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(session_id.clone(), member)])));
     let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    let client_connections = active_client_connections(&session_id);
     {
         let mut swarms = swarms_by_id.write().await;
         swarms.insert(
@@ -685,6 +715,7 @@ async fn wake_turn_tracks_member_status_and_emits_terminal_done() {
             &event_history,
             &event_counter,
             &swarm_event_tx,
+            &client_connections,
         ),
     )
     .await;
@@ -766,6 +797,7 @@ async fn background_task_notify_without_wake_does_not_queue_soft_interrupt() {
         session_id.clone(),
         queue.clone(),
     )])));
+    let client_connections = active_client_connections(&session_id);
     let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
         session_id.clone(),
@@ -790,6 +822,7 @@ async fn background_task_notify_without_wake_does_not_queue_soft_interrupt() {
         &task,
         &sessions,
         &soft_interrupt_queues,
+        &client_connections,
         &swarm_members,
         &swarms_by_id,
         &event_history,
