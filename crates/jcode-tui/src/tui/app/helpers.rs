@@ -258,7 +258,10 @@ mod ctrl_m_tests {
         assert_eq!((code, mods), (KeyCode::Enter, KeyModifiers::NONE));
 
         // Ctrl+Shift+M keeps its own meaning, and Ctrl+J stays untouched.
-        let (mut code, mut mods) = (KeyCode::Char('m'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let (mut code, mut mods) = (
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
         ctrl_m_to_enter(&mut code, &mut mods);
         assert_eq!(code, KeyCode::Char('m'));
 
@@ -727,6 +730,7 @@ pub(crate) fn switched_model_account_suffix(
 /// Notice after switching the active saved account. The switch rebinds this
 /// session and becomes the default for new sessions, but other sessions that
 /// are already running keep the credentials they loaded.
+#[cfg(test)]
 pub(super) fn account_switch_notice(provider: &str, label: &str) -> String {
     format!(
         "Switched {provider} account to `{label}` for this session and new sessions. \
