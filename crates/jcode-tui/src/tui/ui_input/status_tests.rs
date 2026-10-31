@@ -2,11 +2,66 @@ use super::*;
 use ratatui::style::Modifier;
 
 #[test]
+fn overscroll_directory_transition_only_shows_real_moves() {
+    assert_eq!(
+        overscroll_directory_transition(None, Some("/a/start")),
+        Some("/a/start".into())
+    );
+    assert_eq!(
+        overscroll_directory_transition(Some("/a/start/"), Some("/a/start")),
+        Some("/a/start".into())
+    );
+    assert_eq!(
+        overscroll_directory_transition(Some("/a/start"), Some("/b/current")),
+        Some("/a/start → /b/current".into())
+    );
+    assert_eq!(
+        overscroll_directory_transition(Some("/a/start"), None),
+        None
+    );
+    assert_eq!(
+        overscroll_directory_transition(Some("/"), Some("/b")),
+        Some("/ → /b".into())
+    );
+    assert_eq!(
+        overscroll_directory_transition(Some("/one/a/b"), Some("/two/a/b")),
+        Some("/one/a/b → /two/a/b".into())
+    );
+}
+
+#[test]
+fn overscroll_directory_transition_fits_unicode_terminal_widths() {
+    let data = crate::tui::info_widget::InfoWidgetData {
+        original_working_dir: Some("/projects/起点".into()),
+        working_dir: Some("/projects/現在".into()),
+        ..Default::default()
+    };
+    let wide = preview_overscroll_line(&data, 100);
+    let text = wide
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("/projects/起点 → /projects/現在"), "{text}");
+    for width in 0..80 {
+        assert!(preview_overscroll_line(&data, width).width() <= width as usize);
+    }
+}
+
+#[test]
 fn image_tags_are_colored_without_changing_input_geometry() {
     for width in [3, 8, 80] {
         let input = "界 [image 1] hi [image 22]";
-        let (lines, cursor_line, cursor_col) =
-            wrap_input_text(input, input.len(), width, "1", "> ", Color::White, 3);
+        let (lines, cursor_line, cursor_col) = wrap_input_text_with_images(
+            input,
+            input.len(),
+            width,
+            "1",
+            "> ",
+            Color::White,
+            3,
+            &|_| true,
+        );
         let segments = wrap_input_segments(input, width);
         let mut highlighted = String::new();
         for (index, line) in lines.iter().enumerate() {
@@ -41,6 +96,31 @@ fn malformed_image_tags_remain_plain_text() {
             .iter()
             .all(|span| span.style == Style::default())
     );
+}
+
+#[test]
+fn image_tags_warn_when_payload_is_missing() {
+    let input = "[image 1] [image 2] [image 0] [image 999999999999999999999999999999]";
+    let (lines, _, _) =
+        wrap_input_text_with_images(input, 0, 100, "1", "> ", Color::White, 3, &|number| {
+            number == 2
+        });
+    let tags: Vec<_> = lines[0]
+        .spans
+        .iter()
+        .filter(|span| span.content.starts_with("[image"))
+        .collect();
+    assert_eq!(tags.len(), 4);
+    for (index, tag) in tags.iter().enumerate() {
+        assert_eq!(
+            tag.style.fg,
+            Some(if index == 1 {
+                rgb(102, 204, 221)
+            } else {
+                rgb(255, 193, 7)
+            })
+        );
+    }
 }
 
 #[test]

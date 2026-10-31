@@ -352,7 +352,7 @@ pub(super) fn wrapped_input_line_count(
 
     let num_str = next_prompt.to_string();
     let (prompt_char, caret_color) = input_prompt(app);
-    let (lines, _, _) = wrap_input_text(
+    let (lines, _, _) = wrap_input_text_with_images(
         app.input(),
         app.cursor_pos(),
         line_width,
@@ -360,6 +360,7 @@ pub(super) fn wrapped_input_line_count(
         prompt_char,
         caret_color,
         prompt_len,
+        &|number| app.input_image_attached(number),
     );
     lines.len().max(1)
 }
@@ -1477,7 +1478,10 @@ pub(super) fn draw_overscroll_status(frame: &mut Frame, app: &dyn TuiState, area
         .unwrap_or_else(|| app.provider_name());
     let facts = OverscrollFacts {
         machine: crate::tui::ssh_remote_host(),
-        dir: app.working_dir().and_then(|d| overscroll_dir_label(&d)),
+        dir: overscroll_directory_transition(
+            data.original_working_dir.as_deref(),
+            app.working_dir().as_deref(),
+        ),
         branch: overscroll_git_branch(&data),
         git: data.git_info.clone(),
         context: overscroll_context_usage(&data),
@@ -1515,7 +1519,10 @@ pub(crate) fn preview_overscroll_line(
 ) -> Line<'static> {
     let facts = OverscrollFacts {
         machine: None,
-        dir: data.working_dir.as_deref().and_then(overscroll_dir_label),
+        dir: overscroll_directory_transition(
+            data.original_working_dir.as_deref(),
+            data.working_dir.as_deref(),
+        ),
         branch: overscroll_git_branch(data),
         git: data.git_info.clone(),
         context: overscroll_context_usage(data),
@@ -1625,10 +1632,10 @@ fn overscroll_fact_spans(
         let label = if levels.dir == 0 {
             dir.clone()
         } else {
-            dir.rsplit('/')
-                .find(|seg| !seg.is_empty())
-                .unwrap_or(dir)
-                .to_string()
+            dir.split(" → ")
+                .map(|path| path.rsplit('/').find(|seg| !seg.is_empty()).unwrap_or(path))
+                .collect::<Vec<_>>()
+                .join(" → ")
         };
         let mut group = machine_spans(levels);
         if group.is_empty() {
@@ -1873,6 +1880,27 @@ fn overscroll_dir_label(path: &str) -> Option<String> {
     session_facts::dir_label_short(path)
 }
 
+fn overscroll_directory_transition(
+    original: Option<&str>,
+    current: Option<&str>,
+) -> Option<String> {
+    let current = current.filter(|path| !path.trim().is_empty())?;
+    let label = overscroll_dir_label(current).unwrap_or_else(|| current.to_string());
+    let Some(original) = original.filter(|path| !path.trim().is_empty()) else {
+        return Some(label);
+    };
+    if std::path::Path::new(original) == std::path::Path::new(current) {
+        return Some(label);
+    }
+    let origin_label = overscroll_dir_label(original).unwrap_or_else(|| original.to_string());
+    // Elision can hide the differing ancestor. Keep both paths distinguishable.
+    if origin_label == label {
+        Some(format!("{original} → {current}"))
+    } else {
+        Some(format!("{origin_label} → {label}"))
+    }
+}
+
 /// Placeholder header strings used during remote startup; not real model names.
 fn overscroll_is_placeholder(model: &str) -> bool {
     let m = model.trim().to_ascii_lowercase();
@@ -2048,7 +2076,7 @@ pub(super) fn draw_input(
         return None;
     }
 
-    let (all_lines, cursor_line, cursor_col) = wrap_input_text(
+    let (all_lines, cursor_line, cursor_col) = wrap_input_text_with_images(
         input_text,
         cursor_pos,
         line_width,
@@ -2056,6 +2084,7 @@ pub(super) fn draw_input(
         prompt_char,
         caret_color,
         prompt_len,
+        &|number| app.input_image_attached(number),
     );
 
     let mut lines: Vec<Line> = Vec::new();
@@ -2481,6 +2510,7 @@ pub(crate) fn input_cursor_pos_from_screen(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn wrap_input_text<'a>(
     input: &str,
     cursor_pos: usize,
@@ -2490,7 +2520,30 @@ pub(crate) fn wrap_input_text<'a>(
     caret_color: Color,
     prompt_len: usize,
 ) -> (Vec<Line<'a>>, usize, usize) {
-    let image_ranges: Vec<std::ops::Range<usize>> = input
+    wrap_input_text_with_images(
+        input,
+        cursor_pos,
+        line_width,
+        num_str,
+        prompt_char,
+        caret_color,
+        prompt_len,
+        &|_| false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wrap_input_text_with_images<'a>(
+    input: &str,
+    cursor_pos: usize,
+    line_width: usize,
+    num_str: &str,
+    prompt_char: &'a str,
+    caret_color: Color,
+    prompt_len: usize,
+    attached: &dyn Fn(usize) -> bool,
+) -> (Vec<Line<'a>>, usize, usize) {
+    let image_ranges: Vec<(std::ops::Range<usize>, bool)> = input
         .match_indices("[image ")
         .filter_map(|(start, _)| {
             let suffix = &input[start + 7..];
@@ -2499,7 +2552,8 @@ pub(crate) fn wrap_input_text<'a>(
                 return None;
             }
             let char_start = input[..start].chars().count();
-            Some(char_start..char_start + 8 + digits)
+            let present = suffix[..digits].parse::<usize>().ok().is_some_and(attached);
+            Some((char_start..char_start + 8 + digits, present))
         })
         .collect();
     let cursor_char_pos = crate::tui::core::byte_offset_to_char_index(input, cursor_pos);
@@ -2534,8 +2588,16 @@ pub(crate) fn wrap_input_text<'a>(
         let mut previous_style = Style::default();
         for (offset, ch) in segment.text.chars().enumerate() {
             let position = segment.start_char + offset;
-            let style = if image_ranges.iter().any(|range| range.contains(&position)) {
-                Style::default().fg(rgb(102, 204, 221)).bold()
+            let style = if let Some((_, present)) = image_ranges
+                .iter()
+                .find(|(range, _)| range.contains(&position))
+            {
+                let color = if *present {
+                    rgb(102, 204, 221)
+                } else {
+                    rgb(255, 193, 7)
+                };
+                Style::default().fg(color).bold()
             } else {
                 Style::default()
             };

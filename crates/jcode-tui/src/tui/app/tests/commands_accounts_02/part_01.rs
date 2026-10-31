@@ -13,6 +13,79 @@ fn remote_account_fixture(label: &str) -> crate::protocol::AccountUsageSnapshot 
 }
 
 #[test]
+fn test_account_hotkeys_advance_from_pending_target_not_stale_header() {
+    with_ssh_remote_test_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.remote_provider_name = Some("openai".into());
+        app.remote_provider_oauth_account_label = Some("first".into());
+        crate::usage::set_remote_account_usage(
+            Vec::new(),
+            vec![
+                remote_account_fixture("first"),
+                remote_account_fixture("second"),
+                remote_account_fixture("third"),
+            ],
+        );
+        app.pending_account_switch_target = Some(crate::tui::AccountPickerAction::Switch {
+            provider_id: "openai".into(),
+            label: "second".into(),
+        });
+        for (forward, expected) in [(true, "third"), (false, "first")] {
+            app.cycle_account(forward);
+            assert!(matches!(app.pending_account_picker_action.take(),
+                Some(crate::tui::AccountPickerAction::Switch { provider_id, label })
+                    if provider_id == "openai" && label == expected
+            ));
+            assert_eq!(
+                app.remote_provider_oauth_account_label.as_deref(),
+                Some("first")
+            );
+        }
+        crate::usage::clear_remote_account_usage();
+    });
+}
+
+#[test]
+fn test_account_hotkeys_connected_remote_queue_switch_and_preserve_draft() {
+    with_ssh_remote_test_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.remote_provider_name = Some("openai".into());
+        app.remote_provider_oauth_account_label = Some("first".into());
+        crate::usage::set_remote_account_usage(
+            Vec::new(),
+            vec![
+                remote_account_fixture("first"),
+                remote_account_fixture("second"),
+            ],
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for key in ['j', 'k'] {
+            app.input = "keep this draft".into();
+            app.cursor_pos = 4;
+            runtime.block_on(async {
+                let mut remote = crate::tui::backend::RemoteConnection::dummy();
+                app.handle_remote_key(
+                    KeyCode::Char(key),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    &mut remote,
+                )
+                .await
+                .unwrap();
+            });
+            assert_eq!(app.input, "keep this draft");
+            assert_eq!(app.cursor_pos, 4);
+            assert!(matches!(app.pending_account_picker_action.take(),
+                Some(crate::tui::AccountPickerAction::Switch { provider_id, label })
+                    if provider_id == "openai" && label == "second"
+            ));
+        }
+        crate::usage::clear_remote_account_usage();
+    });
+}
+
+#[test]
 fn test_account_local_shared_daemon_retains_inventory_center_and_saved_defaults() {
     with_temp_jcode_home(|| {
         let _env_guard = EnvRestoreGuard::capture(["JCODE_SSH_REMOTE", "GROQ_API_KEY"]);
@@ -167,7 +240,7 @@ fn test_remote_accounts_plural_preview_focuses_without_switching() {
 }
 
 #[test]
-fn test_remote_account_commands_send_only_wire_switches_and_block_local_management() {
+fn test_remote_account_commands_send_wire_switches_and_host_management() {
     with_ssh_remote_test_home(|| {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut app = create_test_app();
@@ -205,25 +278,42 @@ fn test_remote_account_commands_send_only_wire_switches_and_block_local_manageme
                 assert_eq!(request["type"], expected);
                 assert_eq!(request["label"], "remote-only");
             }
-            for command in [
-                "/account doctor",
-                "/account openai settings",
-                "/account openai remove remote-only",
-                "/account add named",
-                "/account default-model unsafe",
-                "/account openai transport https",
+            for (command, args) in [
+                ("/account doctor", vec!["doctor"]),
+                ("/account openai settings", vec!["settings", "openai"]),
+                (
+                    "/account openai remove remote-only",
+                    vec!["remove", "openai", "remote-only"],
+                ),
+                (
+                    "/account default-model remote-model",
+                    vec!["default-model", "remote-model"],
+                ),
+                (
+                    "/account openai transport https",
+                    vec!["openai", "transport", "https"],
+                ),
             ] {
                 assert!(
                     super::auth::handle_account_command_remote(&mut app, command, &mut remote)
                         .await
                         .unwrap()
                 );
+                let mut line = String::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    reader.read_line(&mut line),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["type"], "runtime_command", "{command}");
+                assert_eq!(request["command"], "ssh_account", "{command}");
+                assert_eq!(request["args"], serde_json::json!(args), "{command}");
                 assert!(
-                    app.display_messages()
-                        .last()
-                        .unwrap()
-                        .content
-                        .contains("No local credentials or settings were accessed")
+                    app.account_picker_overlay.is_none(),
+                    "no laptop management picker"
                 );
             }
             assert!(

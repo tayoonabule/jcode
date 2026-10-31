@@ -1410,6 +1410,8 @@ pub struct App {
     runtime_mode: AppRuntimeMode,
     // Remote rewind/undo request waiting for the server's replacement History payload.
     pending_remote_rewind_notice: Option<PendingRemoteRewindNotice>,
+    // Opaque server-owned SSH session navigation and child-creation state.
+    ssh_sessions: remote::ssh_sessions::State,
     // History-recovery watchdog for the "stuck on loading session…" bug. When a
     // remote (re)connect never receives the bootstrap `History` event, every
     // prompt path is gated behind `has_loaded_history()` and the session is
@@ -1649,6 +1651,8 @@ pub struct App {
     pending_startup_prompt_echo: Option<String>,
     // Pending account switch from inline picker (for remote mode async processing)
     pending_account_picker_action: Option<crate::tui::AccountPickerAction>,
+    /// Last sent account switch, used only as the cycle cursor until acknowledged.
+    pending_account_switch_target: Option<crate::tui::AccountPickerAction>,
     // Keybindings for model switching
     model_switch_keys: ModelSwitchKeys,
     // Keybindings for effort switching
